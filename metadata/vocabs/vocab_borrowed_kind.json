@@ -1,0 +1,8 @@
+{
+  "<PAD>": 0,
+  "<UNK>": 1,
+  "none": 2,
+  "mode_name": 3,
+  "pcset": 4,
+  "unknown": 5
+}

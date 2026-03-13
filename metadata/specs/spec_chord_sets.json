@@ -1,0 +1,33 @@
+{
+  "adds": {
+    "kind": "multi_hot",
+    "allowed_values": [2, 4, 6, 9, 11, 13],
+    "deduplicate": true,
+    "sort_before_encode": true
+  },
+  "omits": {
+    "kind": "multi_hot",
+    "allowed_values": [3, 5],
+    "deduplicate": true,
+    "sort_before_encode": true
+  },
+  "suspensions": {
+    "kind": "multi_hot",
+    "allowed_values": [2, 4],
+    "deduplicate": true,
+    "sort_before_encode": true
+  },
+  "alterations": {
+    "kind": "multi_hot_vocab",
+    "allowed_values": ["b5", "#5", "b9", "#9", "#11", "b13"],
+    "deduplicate": true,
+    "sort_before_encode": true
+  },
+  "borrowed_pcset": {
+    "kind": "multi_hot_fixed_range",
+    "size": 12,
+    "value_range": [0, 11],
+    "deduplicate": true,
+    "sort_before_encode": true
+  }
+}

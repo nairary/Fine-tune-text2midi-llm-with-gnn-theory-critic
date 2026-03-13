@@ -1,0 +1,186 @@
+{
+  "song_id": {
+    "use_in_model": false,
+    "role": "identifier"
+  },
+
+  "meta.split": {
+    "use_in_model": false,
+    "role": "dataset_split"
+  },
+  "meta.ori_uid": {
+    "use_in_model": false,
+    "role": "grouping_key"
+  },
+  "meta.end_beat": {
+    "use_in_model": true,
+    "encoding": "scalar_float",
+    "spec_ref": "spec_global.json:end_beat"
+  },
+
+  "meta.keys[].beat": {
+    "use_in_model": true,
+    "encoding": "scalar_float",
+    "spec_ref": "spec_global.json:beat"
+  },
+  "meta.keys[].tonic_symbol": {
+    "use_in_model": true,
+    "encoding": "embedding_id",
+    "vocab_ref": "vocab_tonic_symbol.json"
+  },
+  "meta.keys[].tonic_pc": {
+    "use_in_model": true,
+    "encoding": "categorical_int",
+    "spec_ref": "spec_global.json:tonic_pc"
+  },
+  "meta.keys[].scale": {
+    "use_in_model": true,
+    "encoding": "embedding_id",
+    "vocab_ref": "vocab_key_scale.json"
+  },
+
+  "meta.tempos[].beat": {
+    "use_in_model": true,
+    "encoding": "scalar_float",
+    "spec_ref": "spec_global.json:beat"
+  },
+  "meta.tempos[].bpm": {
+    "use_in_model": true,
+    "encoding": "scalar_float",
+    "spec_ref": "spec_global.json:bpm"
+  },
+
+  "meta.meters[].beat": {
+    "use_in_model": true,
+    "encoding": "scalar_float",
+    "spec_ref": "spec_global.json:beat"
+  },
+  "meta.meters[].num_beats": {
+    "use_in_model": true,
+    "encoding": "categorical_int",
+    "spec_ref": "spec_global.json:num_beats"
+  },
+  "meta.meters[].beat_unit": {
+    "use_in_model": true,
+    "encoding": "categorical_int",
+    "spec_ref": "spec_global.json:beat_unit"
+  },
+
+  "melody[].beat": {
+    "use_in_model": true,
+    "encoding": "scalar_float",
+    "spec_ref": "spec_global.json:beat"
+  },
+  "melody[].duration": {
+    "use_in_model": true,
+    "encoding": "scalar_float",
+    "spec_ref": "spec_global.json:duration"
+  },
+  "melody[].sd": {
+    "use_in_model": true,
+    "encoding": "embedding_id",
+    "vocab_ref": "vocab_melody_sd.json"
+  },
+  "melody[].octave": {
+    "use_in_model": true,
+    "encoding": "embedding_id",
+    "spec_ref": "spec_global.json:octave"
+  },
+  "melody[].is_rest": {
+    "use_in_model": true,
+    "encoding": "binary",
+    "spec_ref": "spec_global.json:is_rest"
+  },
+
+  "chords[].beat": {
+    "use_in_model": true,
+    "encoding": "scalar_float",
+    "spec_ref": "spec_global.json:beat"
+  },
+  "chords[].duration": {
+    "use_in_model": true,
+    "encoding": "scalar_float",
+    "spec_ref": "spec_global.json:duration"
+  },
+  "chords[].root": {
+    "use_in_model": true,
+    "encoding": "embedding_id",
+    "spec_ref": "spec_global.json:root"
+  },
+  "chords[].type": {
+    "use_in_model": true,
+    "encoding": "embedding_id",
+    "spec_ref": "spec_global.json:type"
+  },
+  "chords[].inversion": {
+    "use_in_model": true,
+    "encoding": "embedding_id",
+    "spec_ref": "spec_global.json:inversion"
+  },
+  "chords[].applied": {
+    "use_in_model": true,
+    "encoding": "embedding_id",
+    "spec_ref": "spec_global.json:applied"
+  },
+  "chords[].adds": {
+    "use_in_model": true,
+    "encoding": "multi_hot",
+    "spec_ref": "spec_chord_sets.json:adds"
+  },
+  "chords[].omits": {
+    "use_in_model": true,
+    "encoding": "multi_hot",
+    "spec_ref": "spec_chord_sets.json:omits"
+  },
+  "chords[].alterations": {
+    "use_in_model": true,
+    "encoding": "multi_hot_vocab",
+    "spec_ref": "spec_chord_sets.json:alterations"
+  },
+  "chords[].suspensions": {
+    "use_in_model": true,
+    "encoding": "multi_hot",
+    "spec_ref": "spec_chord_sets.json:suspensions"
+  },
+  "chords[].borrowed_kind": {
+    "use_in_model": true,
+    "encoding": "embedding_id",
+    "vocab_ref": "vocab_borrowed_kind.json"
+  },
+  "chords[].borrowed_mode_name": {
+    "use_in_model": true,
+    "encoding": "embedding_id",
+    "vocab_ref": "vocab_borrowed_mode_name.json"
+  },
+  "chords[].borrowed_pcset": {
+    "use_in_model": true,
+    "encoding": "multi_hot_fixed_range",
+    "spec_ref": "spec_chord_sets.json:borrowed_pcset"
+  },
+  "chords[].alternate": {
+    "use_in_model": false,
+    "role": "preserved_but_ignored_in_baseline"
+  },
+  "chords[].is_rest": {
+    "use_in_model": true,
+    "encoding": "binary",
+    "spec_ref": "spec_global.json:is_rest"
+  },
+
+  "sections[].labels": {
+    "use_in_model": false,
+    "role": "auxiliary_supervision_or_future_section_task"
+  },
+  "sections[].duration_seconds": {
+    "use_in_model": false,
+    "role": "audio_alignment_metadata"
+  },
+  "sections[].segment_start_seconds": {
+    "use_in_model": false,
+    "role": "audio_alignment_metadata"
+  },
+  "sections[].segment_end_seconds": {
+    "use_in_model": false,
+    "role": "audio_alignment_metadata"
+  }
+}

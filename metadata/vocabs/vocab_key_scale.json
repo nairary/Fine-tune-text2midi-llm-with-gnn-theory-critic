@@ -1,0 +1,13 @@
+{
+  "<PAD>": 0,
+  "<UNK>": 1,
+  "major": 2,
+  "minor": 3,
+  "dorian": 4,
+  "phrygian": 5,
+  "lydian": 6,
+  "mixolydian": 7,
+  "locrian": 8,
+  "harmonic_minor": 9,
+  "phrygian_dominant": 10
+}

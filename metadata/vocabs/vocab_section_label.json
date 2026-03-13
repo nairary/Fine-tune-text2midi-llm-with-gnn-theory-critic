@@ -1,0 +1,12 @@
+{
+  "<PAD>": 0,
+  "<UNK>": 1,
+  "verse": 2,
+  "chorus": 3,
+  "pre-chorus": 4,
+  "bridge": 5,
+  "intro": 6,
+  "outro": 7,
+  "instrumental": 8,
+  "solo": 9
+}

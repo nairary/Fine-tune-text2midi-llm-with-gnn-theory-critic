@@ -1,0 +1,64 @@
+{
+  "root": {
+    "kind": "categorical_int",
+    "allowed_values": [0, 1, 2, 3, 4, 5, 6, 7],
+    "unknown_policy": "map_to_null"
+  },
+  "type": {
+    "kind": "categorical_int",
+    "allowed_values": [5, 7, 9, 11, 13],
+    "unknown_policy": "map_to_null"
+  },
+  "inversion": {
+    "kind": "categorical_int",
+    "allowed_values": [0, 1, 2, 3],
+    "unknown_policy": "map_to_null"
+  },
+  "applied": {
+    "kind": "categorical_int",
+    "allowed_values": [0, 1, 2, 3, 4, 5, 6, 7],
+    "unknown_policy": "map_to_null"
+  },
+  "octave": {
+    "kind": "categorical_int_with_missing",
+    "min": -4,
+    "max": 4,
+    "missing_token": "<UNK_OCTAVE>"
+  },
+  "is_rest": {
+    "kind": "binary"
+  },
+  "beat": {
+    "kind": "scalar_float"
+  },
+  "duration": {
+    "kind": "scalar_float"
+  },
+  "bpm": {
+    "kind": "scalar_float"
+  },
+  "end_beat": {
+    "kind": "scalar_float"
+  },
+  "segment_start_seconds": {
+    "kind": "scalar_float"
+  },
+  "segment_end_seconds": {
+    "kind": "scalar_float"
+  },
+  "duration_seconds": {
+    "kind": "scalar_float"
+  },
+  "tonic_pc": {
+    "kind": "categorical_int",
+    "allowed_values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+  },
+  "num_beats": {
+    "kind": "categorical_int",
+    "allowed_values": [2, 3, 4, 5, 6, 8, 9, 12]
+  },
+  "beat_unit": {
+    "kind": "categorical_int",
+    "allowed_values": [1, 3]
+  }
+}
