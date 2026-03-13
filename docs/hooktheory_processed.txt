@@ -1,0 +1,348 @@
+==================================================
+hooktheory_processed.json
+==================================================
+
+Purpose
+-------
+This file stores the processed per-clip symbolic dataset built from the raw HookTheory JSON and the
+HookTheoryStructure.{train,val,test}.jsonl files.
+
+Each top-level entry corresponds to one symbolic clip/song object identified by `song_id`.
+This is the main dataset used to build teacher graphs and later MIDI-compatible observer inputs.
+
+Top-level structure
+-------------------
+The file is a JSON object (dictionary) of the form:
+
+{
+  "<song_id>": { ... processed clip object ... },
+  "<song_id>": { ... },
+  ...
+}
+
+The top-level key and the inner field `song_id` should refer to the same clip id.
+
+Processed clip object schema
+----------------------------
+{
+  "song_id": str,
+  "meta": {
+    "split": str | null,
+    "ori_uid": str | null,
+    "end_beat": number | null,
+    "keys": [key_region, ...],
+    "tempos": [tempo_region, ...],
+    "meters": [meter_region, ...]
+  },
+  "melody": [melody_note, ...],
+  "chords": [chord_event, ...],
+  "sections": [section_segment, ...]
+}
+
+Field-by-field documentation
+----------------------------
+
+A. song_id
+----------
+Type:
+- string
+
+Meaning:
+- Unique id of the symbolic clip.
+- This is the clip-level identifier used throughout the processed dataset.
+- For section annotation matching, this id corresponds to the stem of `audio_path` from the structure files:
+  e.g. `data/HookTheory/hooktheory_clips/BbWgMGXzolX.mp3` -> `song_id = "BbWgMGXzolX"`.
+
+Usage:
+- Primary key for accessing one clip in the processed dataset.
+- Used later to trace which clip-level symbolic object contributed to a full-song timeline.
+
+
+B. meta
+-------
+Type:
+- object
+
+Meaning:
+- Clip-level metadata and global symbolic configuration.
+
+Schema:
+{
+  "split": str | null,
+  "ori_uid": str | null,
+  "end_beat": number | null,
+  "keys": [key_region, ...],
+  "tempos": [tempo_region, ...],
+  "meters": [meter_region, ...]
+}
+
+B1. meta.split
+--------------
+Type:
+- string or null
+
+Expected values:
+- "train"
+- "val"
+- "test"
+- possibly null if unavailable
+
+Meaning:
+- Dataset split for this clip.
+
+Usage:
+- Used to decide which HookTheoryStructure split file to join against.
+- Useful for training/validation/test separation.
+
+B2. meta.ori_uid
+----------------
+Type:
+- string or null
+
+Meaning:
+- Identifier of the original full audio song from which this clip was extracted.
+- Multiple different `song_id` values can share the same `ori_uid`.
+
+Usage:
+- Main key for grouping multiple clips into one reconstructed full-song timeline.
+- Used by `build_original_song_timelines.py`.
+
+Important:
+- `ori_uid = null` means no section structure entry was matched for this clip.
+
+B3. meta.end_beat
+-----------------
+Type:
+- number or null
+
+Meaning:
+- End beat of the symbolic clip in HookTheory beat coordinates.
+
+Usage:
+- Useful for graph construction and symbolic clip length estimation.
+
+Note:
+- This is symbolic time, not audio time in seconds.
+
+B4. meta.keys
+-------------
+Type:
+- list of key_region objects
+
+Reason for list:
+- Some clips contain more than one key region.
+- The preprocessing intentionally preserves all of them instead of collapsing to the first element.
+
+key_region schema:
+{
+  "beat": number | null,
+  "tonic": str | null,
+  "scale": str | null
+}
+
+Fields:
+- beat:
+  Beat at which the key region starts.
+- tonic:
+  Key tonic as represented in HookTheory, e.g. "A", "Bb", "F#".
+- scale:
+  Scale / mode label, e.g. "major", "minor", "dorian", etc.
+
+Usage:
+- Teacher model symbolic conditioning.
+- Future harmonic context modeling.
+
+B5. meta.tempos
+---------------
+Type:
+- list of tempo_region objects
+
+Reason for list:
+- Some clips contain more than one tempo region.
+
+tempo_region schema:
+{
+  "beat": number | null,
+  "bpm": number | null
+}
+
+Fields:
+- beat:
+  Beat at which the tempo region starts.
+- bpm:
+  Tempo in beats per minute.
+
+Usage:
+- Symbolic timing context.
+- Later mapping between symbolic and absolute time if needed.
+
+B6. meta.meters
+---------------
+Type:
+- list of meter_region objects
+
+Reason for list:
+- Some clips contain more than one meter region.
+
+meter_region schema:
+{
+  "beat": number | null,
+  "num_beats": number | null,
+  "beat_unit": number | null
+}
+
+Fields:
+- beat:
+  Beat at which the meter region starts.
+- num_beats:
+  Numerator-like part of the meter representation.
+- beat_unit:
+  Denominator-like or internal beat-unit representation from HookTheory.
+
+Usage:
+- Meter-aware graph construction.
+- Positional features such as bar index and position in bar.
+
+
+C. melody
+---------
+Type:
+- list of melody_note objects
+
+Meaning:
+- Symbolic note events for the clip melody.
+
+melody_note schema:
+{
+  "beat": number | null,
+  "duration": number | null,
+  "sd": str | null,
+  "octave": number | null,
+  "is_rest": bool | null
+}
+
+Fields:
+- beat:
+  Start beat of the note/rest in symbolic time.
+- duration:
+  Duration in beats.
+- sd:
+  Scale degree representation relative to key, e.g. "1", "b3", "#4".
+- octave:
+  Relative octave index as stored in HookTheory.
+- is_rest:
+  Whether the event is a rest.
+
+Usage:
+- Main note-level symbolic input for teacher graph construction.
+- Can later be converted into pseudo-MIDI-like note features for observer pretraining.
+
+Important:
+- `sd` is not an absolute MIDI pitch.
+- It is a key-relative melodic representation.
+
+D. chords
+---------
+Type:
+- list of chord_event objects
+
+Meaning:
+- Symbolic harmonic events for the clip.
+
+chord_event schema:
+{
+  "beat": number | null,
+  "duration": number | null,
+  "root": number | str | null,
+  "type": number | str | null,
+  "inversion": number | null,
+  "applied": number | str | null,
+  "adds": [ ... ],
+  "omits": [ ... ],
+  "alterations": [ ... ],
+  "suspensions": [ ... ],
+  "borrowed": any | null,
+  "alternate": any | null,
+  "is_rest": bool | null
+}
+
+Fields:
+- beat:
+  Start beat of the chord.
+- duration:
+  Chord duration in beats.
+- root:
+  Chord root encoding from HookTheory.
+- type:
+  Chord type encoding from HookTheory.
+- inversion:
+  Inversion index.
+- applied:
+  Applied-function / secondary-function field from HookTheory.
+- adds:
+  List of added chord tones/extensions.
+- omits:
+  List of omitted chord tones.
+- alterations:
+  List of altered chord components.
+- suspensions:
+  List of suspensions.
+- borrowed:
+  Borrowed-harmony field if present.
+- alternate:
+  Alternate representation field if present.
+- is_rest:
+  Whether the event is marked as harmonic rest.
+
+Usage:
+- Main harmonic symbolic input for teacher graph construction.
+- Candidate source of chord-level nodes and harmonic relations.
+
+Important:
+- These are symbolic functional harmony annotations, not plain MIDI-derived chord labels.
+
+E. sections
+-----------
+Type:
+- list of section_segment objects
+
+Meaning:
+- Audio-aligned section clips matched from HookTheoryStructure split files.
+
+Important:
+- These are stored in seconds, not in symbolic beats.
+- They belong to the audio clip alignment domain, not directly to the symbolic beat timeline.
+
+section_segment schema:
+{
+  "labels": [str, ...],
+  "duration_seconds": number | null,
+  "segment_start_seconds": number | null,
+  "segment_end_seconds": number | null
+}
+
+Fields:
+- labels:
+  List of section labels attached to this clip segment, e.g. ["verse"], ["chorus"].
+- duration_seconds:
+  Duration of the audio segment in seconds.
+- segment_start_seconds:
+  Start time of this segment within the original full audio song.
+- segment_end_seconds:
+  End time of this segment within the original full audio song.
+
+Usage:
+- Section-aware supervision.
+- Grouping clips into original-song timelines.
+- Later song-level structure modeling.
+
+Important note:
+- `sections` are aligned in audio time.
+- `melody` and `chords` are aligned in symbolic beat time.
+- These two timelines should not be treated as directly equivalent without an explicit alignment procedure.
+
+Typical workflow usage
+----------------------
+- Use all entries in `hooktheory_processed.json` for general symbolic teacher pretraining.
+- Use only entries with non-null `meta.ori_uid` and non-empty `sections` for section-aware experiments or
+  for constructing original-song timelines.

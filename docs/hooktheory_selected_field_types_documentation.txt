@@ -1,0 +1,735 @@
+HookTheory selected field types and value domains
+============================================
+
+This document describes only the fields that were selected for the current preprocessing pipeline and retained in the processed dataset.
+
+The description covers:
+
+1. fields stored in `hooktheory_processed.json`
+2. fields stored in `original_songs_timeline.json`
+
+
+==================================================
+1. Fields kept in `hooktheory_processed.json`
+==================================================
+
+Top-level structure
+-------------------
+```json
+{
+  "<song_id>": {
+    "song_id": "...",
+    "meta": { ... },
+    "melody": [ ... ],
+    "chords": [ ... ],
+    "sections": [ ... ]
+  }
+}
+```
+
+--------------------------------------------------
+1.1 song_id
+--------------------------------------------------
+Type:
+- string
+
+Meaning:
+- Clip-level identifier.
+- This is the main id of one symbolic HookTheory clip.
+
+Source:
+- raw HookTheory `hash`
+
+Usage:
+- primary key of the processed dataset
+- traceability to section clips and later full-song grouping
+
+
+--------------------------------------------------
+1.2 meta
+--------------------------------------------------
+Type:
+- object
+
+Schema:
+```json
+{
+  "split": str | null,
+  "ori_uid": str | null,
+  "end_beat": number | null,
+  "keys": [key_region, ...],
+  "tempos": [tempo_region, ...],
+  "meters": [meter_region, ...]
+}
+```
+
+### meta.split
+Type:
+- string or null
+
+Typical values:
+- `"train"`
+- `"val"`
+- `"test"`
+
+Meaning:
+- Dataset split of the clip.
+
+### meta.ori_uid
+Type:
+- string or null
+
+Meaning:
+- Identifier of the original full song from which this clip was extracted.
+
+Typical values:
+- YouTube-like ids such as:
+  - `Rk6YDzmqZ0I`
+  - `7bnX-6sJZBw`
+  - `X1Fqn9du7xo`
+
+Usage:
+- grouping key for reconstructing full-song timelines
+
+### meta.end_beat
+Type:
+- number or null
+
+Meaning:
+- End beat of the symbolic clip.
+
+Usage:
+- symbolic clip length
+- later graph construction
+
+### meta.keys
+Type:
+- list of key-region objects
+
+Schema:
+```json
+{
+  "beat": number | null,
+  "tonic": string | null,
+  "scale": string | null
+}
+```
+
+#### keys[].beat
+Type:
+- number or null
+
+Meaning:
+- Beat at which the key region starts.
+
+#### keys[].tonic
+Type:
+- string or null
+
+Observed values:
+- natural note names:
+  - `C`, `D`, `E`, `F`, `G`, `A`, `B`
+- accidentals:
+  - `Bb`, `Eb`, `Ab`, `Db`, `Gb`
+  - `F#`, `C#`, `G#`, `D#`, `A#`
+  - rarer: `E#`
+
+Meaning:
+- tonal center of the region
+
+#### keys[].scale
+Type:
+- string or null
+
+Observed values:
+- `major`
+- `minor`
+- `mixolydian`
+- `dorian`
+- `phrygian`
+- `lydian`
+- `locrian`
+- `harmonicMinor`
+- `phrygianDominant`
+
+Meaning:
+- scale / mode label of the region
+
+Important:
+- `keys` is kept as an array because one clip may contain multiple key regions.
+
+### meta.tempos
+Type:
+- list of tempo-region objects
+
+Schema:
+```json
+{
+  "beat": number | null,
+  "bpm": number | null
+}
+```
+
+#### tempos[].beat
+Type:
+- number or null
+
+Meaning:
+- Beat at which the tempo region starts.
+
+#### tempos[].bpm
+Type:
+- number or null
+
+Meaning:
+- Tempo in beats per minute.
+
+Important:
+- `tempos` is kept as an array because one clip may contain multiple tempo regions.
+
+### meta.meters
+Type:
+- list of meter-region objects
+
+Schema:
+```json
+{
+  "beat": number | null,
+  "num_beats": number | null,
+  "beat_unit": number | null
+}
+```
+
+#### meters[].beat
+Type:
+- number or null
+
+Meaning:
+- Beat at which the meter region starts.
+
+#### meters[].num_beats
+Type:
+- number or null
+
+Observed values:
+- typically `2`, `3`, `4`, `5`, `6`, `8`, `9`, `12`
+
+Meaning:
+- measure size / meter numerator-like field
+
+#### meters[].beat_unit
+Type:
+- number or null
+
+Observed values:
+- often `1`
+- rarer other numeric values
+
+Meaning:
+- HookTheory beat-unit field
+
+Important:
+- `meters` is kept as an array because one clip may contain multiple meter regions.
+
+
+--------------------------------------------------
+1.3 melody
+--------------------------------------------------
+Type:
+- list of melody-note objects
+
+Schema:
+```json
+{
+  "beat": number | null,
+  "duration": number | null,
+  "sd": string | null,
+  "octave": number | null,
+  "is_rest": bool | null
+}
+```
+
+### melody[].beat
+Type:
+- number or null
+
+Observed values:
+- integer and fractional beats:
+  - `1`
+  - `3.5`
+  - `3.75`
+  - `5.25`
+  - etc.
+
+Meaning:
+- symbolic onset time of the note/rest
+
+### melody[].duration
+Type:
+- number or null
+
+Observed values:
+- `0.25`
+- `0.5`
+- `0.75`
+- `1`
+- `2`
+- `4`
+- etc.
+
+Meaning:
+- symbolic duration in beats
+
+### melody[].sd
+Type:
+- string or null
+
+Meaning:
+- relative scale degree of the melody note
+
+Observed values:
+- diatonic:
+  - `1`, `2`, `3`, `4`, `5`, `6`, `7`
+- flat variants:
+  - `b1`, `b2`, `b3`, `b4`, `b5`, `b6`, `b7`
+- sharp variants:
+  - `#1`, `#2`, `#3`, `#4`, `#5`, `#6`, `#7`
+- rare:
+  - `bb1`
+- noisy:
+  - empty string `""`
+
+Important:
+- `sd` is not an absolute MIDI pitch
+- it is a key-relative melodic token
+
+### melody[].octave
+Type:
+- number or null
+
+Observed values:
+- integers such as:
+  - `-1`
+  - `0`
+  - `1`
+  - `2`
+
+Meaning:
+- relative octave offset used together with `sd`
+
+### melody[].is_rest
+Type:
+- boolean or null
+
+Observed values:
+- `true`
+- `false`
+
+Meaning:
+- whether the event is a rest
+
+
+--------------------------------------------------
+1.4 chords
+--------------------------------------------------
+Type:
+- list of chord-event objects
+
+Schema:
+```json
+{
+  "beat": number | null,
+  "duration": number | null,
+  "root": number | string | null,
+  "type": number | string | null,
+  "inversion": number | null,
+  "applied": number | string | null,
+  "adds": list,
+  "omits": list,
+  "alterations": list,
+  "suspensions": list,
+  "borrowed": any | null,
+  "alternate": any | null,
+  "is_rest": bool | null
+}
+```
+
+### chords[].beat
+Type:
+- number or null
+
+Meaning:
+- symbolic onset of the chord
+
+### chords[].duration
+Type:
+- number or null
+
+Meaning:
+- symbolic duration of the chord in beats
+
+### chords[].root
+Type:
+- integer or null
+
+Observed values:
+- typically functional scale-degree-like values:
+  - `1`, `2`, `3`, `4`, `5`, `6`, `7`
+- sometimes `0` or null in edge cases
+
+Meaning:
+- functional root of the chord relative to the tonal context
+
+### chords[].type
+Type:
+- integer or null
+
+Observed values:
+- `5`
+- `7`
+- `9`
+- `11`
+- `13`
+
+Interpretation:
+- `5`  -> triad
+- `7`  -> seventh chord
+- `9`  -> ninth chord
+- `11` -> eleventh chord
+- `13` -> thirteenth chord
+
+### chords[].inversion
+Type:
+- integer or null
+
+Observed values:
+- `0`, `1`, `2`, `3`
+
+Meaning:
+- inversion index
+
+### chords[].applied
+Type:
+- integer, string, or null
+
+Observed values:
+- often `0`
+- other numeric values for applied harmony
+
+Meaning:
+- secondary / applied harmonic function
+
+### chords[].adds
+Type:
+- list
+
+Observed contents:
+- integers such as:
+  - `2`
+  - `4`
+  - `6`
+  - `9`
+  - `11`
+  - `13`
+
+Meaning:
+- added chord tones / extensions
+
+### chords[].omits
+Type:
+- list
+
+Observed contents:
+- integers such as:
+  - `3`
+  - `5`
+
+Meaning:
+- omitted chord tones
+
+### chords[].alterations
+Type:
+- list
+
+Observed contents:
+- string-like alteration tokens such as:
+  - `#5`
+  - `b9`
+  - `b13`
+
+Meaning:
+- chromatic chord alterations
+
+### chords[].suspensions
+Type:
+- list
+
+Observed contents:
+- integers such as:
+  - `2`
+  - `4`
+
+Meaning:
+- suspension markers such as sus2 / sus4
+
+### chords[].borrowed
+Type:
+- null, string, or list
+
+Observed values:
+- `null`
+- `"major"`
+- `"minor"`
+- explicit scale lists such as:
+  - `[0, 2, 4, 5, 7, 9, 11]`
+
+Meaning:
+- borrowed-harmony / modal-mixture information
+
+### chords[].alternate
+Type:
+- string, null, or auxiliary value
+
+Meaning:
+- alternate chord naming / auxiliary field
+
+Status:
+- preserved in processed data
+- not used in the baseline interpretation yet
+
+### chords[].is_rest
+Type:
+- boolean or null
+
+Observed values:
+- `true`
+- `false`
+
+Meaning:
+- whether the harmonic event is a rest
+
+
+--------------------------------------------------
+1.5 sections
+--------------------------------------------------
+Type:
+- list of section-segment objects
+
+Schema:
+```json
+{
+  "labels": [str, ...],
+  "duration_seconds": number | null,
+  "segment_start_seconds": number | null,
+  "segment_end_seconds": number | null
+}
+```
+
+Important:
+- These fields are in **audio seconds**
+- They are not symbolic beat coordinates
+
+### sections[].labels
+Type:
+- list of strings
+
+Observed values:
+- `["verse"]`
+- `["chorus"]`
+- `["pre-chorus"]`
+- `["bridge"]`
+- `["intro"]`
+- etc.
+
+Meaning:
+- section label(s) attached to the audio clip segment
+
+### sections[].duration_seconds
+Type:
+- number or null
+
+Meaning:
+- duration of the audio section clip in seconds
+
+### sections[].segment_start_seconds
+Type:
+- number or null
+
+Meaning:
+- start time of the segment inside the original full audio song
+
+### sections[].segment_end_seconds
+Type:
+- number or null
+
+Meaning:
+- end time of the segment inside the original full audio song
+
+
+==================================================
+2. Fields kept in `original_songs_timeline.json`
+==================================================
+
+Top-level structure
+-------------------
+```json
+{
+  "<ori_uid>": {
+    "ori_uid": "...",
+    "clip_song_ids": [...],
+    "splits": [...],
+    "timeline": [...],
+    "clips_without_sections": [...]
+  }
+}
+```
+
+--------------------------------------------------
+2.1 ori_uid
+--------------------------------------------------
+Type:
+- string
+
+Meaning:
+- original full-song identifier
+
+Usage:
+- grouping key for all clip-level entries that belong to the same original song
+
+
+--------------------------------------------------
+2.2 clip_song_ids
+--------------------------------------------------
+Type:
+- list of strings
+
+Meaning:
+- all clip `song_id`s grouped under this original song
+
+
+--------------------------------------------------
+2.3 splits
+--------------------------------------------------
+Type:
+- list of strings
+
+Observed values:
+- `["train"]`
+- `["val"]`
+- `["test"]`
+
+Meaning:
+- dataset splits represented by the grouped clips
+
+
+--------------------------------------------------
+2.4 timeline
+--------------------------------------------------
+Type:
+- list of timeline-segment objects
+
+Schema:
+```json
+{
+  "segment_start_seconds": number | null,
+  "segment_end_seconds": number | null,
+  "duration_seconds": number | null,
+  "labels": [str, ...],
+  "clip_song_ids": [str, ...],
+  "splits": [str, ...]
+}
+```
+
+Meaning:
+- ordered list of section segments for the original full song
+
+Construction:
+- all section clips with the same `ori_uid` are collected
+- sorted by `segment_start_seconds`
+- exact duplicate intervals `(start, end)` are merged as noisy duplicates
+
+### timeline[].segment_start_seconds
+Type:
+- number or null
+
+Meaning:
+- start time of the interval in the original audio song
+
+### timeline[].segment_end_seconds
+Type:
+- number or null
+
+Meaning:
+- end time of the interval in the original audio song
+
+### timeline[].duration_seconds
+Type:
+- number or null
+
+Meaning:
+- segment duration in seconds
+
+### timeline[].labels
+Type:
+- list of strings
+
+Meaning:
+- merged set of labels attached to that interval
+
+Observed values:
+- combinations such as:
+  - `["verse"]`
+  - `["chorus"]`
+  - `["verse", "pre-chorus", "chorus"]` in noisy duplicate cases
+
+### timeline[].clip_song_ids
+Type:
+- list of strings
+
+Meaning:
+- all clip ids that contributed to this merged interval
+
+### timeline[].splits
+Type:
+- list of strings
+
+Meaning:
+- splits represented by the contributing clips
+
+
+--------------------------------------------------
+2.5 clips_without_sections
+--------------------------------------------------
+Type:
+- list of strings
+
+Meaning:
+- clip ids that share this `ori_uid` but did not have matched section segments
+
+
+==================================================
+3. Summary
+==================================================
+
+The retained fields are exactly the minimum subset needed for:
+
+- symbolic teacher-graph construction:
+  - melody
+  - chords
+  - key / tempo / meter metadata
+
+- section-aware grouping:
+  - `meta.ori_uid`
+  - `sections`
+
+- full-song timeline reconstruction:
+  - `ori_uid`
+  - merged `timeline` in seconds
+
+Fields intentionally kept out of this reduced specification:
+- artist / title / youtube metadata
+- inactiveNotes
+- pedal
+- recordingEndBeat
+- raw audio technical metadata
+- other auxiliary fields not used in the current baseline

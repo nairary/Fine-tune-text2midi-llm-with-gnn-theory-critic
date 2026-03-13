@@ -1,0 +1,193 @@
+==================================================
+original_songs_timeline.json
+==================================================
+
+Purpose
+-------
+This file groups clip-level entries from `hooktheory_processed.json` by `meta.ori_uid` and reconstructs a
+coarse timeline of the original full audio song.
+
+Each top-level entry corresponds to one original song, not one symbolic clip.
+
+Top-level structure
+-------------------
+{
+  "<ori_uid>": { ... original song timeline object ... },
+  "<ori_uid>": { ... },
+  ...
+}
+
+Original song timeline object schema
+------------------------------------
+{
+  "ori_uid": str,
+  "clip_song_ids": [str, ...],
+  "splits": [str, ...],
+  "timeline": [timeline_segment, ...],
+  "clips_without_sections": [str, ...]
+}
+
+Field-by-field documentation
+----------------------------
+
+A. ori_uid
+----------
+Type:
+- string
+
+Meaning:
+- Identifier of the original full song in the audio dataset.
+- This is the grouping key used to collect all clip-level annotations belonging to the same original song.
+
+B. clip_song_ids
+----------------
+Type:
+- list of strings
+
+Meaning:
+- All clip-level `song_id`s that were grouped into this original song.
+
+Usage:
+- Traceability from full-song timeline back to the contributing symbolic clips.
+
+C. splits
+---------
+Type:
+- list of strings
+
+Meaning:
+- Set of dataset splits represented by the contributing clips.
+
+Typical values:
+- ["train"]
+- ["val"]
+- ["test"]
+
+Usage:
+- Sanity checks and split consistency diagnostics.
+
+D. timeline
+-----------
+Type:
+- list of timeline_segment objects
+
+Meaning:
+- Ordered sequence of section segments in the original song, represented in audio time.
+
+Construction logic:
+1. collect all `sections` from all clips sharing the same `ori_uid`
+2. sort by `segment_start_seconds`
+3. merge exact duplicate intervals `(segment_start_seconds, segment_end_seconds)` as noisy duplicates
+4. union labels and clip ids for merged duplicates
+
+timeline_segment schema:
+{
+  "segment_start_seconds": number | null,
+  "segment_end_seconds": number | null,
+  "duration_seconds": number | null,
+  "labels": [str, ...],
+  "clip_song_ids": [str, ...],
+  "splits": [str, ...]
+}
+
+Fields:
+- segment_start_seconds:
+  Start time of the section interval in the original song.
+- segment_end_seconds:
+  End time of the section interval in the original song.
+- duration_seconds:
+  Duration of the section interval.
+- labels:
+  Merged set of labels attached to this interval.
+- clip_song_ids:
+  All clip ids that contributed this interval.
+- splits:
+  Splits of the contributing clips.
+
+Important:
+- If multiple clips with the same `ori_uid` share exactly the same interval but have different labels,
+  they are merged into a single timeline segment.
+- This is intended to treat exact duplicate intervals as noisy duplicated annotations.
+
+E. clips_without_sections
+-------------------------
+Type:
+- list of strings
+
+Meaning:
+- Clip ids that belong to this `ori_uid` but had no section entries attached in `hooktheory_processed.json`.
+
+Usage:
+- Diagnostics for partial section coverage.
+
+Semantics of duplicate merging
+------------------------------
+If several clips share:
+- the same `ori_uid`
+- the same `segment_start_seconds`
+- the same `segment_end_seconds`
+
+then they are treated as duplicate annotations of the same original-song interval.
+
+Example:
+{
+  "segment_start_seconds": 14.25,
+  "segment_end_seconds": 40.909912109375,
+  "labels": ["chorus", "pre-chorus", "verse"],
+  "clip_song_ids": ["DnZgWOjVgry", "WAQodKMYxDl", "ZdPoDAeAmnM"]
+}
+
+Interpretation:
+- the system assumes this is one interval with noisy/conflicting labels, not three different timeline events.
+
+Recommended usage
+-----------------
+This file is useful for:
+- reconstructing section-level order of clips within the original audio song,
+- section-sequence analysis,
+- future song-level graph construction,
+- filtering to original songs with at least one section timeline segment.
+
+This file is not yet a full symbolic song reconstruction because:
+- the symbolic note/chord data remain clip-local,
+- section timing is in audio seconds,
+- no explicit symbolic-to-audio beat alignment is performed here.
+
+Relationship between the two files
+----------------------------------
+`hooktheory_processed.json`
+- clip-level symbolic dataset
+- contains symbolic notes/chords plus attached audio section metadata
+
+`original_songs_timeline.json`
+- original-song-level grouping of those clips
+- contains section timelines in seconds aggregated by `ori_uid`
+
+In short:
+- use `hooktheory_processed.json` for clip-level symbolic modeling,
+- use `original_songs_timeline.json` for full-song section order analysis and section grouping.
+
+
+Practical recommendations
+=========================
+
+1. Teacher pretraining
+----------------------
+Use `hooktheory_processed.json` as the primary source of symbolic supervision.
+
+2. Section-aware experiments
+----------------------------
+Use only entries in `hooktheory_processed.json` where:
+- `meta.ori_uid` is not null
+- `sections` is non-empty
+
+3. Full-song section ordering
+-----------------------------
+Use `original_songs_timeline.json`.
+
+4. Be careful about timeline domains
+------------------------------------
+- `melody` and `chords` are in symbolic beat time.
+- `sections` and `timeline` are in audio seconds.
+
+They should not be mixed directly without explicit alignment.
