@@ -37,10 +37,14 @@ def load_metadata(metadata_dir):
         "section_label": load_json(vocabs_dir / "vocab_section_label.json"),
     }
 
+    field_specs_path = specs_dir / "field_specs.json"
+    if not field_specs_path.exists():
+        field_specs_path = specs_dir / "field_spec.json"
+
     specs = {
         "global": load_json(specs_dir / "spec_global.json"),
         "chord_sets": load_json(specs_dir / "spec_chord_sets.json"),
-        "field_specs": load_json(specs_dir / "field_specs.json"),
+        "field_specs": load_json(field_specs_path),
     }
 
     return vocabs, specs
