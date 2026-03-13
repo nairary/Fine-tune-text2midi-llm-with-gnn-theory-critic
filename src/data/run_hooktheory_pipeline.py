@@ -9,35 +9,7 @@ from encode_teacher_features import load_metadata, build_runtime_maps, encode_so
 
 
 def dump_json(obj, path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def build_structured_only_songs(songs):
-    return {
-        song_id: song
-        for song_id, song in songs.items()
-        if song.get("meta", {}).get("ori_uid") is not None and len(song.get("sections", [])) > 0
-    }
-
-
-def canonicalize_dataset(dataset, keep_raw=False):
-    reporter = Reporter()
-    canonical = {
-        song_id: normalize_song(song_id, song, reporter=reporter, keep_raw=keep_raw)
-        for song_id, song in dataset.items()
-    }
-    return canonical, reporter.to_dict()
-
-
-def encode_dataset(canonical, metadata_dir):
-    vocabs, specs = load_metadata(metadata_dir)
-    runtime_maps = build_runtime_maps(specs)
-    encoded = {
-        song_id: encode_song(song_id, song, vocabs=vocabs, specs=specs, runtime_maps=runtime_maps)
-        for song_id, song in canonical.items()
-    }
-    return encoded, runtime_maps
 
 
 def parse_args():
@@ -59,9 +31,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+
     out_dir = Path(args.out_dir)
-    canonical_full_dir = out_dir / "canonical_full"
-    canonical_structured_dir = out_dir / "canonical_structured_only"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     print("[PIPELINE] Step 1/4: preprocess")
     songs, processed_stats, attach_stats = build_processed_dataset(
@@ -71,51 +43,40 @@ def main():
         structure_test_path=args.structure_test,
         do_compute_stats=args.compute_stats,
     )
-    structured_only = build_structured_only_songs(songs)
-
-    # exactly as in hk_data_pipeline
-    dump_json(songs, out_dir / "hooktheory_processed.json")
-    dump_json(structured_only, out_dir / "hooktheory_processed_structured_only.json")
-    dump_json(attach_stats.get("unmatched_song_ids", []), out_dir / "hooktheory_processed_unmatched_ids.json")
-    dump_json(attach_stats.get("unknown_split_song_ids", []), out_dir / "hooktheory_processed_unknown_split_ids.json")
+    dump_json(songs, out_dir / "processed.json")
     if args.compute_stats:
-        dump_json(processed_stats, out_dir / "hooktheory_processed.stats.json")
+        dump_json(processed_stats, out_dir / "processed.stats.json")
+        dump_json(attach_stats, out_dir / "processed.attach.stats.json")
 
     print("[PIPELINE] Step 2/4: timelines")
-    timeline, timeline_aggregate = build_original_song_timelines(structured_only)
-    dump_json(timeline, out_dir / "original_songs_timeline.json")
+    timeline, timeline_aggregate = build_original_song_timelines(songs)
+    dump_json(timeline, out_dir / "timeline.json")
     if args.compute_stats:
-        timeline_stats = compute_timeline_stats(timeline)
-        dump_json(timeline_aggregate, out_dir / "original_songs_aggregate.stats.json")
-        dump_json(timeline_stats, out_dir / "original_songs_timeline.stats.json")
+        dump_json(timeline_aggregate, out_dir / "timeline.aggregate.stats.json")
+        dump_json(compute_timeline_stats(timeline), out_dir / "timeline.stats.json")
 
     print("[PIPELINE] Step 3/4: canonicalize")
-    canonical_full, canonical_full_report = canonicalize_dataset(songs, keep_raw=args.keep_raw)
-    canonical_structured, canonical_structured_report = canonicalize_dataset(structured_only, keep_raw=args.keep_raw)
-
-    dump_json(canonical_full, canonical_full_dir / "hooktheory_canonical.json")
-    dump_json(canonical_structured, canonical_structured_dir / "hooktheory_canonical.json")
-
-    canonical_full_stats = compute_canonical_stats(canonical_full)
-    canonical_structured_stats = compute_canonical_stats(canonical_structured)
-    dump_json(canonical_full_stats, canonical_full_dir / "hooktheory_canonical.stats.json")
-    dump_json(canonical_full_report, canonical_full_dir / "hooktheory_canonical.report.json")
-    dump_json(canonical_structured_stats, canonical_structured_dir / "hooktheory_canonical.stats.json")
-    dump_json(canonical_structured_report, canonical_structured_dir / "hooktheory_canonical.report.json")
+    reporter = Reporter()
+    canonical = {
+        song_id: normalize_song(song_id, song, reporter=reporter, keep_raw=args.keep_raw)
+        for song_id, song in songs.items()
+    }
+    dump_json(canonical, out_dir / "canonical.json")
+    if args.compute_stats:
+        dump_json(compute_canonical_stats(canonical), out_dir / "canonical.stats.json")
+        dump_json(reporter.to_dict(), out_dir / "canonical.report.json")
 
     print("[PIPELINE] Step 4/4: encode")
-    encoded_full, runtime_maps = encode_dataset(canonical_full, metadata_dir=args.metadata_dir)
-    encoded_structured, _ = encode_dataset(canonical_structured, metadata_dir=args.metadata_dir)
-
-    # two encoded jsons for canonicalized full vs structured-only
-    dump_json(encoded_full, canonical_full_dir / "teacher_encoded.json")
-    dump_json(encoded_structured, canonical_structured_dir / "teacher_encoded.json")
-
+    vocabs, specs = load_metadata(args.metadata_dir)
+    runtime_maps = build_runtime_maps(specs)
+    encoded = {
+        song_id: encode_song(song_id, song, vocabs=vocabs, specs=specs, runtime_maps=runtime_maps)
+        for song_id, song in canonical.items()
+    }
+    dump_json(encoded, out_dir / "encoded.json")
     if args.compute_stats:
-        dump_json(compute_encoded_stats(encoded_full), canonical_full_dir / "teacher_encoded.stats.json")
-        dump_json(compute_encoded_stats(encoded_structured), canonical_structured_dir / "teacher_encoded.stats.json")
-        dump_json(runtime_maps, canonical_full_dir / "teacher_encoder_maps.json")
-        dump_json(runtime_maps, canonical_structured_dir / "teacher_encoder_maps.json")
+        dump_json(compute_encoded_stats(encoded), out_dir / "encoded.stats.json")
+        dump_json(runtime_maps, out_dir / "encoded.maps.json")
 
     print("[PIPELINE] done")
     print(f"[PIPELINE] outputs saved to: {out_dir.resolve()}")
