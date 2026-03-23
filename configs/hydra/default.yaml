@@ -1,0 +1,9 @@
+# @package hydra
+run:
+  dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_${run_name}
+sweep:
+  dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}_${run_name}
+  subdir: ${hydra.job.num}
+job:
+  chdir: true
+output_subdir: .hydra

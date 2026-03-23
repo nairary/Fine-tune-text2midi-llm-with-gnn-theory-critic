@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, Mapping, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -12,13 +12,18 @@ from src.utils.teacher_pooling import MultiTypeMeanPooling
 
 
 class NodeEncoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
+    def __init__(self, input_dim: int, hidden_dim: int, encoder_hidden_dims: Sequence[int] | None = None):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        hidden_stack = list(encoder_hidden_dims or [hidden_dim])
+        dims = [input_dim, *hidden_stack, hidden_dim]
+        layers = []
+        for in_dim, out_dim in zip(dims[:-1], dims[1:]):
+            layers.append(nn.Linear(in_dim, out_dim))
+            if out_dim != hidden_dim or (in_dim, out_dim) != (dims[-2], dims[-1]):
+                layers.append(nn.ReLU())
+        if layers and isinstance(layers[-1], nn.ReLU):
+            layers.pop()
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -34,6 +39,12 @@ class TeacherGNN(nn.Module):
         dropout: float = 0.1,
         residual: bool = True,
         node_types: Iterable[str] | None = None,
+        encoder_hidden_dims: Sequence[int] | None = None,
+        pooling_mode: str = "mean",
+        pooling_output_dim: int | None = None,
+        score_head_hidden_dim: int | None = None,
+        reconstruction_head_hidden_dim: int | None = None,
+        enabled_heads: Mapping[str, bool] | None = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -42,10 +53,17 @@ class TeacherGNN(nn.Module):
         self.residual = residual
         self.node_types = tuple(node_types or input_dims.keys())
         self.edge_types = list(edge_types)
+        self.pooling_output_dim = pooling_output_dim or hidden_dim
+        self.score_head_hidden_dim = score_head_hidden_dim or max(1, self.pooling_output_dim // 2)
+        self.reconstruction_head_hidden_dim = reconstruction_head_hidden_dim or hidden_dim
 
         self.encoders = nn.ModuleDict(
             {
-                node_type: NodeEncoder(input_dim=input_dims[node_type], hidden_dim=hidden_dim)
+                node_type: NodeEncoder(
+                    input_dim=input_dims[node_type],
+                    hidden_dim=hidden_dim,
+                    encoder_hidden_dims=encoder_hidden_dims,
+                )
                 for node_type in self.node_types
             }
         )
@@ -56,18 +74,27 @@ class TeacherGNN(nn.Module):
         for _ in range(num_layers):
             self.convs.append(
                 HeteroConv(
-                    {
-                        edge_type: SAGEConv((-1, -1), hidden_dim)
-                        for edge_type in self.edge_types
-                    },
+                    {edge_type: SAGEConv((-1, -1), hidden_dim) for edge_type in self.edge_types},
                     aggr="sum",
                 )
             )
             self.conv_norms.append(nn.ModuleDict({node_type: nn.LayerNorm(hidden_dim) for node_type in self.node_types}))
 
-        self.pool = MultiTypeMeanPooling(hidden_dim=hidden_dim, node_types=self.node_types)
-        self.reconstruction_heads = ReconstructionHeads(hidden_dim=hidden_dim)
-        self.graph_score_head = GraphScoreHead(hidden_dim=hidden_dim)
+        self.pool = MultiTypeMeanPooling(
+            hidden_dim=hidden_dim,
+            node_types=self.node_types,
+            output_dim=self.pooling_output_dim,
+            pooling_mode=pooling_mode,
+        )
+        self.reconstruction_heads = ReconstructionHeads(
+            hidden_dim=hidden_dim,
+            head_hidden_dim=self.reconstruction_head_hidden_dim,
+            enabled_heads=enabled_heads,
+        )
+        self.graph_score_head = GraphScoreHead(
+            input_dim=self.pooling_output_dim,
+            hidden_dim=self.score_head_hidden_dim,
+        )
 
     def encode_nodes(self, batch) -> Dict[str, torch.Tensor]:
         encoded = {}
@@ -129,6 +156,12 @@ class TeacherGNN(nn.Module):
         num_layers: int = 3,
         dropout: float = 0.1,
         residual: bool = True,
+        encoder_hidden_dims: Sequence[int] | None = None,
+        pooling_mode: str = "mean",
+        pooling_output_dim: int | None = None,
+        score_head_hidden_dim: int | None = None,
+        reconstruction_head_hidden_dim: int | None = None,
+        enabled_heads: Mapping[str, bool] | None = None,
     ) -> "TeacherGNN":
         input_dims = {node_type: hetero_data[node_type].x.size(-1) for node_type in hetero_data.node_types}
         return cls(
@@ -139,4 +172,10 @@ class TeacherGNN(nn.Module):
             dropout=dropout,
             residual=residual,
             node_types=hetero_data.node_types,
+            encoder_hidden_dims=encoder_hidden_dims,
+            pooling_mode=pooling_mode,
+            pooling_output_dim=pooling_output_dim,
+            score_head_hidden_dim=score_head_hidden_dim,
+            reconstruction_head_hidden_dim=reconstruction_head_hidden_dim,
+            enabled_heads=enabled_heads,
         )

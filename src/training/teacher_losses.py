@@ -53,18 +53,31 @@ def _batched_indices(masked_batch, masked_labels: List[dict], node_type: str, fi
     return torch.cat(global_indices).to(masked_batch[node_type].x.device), torch.cat(target_values).to(masked_batch[node_type].x.device)
 
 
-def compute_reconstruction_losses(masked_outputs: Mapping[str, Dict[str, torch.Tensor]], masked_batch, masked_labels: List[dict]):
+def compute_reconstruction_losses(
+    masked_outputs: Mapping[str, Dict[str, torch.Tensor]],
+    masked_batch,
+    masked_labels: List[dict],
+    recon_weights: Mapping[str, float] | None = None,
+    enabled_heads: Mapping[str, bool] | None = None,
+):
     recon_logits = masked_outputs["recon_logits"]
     losses = {}
     metrics = {}
     total_recon_loss = None
+    recon_weights = recon_weights or {}
+    enabled_heads = enabled_heads or {}
 
     for head_name, spec in RECONSTRUCTION_SPECS.items():
+        if not enabled_heads.get(head_name, True):
+            continue
+        if head_name not in recon_logits:
+            continue
+
         logits = recon_logits[head_name]
         node_type = spec["node_type"]
         field_name = spec["field_name"]
         valid_ids = spec["valid_ids"]
-        loss_weight = spec["loss_weight"]
+        loss_weight = float(recon_weights.get(head_name, spec["default_loss_weight"]))
         global_indices, target_values = _batched_indices(masked_batch, masked_labels, node_type, field_name)
 
         metric_prefix = head_name.replace("note_", "note_").replace("chord_", "chord_")
@@ -95,8 +108,11 @@ def compute_reconstruction_losses(masked_outputs: Mapping[str, Dict[str, torch.T
         total_recon_loss = weighted_loss if total_recon_loss is None else total_recon_loss + weighted_loss
 
     if total_recon_loss is None:
-        reference = next(iter(recon_logits.values()))
-        total_recon_loss = _zero_like_reference(reference)
+        if recon_logits:
+            reference = next(iter(recon_logits.values()))
+            total_recon_loss = _zero_like_reference(reference)
+        else:
+            raise ValueError("No reconstruction heads are enabled; cannot compute reconstruction loss.")
 
     losses["recon_loss"] = total_recon_loss
     return losses, metrics
@@ -127,11 +143,15 @@ def compute_teacher_ssl_losses(
     masked_labels: List[dict],
     lambda_recon: float = 1.0,
     lambda_rank: float = 0.5,
+    recon_weights: Mapping[str, float] | None = None,
+    enabled_heads: Mapping[str, bool] | None = None,
 ):
     recon_losses, recon_metrics = compute_reconstruction_losses(
         masked_outputs=masked_outputs,
         masked_batch=masked_batch,
         masked_labels=masked_labels,
+        recon_weights=recon_weights,
+        enabled_heads=enabled_heads,
     )
     rank_bundle = compute_ranking_loss(real_outputs=real_outputs, corrupted_outputs=corrupted_outputs)
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Mapping
 
 import torch
 from torch import nn
@@ -13,31 +13,31 @@ RECONSTRUCTION_SPECS = {
         "node_type": "note",
         "field_name": "sd_id",
         "valid_ids": VALID_ID_SETS["note_sd_id"],
-        "loss_weight": 1.0,
+        "default_loss_weight": 1.0,
     },
     "chord_root": {
         "node_type": "chord",
         "field_name": "root_id",
         "valid_ids": VALID_ID_SETS["chord_root_id"],
-        "loss_weight": 1.0,
+        "default_loss_weight": 1.0,
     },
     "chord_type": {
         "node_type": "chord",
         "field_name": "type_id",
         "valid_ids": VALID_ID_SETS["chord_type_id"],
-        "loss_weight": 1.0,
+        "default_loss_weight": 1.0,
     },
     "chord_applied": {
         "node_type": "chord",
         "field_name": "applied_id",
         "valid_ids": VALID_ID_SETS["chord_applied_id"],
-        "loss_weight": 0.5,
+        "default_loss_weight": 0.5,
     },
     "chord_borrowed_kind": {
         "node_type": "chord",
         "field_name": "borrowed_kind_id",
         "valid_ids": VALID_ID_SETS["chord_borrowed_kind_id"],
-        "loss_weight": 0.25,
+        "default_loss_weight": 0.25,
     },
 }
 
@@ -56,12 +56,12 @@ class MLPHead(nn.Module):
 
 
 class GraphScoreHead(nn.Module):
-    def __init__(self, hidden_dim: int):
+    def __init__(self, input_dim: int, hidden_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -69,12 +69,22 @@ class GraphScoreHead(nn.Module):
 
 
 class ReconstructionHeads(nn.Module):
-    def __init__(self, hidden_dim: int):
+    def __init__(
+        self,
+        hidden_dim: int,
+        head_hidden_dim: int,
+        enabled_heads: Mapping[str, bool] | None = None,
+    ):
         super().__init__()
+        self.enabled_heads = {
+            head_name: bool(enabled_heads.get(head_name, True)) if enabled_heads is not None else True
+            for head_name in RECONSTRUCTION_SPECS
+        }
         self.heads = nn.ModuleDict(
             {
-                head_name: MLPHead(hidden_dim, hidden_dim, len(spec["valid_ids"]))
+                head_name: MLPHead(hidden_dim, head_hidden_dim, len(spec["valid_ids"]))
                 for head_name, spec in RECONSTRUCTION_SPECS.items()
+                if self.enabled_heads[head_name]
             }
         )
 
@@ -84,10 +94,15 @@ class ReconstructionHeads(nn.Module):
         if note_embeddings is None or chord_embeddings is None:
             raise KeyError("Expected note and chord embeddings to be present for reconstruction heads.")
 
-        return {
-            "note_sd": self.heads["note_sd"](note_embeddings),
-            "chord_root": self.heads["chord_root"](chord_embeddings),
-            "chord_type": self.heads["chord_type"](chord_embeddings),
-            "chord_applied": self.heads["chord_applied"](chord_embeddings),
-            "chord_borrowed_kind": self.heads["chord_borrowed_kind"](chord_embeddings),
-        }
+        outputs: Dict[str, torch.Tensor] = {}
+        if "note_sd" in self.heads:
+            outputs["note_sd"] = self.heads["note_sd"](note_embeddings)
+        if "chord_root" in self.heads:
+            outputs["chord_root"] = self.heads["chord_root"](chord_embeddings)
+        if "chord_type" in self.heads:
+            outputs["chord_type"] = self.heads["chord_type"](chord_embeddings)
+        if "chord_applied" in self.heads:
+            outputs["chord_applied"] = self.heads["chord_applied"](chord_embeddings)
+        if "chord_borrowed_kind" in self.heads:
+            outputs["chord_borrowed_kind"] = self.heads["chord_borrowed_kind"](chord_embeddings)
+        return outputs

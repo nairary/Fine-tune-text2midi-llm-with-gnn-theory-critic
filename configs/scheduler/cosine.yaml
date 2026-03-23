@@ -1,0 +1,3 @@
+name: cosine
+t_max: ${training.epochs}
+eta_min: 1.0e-5
