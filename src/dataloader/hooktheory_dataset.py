@@ -1,6 +1,7 @@
 # src/dataloader/hooktheory_dataset.py
 import json
 from pathlib import Path
+from typing import Sequence
 
 import torch
 from torch.utils.data import Dataset
@@ -10,9 +11,19 @@ from .utils_graph import build_graph_from_encoded, corrupt_graph, mask_graph
 
 
 class HookTheoryDataset(Dataset):
-    def __init__(self, json_path: str, mask_prob: float = 0.15):
+    def __init__(
+        self,
+        json_path: str,
+        mask_prob: float = 0.15,
+        mask_min_nodes: int = 1,
+        optional_mask_field_prob: float = 0.5,
+        corruption_modes: Sequence[str] | None = None,
+    ):
         self.json_path = Path(json_path)
         self.mask_prob = mask_prob
+        self.mask_min_nodes = mask_min_nodes
+        self.optional_mask_field_prob = optional_mask_field_prob
+        self.corruption_modes = tuple(corruption_modes) if corruption_modes is not None else None
 
         with open(self.json_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -30,8 +41,13 @@ class HookTheoryDataset(Dataset):
     def __getitem__(self, idx):
         song_obj = self.data[idx]
         graph_real = build_graph_from_encoded(song_obj)
-        graph_masked, masked_labels = mask_graph(graph_real, mask_prob=self.mask_prob)
-        graph_corrupted = corrupt_graph(graph_real)
+        graph_masked, masked_labels = mask_graph(
+            graph_real,
+            mask_prob=self.mask_prob,
+            min_nodes_to_mask=self.mask_min_nodes,
+            optional_mask_field_prob=self.optional_mask_field_prob,
+        )
+        graph_corrupted = corrupt_graph(graph_real, corruption_modes=self.corruption_modes)
 
         return {
             "graph_real": graph_real,
@@ -56,11 +72,3 @@ def collate_fn(batch):
         "masked_labels": masked_labels,
         "graph_score_label": score_labels,
     }
-
-
-if __name__ == "__main__":
-    dataset = HookTheoryDataset("data/HTCanon/encoded_full/teacher_encoded.json")
-    loader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
-
-    batch = next(iter(loader))
-    print(batch["graph_real"])

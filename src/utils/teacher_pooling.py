@@ -8,11 +8,15 @@ from torch_geometric.nn import global_mean_pool
 
 
 class MultiTypeMeanPooling(nn.Module):
-    def __init__(self, hidden_dim: int, node_types: Iterable[str]):
+    def __init__(self, hidden_dim: int, node_types: Iterable[str], output_dim: int | None = None, pooling_mode: str = "mean"):
         super().__init__()
+        if pooling_mode != "mean":
+            raise ValueError(f"Unsupported pooling_mode='{pooling_mode}'. Only 'mean' is currently implemented.")
         self.hidden_dim = hidden_dim
         self.node_types = tuple(node_types)
-        self.proj = nn.Linear(len(self.node_types) * hidden_dim, hidden_dim)
+        self.pooling_mode = pooling_mode
+        self.output_dim = output_dim or hidden_dim
+        self.proj = nn.Linear(len(self.node_types) * hidden_dim, self.output_dim)
 
     def _infer_num_graphs(self, batch_dict: Dict[str, torch.Tensor]) -> int:
         max_graph_index = -1

@@ -1,0 +1,14 @@
+lambda_recon: 1.0
+lambda_rank: 0.5
+enabled_heads:
+  note_sd: true
+  chord_root: true
+  chord_type: true
+  chord_applied: true
+  chord_borrowed_kind: true
+recon_weights:
+  note_sd: 1.0
+  chord_root: 1.0
+  chord_type: 1.0
+  chord_applied: 0.5
+  chord_borrowed_kind: 0.25
