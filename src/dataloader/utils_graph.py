@@ -300,7 +300,12 @@ def build_graph_from_encoded(song_obj):
     return graph
 
 
-def mask_graph(graph: HeteroData, mask_prob=0.15):
+def mask_graph(
+    graph: HeteroData,
+    mask_prob: float = 0.15,
+    min_nodes_to_mask: int = 1,
+    optional_mask_field_prob: float = 0.5,
+):
     """Field-aware masking for note/chord nodes used in SSL reconstruction."""
     masked_graph = copy.deepcopy(graph)
     masked_labels: Dict[str, dict] = {}
@@ -316,14 +321,14 @@ def mask_graph(graph: HeteroData, mask_prob=0.15):
             continue
 
         num_nodes = x.size(0)
-        num_mask = max(1, int(round(num_nodes * mask_prob)))
+        num_mask = max(int(min_nodes_to_mask), int(round(num_nodes * mask_prob)))
         num_mask = min(num_nodes, num_mask)
         indices = torch.tensor(sorted(random.sample(range(num_nodes), num_mask)), dtype=torch.long)
 
         selected_fields = list(PRIMARY_MASK_FIELDS.get(node_type, fields))
         optional_fields = [field for field in fields if field not in selected_fields]
         for field in optional_fields:
-            if random.random() < 0.5:
+            if random.random() < optional_mask_field_prob:
                 selected_fields.append(field)
         selected_fields = list(dict.fromkeys(selected_fields))
 
@@ -365,23 +370,27 @@ def _swap_neighbor_rows(x: torch.Tensor) -> bool:
     return True
 
 
-def corrupt_graph(graph: HeteroData):
+def corrupt_graph(graph: HeteroData, corruption_modes: Tuple[str, ...] | None = None):
     """Create a semantically corrupted copy of the graph for discrimination tasks."""
     corrupted = copy.deepcopy(graph)
-    corruption_modes = []
+    available_corruption_modes = []
 
     if corrupted["note"].x.size(0) > 0:
-        corruption_modes.append("note_sd_replacement")
+        available_corruption_modes.append("note_sd_replacement")
     if corrupted["chord"].x.size(0) > 0:
-        corruption_modes.extend(["chord_root_replacement", "chord_type_replacement"])
+        available_corruption_modes.extend(["chord_root_replacement", "chord_type_replacement"])
     if corrupted["chord"].x.size(0) > 1:
-        corruption_modes.append("swap_neighboring_chords")
+        available_corruption_modes.append("swap_neighboring_chords")
 
-    if not corruption_modes:
+    if corruption_modes is not None:
+        allowed_modes = set(corruption_modes)
+        available_corruption_modes = [mode for mode in available_corruption_modes if mode in allowed_modes]
+
+    if not available_corruption_modes:
         corrupted.corruption_metadata = {"mode": "identity", "applied": False}
         return corrupted
 
-    mode = random.choice(corruption_modes)
+    mode = random.choice(available_corruption_modes)
     applied = False
     if mode == "note_sd_replacement":
         applied = _replace_with_valid_ids(

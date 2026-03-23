@@ -9,41 +9,29 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import torch
+from hydra import compose, initialize_config_dir
 
-from src.training.train_teacher_ssl import build_loaders, build_model, evaluate, print_metrics
+from src.training.train_teacher import build_loaders, build_model, evaluate, print_metrics
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate a TeacherGNN SSL checkpoint.")
     parser.add_argument("--checkpoint-path", required=True)
-    parser.add_argument("--json-path", default="data/HTCanon/encoded_full/teacher_encoded.json")
-    parser.add_argument("--train-split", default="train")
-    parser.add_argument("--val-split", default="val")
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--num-layers", type=int, default=3)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--mask-prob", type=float, default=0.15)
-    parser.add_argument("--lambda-recon", type=float, default=1.0)
-    parser.add_argument("--lambda-rank", type=float, default=0.5)
-    parser.add_argument("--limit-train-samples", type=int, default=None)
-    parser.add_argument("--limit-val-samples", type=int, default=None)
-    parser.add_argument("--max-val-batches", type=int, default=None)
+    parser.add_argument("overrides", nargs="*", help="Optional Hydra overrides, e.g. model=teacher_gnn_small")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _, _, val_loader = build_loaders(args)
+    config_dir = str((ROOT / "configs").resolve())
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        cfg = compose(config_name="config", overrides=args.overrides)
+
+    device = torch.device(cfg.device if cfg.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
+    _, _, val_loader = build_loaders(cfg)
     sample = val_loader.dataset[0]
 
-    model = build_model(
-        sample["graph_real"],
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-    ).to(device)
+    model = build_model(sample["graph_real"], cfg.model, cfg.losses).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
@@ -51,9 +39,9 @@ def main():
         model=model,
         loader=val_loader,
         device=device,
-        lambda_recon=args.lambda_recon,
-        lambda_rank=args.lambda_rank,
-        max_batches=args.max_val_batches,
+        losses_cfg=cfg.losses,
+        training_cfg=cfg.training,
+        max_batches=cfg.training.limit_val_batches,
     )
     print_metrics("Validation", metrics)
 

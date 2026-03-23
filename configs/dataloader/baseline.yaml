@@ -1,0 +1,13 @@
+batch_size: 2
+num_workers: 0
+shuffle: true
+pin_memory: false
+drop_last: false
+mask_prob: 0.15
+mask_min_nodes: 1
+optional_mask_field_prob: 0.5
+corruption_modes:
+  - note_sd_replacement
+  - chord_root_replacement
+  - chord_type_replacement
+  - swap_neighboring_chords
