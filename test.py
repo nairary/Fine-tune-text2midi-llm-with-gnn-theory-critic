@@ -1,7 +1,7 @@
 from torch.utils.data import DataLoader
 from src.dataloader.hooktheory_dataset import HookTheoryDataset, collate_fn
 
-dataset = HookTheoryDataset("data/HTCanon/HK_processed/encoded_full/teacher_encoded.json")
+dataset = HookTheoryDataset("data/HTCanon/encoded_full/teacher_encoded.json")
 loader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
 
 for batch in loader:
