@@ -59,8 +59,6 @@ def collate_fn(batch):
 
 
 if __name__ == "__main__":
-    from torch.utils.data import DataLoader
-
     dataset = HookTheoryDataset("data/HTCanon/encoded_full/teacher_encoded.json")
     loader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
 
