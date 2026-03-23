@@ -1,0 +1,7 @@
+name: teacher_encoded_structured_only
+json_path: data/HTCanon/encoded_structured_only/teacher_encoded.json
+metadata_dir: metadata
+split:
+  train: train
+  val: val
+structured_only: true
