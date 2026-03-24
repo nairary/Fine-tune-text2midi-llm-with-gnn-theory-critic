@@ -8,3 +8,7 @@ pooling_mode: mean
 pooling_output_dim: 96
 score_head_hidden_dim: 48
 reconstruction_head_hidden_dim: 96
+use_note_score_head: true
+use_chord_score_head: true
+use_onset_score_head: true
+local_score_head_hidden_dim: 48

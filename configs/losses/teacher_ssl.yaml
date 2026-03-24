@@ -1,5 +1,13 @@
 lambda_recon: 1.0
-lambda_rank: 0.5
+lambda_graph_rank: 0.5
+lambda_note_local: 0.5
+lambda_chord_local: 0.5
+lambda_onset_local: 0.5
+enable_graph_rank: true
+enable_note_local: true
+enable_chord_local: true
+enable_onset_local: true
+local_negatives_per_positive: 2
 enabled_heads:
   note_sd: true
   chord_root: true
