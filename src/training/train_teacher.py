@@ -97,6 +97,7 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
         "graph_masked": batch["graph_masked"].to(device),
         "graph_corrupted": batch["graph_corrupted"].to(device),
         "masked_labels": batch["masked_labels"],
+        "corruption_metadata": batch["corruption_metadata"],
         "graph_score_label": batch["graph_score_label"].to(device),
     }
 
@@ -114,6 +115,10 @@ def build_model(sample_graph, model_cfg: DictConfig, losses_cfg: DictConfig) -> 
         score_head_hidden_dim=model_cfg.score_head_hidden_dim,
         reconstruction_head_hidden_dim=model_cfg.reconstruction_head_hidden_dim,
         enabled_heads=OmegaConf.to_container(losses_cfg.enabled_heads, resolve=True),
+        use_note_score_head=bool(model_cfg.use_note_score_head),
+        use_chord_score_head=bool(model_cfg.use_chord_score_head),
+        use_onset_score_head=bool(model_cfg.use_onset_score_head),
+        local_score_head_hidden_dim=model_cfg.local_score_head_hidden_dim,
     )
 
 
@@ -236,9 +241,19 @@ def run_epoch(
                 masked_batch=batch["graph_masked"],
                 masked_labels=batch["masked_labels"],
                 lambda_recon=float(losses_cfg.lambda_recon),
-                lambda_rank=float(losses_cfg.lambda_rank),
+                lambda_graph_rank=float(losses_cfg.lambda_graph_rank),
+                lambda_note_local=float(losses_cfg.lambda_note_local),
+                lambda_chord_local=float(losses_cfg.lambda_chord_local),
+                lambda_onset_local=float(losses_cfg.lambda_onset_local),
+                enable_graph_rank=bool(losses_cfg.enable_graph_rank),
+                enable_note_local=bool(losses_cfg.enable_note_local),
+                enable_chord_local=bool(losses_cfg.enable_chord_local),
+                enable_onset_local=bool(losses_cfg.enable_onset_local),
                 recon_weights=recon_weights,
                 enabled_heads=enabled_heads,
+                corruption_metadata=batch["corruption_metadata"],
+                corrupted_batch=batch["graph_corrupted"],
+                local_negatives_per_positive=int(losses_cfg.local_negatives_per_positive),
             )
 
         if is_train:
@@ -312,12 +327,18 @@ def print_metrics(prefix: str, metrics: Mapping[str, float]):
         "chord_applied_loss",
         "chord_borrowed_kind_loss",
         "rank_loss",
+        "note_local_loss",
+        "chord_local_loss",
+        "onset_local_loss",
         "note_sd_acc",
         "chord_root_acc",
         "chord_type_acc",
         "chord_applied_acc",
         "chord_borrowed_kind_acc",
         "rank_acc",
+        "note_local_acc",
+        "chord_local_acc",
+        "onset_local_acc",
         "mean_margin",
         "score_real_mean",
         "score_corrupted_mean",

@@ -135,16 +135,116 @@ def compute_ranking_loss(real_outputs, corrupted_outputs):
     }
 
 
+def _sample_clean_indices(
+    graph_node_count: int,
+    corrupted_indices: List[int],
+    negatives_per_positive: int,
+) -> List[int]:
+    corrupted_set = set(corrupted_indices)
+    clean_pool = [idx for idx in range(graph_node_count) if idx not in corrupted_set]
+    if not clean_pool:
+        return []
+    count = min(len(clean_pool), max(1, len(corrupted_indices) * negatives_per_positive))
+    permutation = torch.randperm(len(clean_pool))[:count].tolist()
+    return [clean_pool[pos] for pos in permutation]
+
+
+def _node_graph_ranges(batch, node_type: str):
+    ptr = batch[node_type].ptr
+    return [(int(ptr[i].item()), int(ptr[i + 1].item())) for i in range(ptr.numel() - 1)]
+
+
+def compute_local_corruption_losses(
+    corrupted_outputs,
+    corrupted_batch,
+    corruption_metadata: List[dict] | None,
+    enabled_levels: Mapping[str, bool] | None = None,
+    negatives_per_positive: int = 2,
+):
+    enabled_levels = enabled_levels or {"note": True, "chord": True, "onset": True}
+    local_scores = corrupted_outputs.get("local_scores", {})
+    graph_ranges = {
+        "note": _node_graph_ranges(corrupted_batch, "note"),
+        "chord": _node_graph_ranges(corrupted_batch, "chord"),
+        "onset": _node_graph_ranges(corrupted_batch, "onset"),
+    }
+
+    losses = {}
+    metrics = {}
+    for level in ("note", "chord", "onset"):
+        if not enabled_levels.get(level, True):
+            continue
+        level_logits_all = local_scores.get(level)
+        if level_logits_all is None:
+            continue
+        loss_key = f"{level}_local_loss"
+        acc_key = f"{level}_local_acc"
+        if corruption_metadata is None:
+            losses[loss_key] = _zero_like_reference(level_logits_all)
+            continue
+
+        key = f"{level}_corrupted_indices"
+        sampled_logits = []
+        sampled_targets = []
+        for graph_index, metadata in enumerate(corruption_metadata):
+            metadata = metadata or {}
+            local_corrupted = [int(idx) for idx in (metadata.get(key) or [])]
+            if not local_corrupted:
+                continue
+            start, end = graph_ranges[level][graph_index]
+            graph_node_count = max(0, end - start)
+            if graph_node_count <= 0:
+                continue
+            valid_corrupted = sorted({idx for idx in local_corrupted if 0 <= idx < graph_node_count})
+            if not valid_corrupted:
+                continue
+            sampled_clean = _sample_clean_indices(
+                graph_node_count=graph_node_count,
+                corrupted_indices=valid_corrupted,
+                negatives_per_positive=negatives_per_positive,
+            )
+            for local_idx in valid_corrupted:
+                global_idx = start + local_idx
+                sampled_logits.append(level_logits_all[global_idx])
+                sampled_targets.append(1.0)
+            for local_idx in sampled_clean:
+                global_idx = start + local_idx
+                sampled_logits.append(level_logits_all[global_idx])
+                sampled_targets.append(0.0)
+
+        if not sampled_logits:
+            losses[loss_key] = _zero_like_reference(level_logits_all)
+            continue
+
+        level_logits = torch.stack(sampled_logits, dim=0)
+        level_targets = torch.tensor(sampled_targets, dtype=torch.float, device=level_logits.device)
+        loss_value = F.binary_cross_entropy_with_logits(level_logits, level_targets)
+        predictions = (torch.sigmoid(level_logits) >= 0.5).float()
+        metrics[acc_key] = (predictions == level_targets).float().mean().detach()
+        losses[loss_key] = loss_value
+    return losses, metrics
+
+
 def compute_teacher_ssl_losses(
     masked_outputs,
     real_outputs,
     corrupted_outputs,
     masked_batch,
+    corrupted_batch,
     masked_labels: List[dict],
+    corruption_metadata: List[dict] | None = None,
     lambda_recon: float = 1.0,
-    lambda_rank: float = 0.5,
+    lambda_graph_rank: float = 0.5,
+    lambda_note_local: float = 0.5,
+    lambda_chord_local: float = 0.5,
+    lambda_onset_local: float = 0.5,
+    enable_graph_rank: bool = True,
+    enable_note_local: bool = True,
+    enable_chord_local: bool = True,
+    enable_onset_local: bool = True,
     recon_weights: Mapping[str, float] | None = None,
     enabled_heads: Mapping[str, bool] | None = None,
+    local_negatives_per_positive: int = 2,
 ):
     recon_losses, recon_metrics = compute_reconstruction_losses(
         masked_outputs=masked_outputs,
@@ -154,18 +254,40 @@ def compute_teacher_ssl_losses(
         enabled_heads=enabled_heads,
     )
     rank_bundle = compute_ranking_loss(real_outputs=real_outputs, corrupted_outputs=corrupted_outputs)
+    local_losses, local_metrics = compute_local_corruption_losses(
+        corrupted_outputs=corrupted_outputs,
+        corrupted_batch=corrupted_batch,
+        corruption_metadata=corruption_metadata,
+        enabled_levels={
+            "note": enable_note_local,
+            "chord": enable_chord_local,
+            "onset": enable_onset_local,
+        },
+        negatives_per_positive=local_negatives_per_positive,
+    )
 
-    total_loss = lambda_recon * recon_losses["recon_loss"] + lambda_rank * rank_bundle["rank_loss"]
+    total_loss = lambda_recon * recon_losses["recon_loss"]
+    if enable_graph_rank:
+        total_loss = total_loss + lambda_graph_rank * rank_bundle["rank_loss"]
+    if enable_note_local and "note_local_loss" in local_losses:
+        total_loss = total_loss + lambda_note_local * local_losses["note_local_loss"]
+    if enable_chord_local and "chord_local_loss" in local_losses:
+        total_loss = total_loss + lambda_chord_local * local_losses["chord_local_loss"]
+    if enable_onset_local and "onset_local_loss" in local_losses:
+        total_loss = total_loss + lambda_onset_local * local_losses["onset_local_loss"]
+
     loss_dict = {
         "loss": total_loss,
         **recon_losses,
-        "rank_loss": rank_bundle["rank_loss"],
+        **local_losses,
+        "rank_loss": rank_bundle["rank_loss"] if enable_graph_rank else _zero_like_reference(rank_bundle["rank_loss"]),
     }
     metric_dict = {
         **recon_metrics,
-        "rank_acc": rank_bundle["rank_acc"],
-        "mean_margin": rank_bundle["mean_margin"],
-        "score_real_mean": rank_bundle["score_real_mean"],
-        "score_corrupted_mean": rank_bundle["score_corrupted_mean"],
+        **local_metrics,
+        "rank_acc": rank_bundle["rank_acc"] if enable_graph_rank else rank_bundle["rank_acc"].new_tensor(0.0),
+        "mean_margin": rank_bundle["mean_margin"] if enable_graph_rank else rank_bundle["mean_margin"].new_tensor(0.0),
+        "score_real_mean": rank_bundle["score_real_mean"] if enable_graph_rank else rank_bundle["score_real_mean"].new_tensor(0.0),
+        "score_corrupted_mean": rank_bundle["score_corrupted_mean"] if enable_graph_rank else rank_bundle["score_corrupted_mean"].new_tensor(0.0),
     }
     return loss_dict, metric_dict
