@@ -360,14 +360,43 @@ def _replace_with_valid_ids(x: torch.Tensor, column: int, valid_ids: Tuple[int, 
     return True
 
 
-def _swap_neighbor_rows(x: torch.Tensor) -> bool:
+def _swap_neighbor_rows(x: torch.Tensor) -> int | None:
     if x.size(0) < 2:
-        return False
+        return None
     idx = random.randrange(x.size(0) - 1)
     swapped = x.clone()
     swapped[idx], swapped[idx + 1] = x[idx + 1].clone(), x[idx].clone()
     x.copy_(swapped)
-    return True
+    return idx
+
+
+def _onset_mismatch(corrupted: HeteroData) -> tuple[bool, int | None, int | None]:
+    note_x = corrupted["note"].x
+    onset_x = corrupted["onset"].x
+    starts_note_edges = corrupted[("onset", "starts_note", "note")].edge_index
+    if note_x.size(0) == 0 or onset_x.size(0) < 2 or starts_note_edges.size(1) == 0:
+        return False, None, None
+
+    edge_idx = random.randrange(starts_note_edges.size(1))
+    src_onset = int(starts_note_edges[0, edge_idx].item())
+    note_idx = int(starts_note_edges[1, edge_idx].item())
+    if src_onset + 1 < onset_x.size(0):
+        dst_onset = src_onset + 1
+    elif src_onset - 1 >= 0:
+        dst_onset = src_onset - 1
+    else:
+        return False, None, None
+    if dst_onset == src_onset:
+        return False, None, None
+
+    starts_note_edges[0, edge_idx] = dst_onset
+    corrupted[("onset", "starts_note", "note")].edge_index = starts_note_edges
+
+    note_x[note_idx, NOTE_LAYOUT["beat"]] = onset_x[dst_onset, 0]
+    note_x[note_idx, NOTE_LAYOUT["bar_index"]] = onset_x[dst_onset, 1]
+    note_x[note_idx, NOTE_LAYOUT["pos_in_bar"]] = onset_x[dst_onset, 2]
+    corrupted["note"].x = note_x
+    return True, note_idx, dst_onset
 
 
 def corrupt_graph(graph: HeteroData, corruption_modes: Tuple[str, ...] | None = None):
@@ -381,39 +410,81 @@ def corrupt_graph(graph: HeteroData, corruption_modes: Tuple[str, ...] | None = 
         available_corruption_modes.extend(["chord_root_replacement", "chord_type_replacement"])
     if corrupted["chord"].x.size(0) > 1:
         available_corruption_modes.append("swap_neighboring_chords")
+    if (
+        corrupted["onset"].x.size(0) > 1
+        and corrupted["note"].x.size(0) > 0
+        and corrupted[("onset", "starts_note", "note")].edge_index.size(1) > 0
+    ):
+        available_corruption_modes.append("onset_mismatch")
 
     if corruption_modes is not None:
         allowed_modes = set(corruption_modes)
         available_corruption_modes = [mode for mode in available_corruption_modes if mode in allowed_modes]
 
     if not available_corruption_modes:
-        corrupted.corruption_metadata = {"mode": "identity", "applied": False}
+        corrupted.corruption_metadata = {
+            "mode": "identity",
+            "applied": False,
+            "note_corrupted_indices": [],
+            "chord_corrupted_indices": [],
+            "onset_corrupted_indices": [],
+        }
         return corrupted
 
     mode = random.choice(available_corruption_modes)
     applied = False
+    note_corrupted_indices: list[int] = []
+    chord_corrupted_indices: list[int] = []
+    onset_corrupted_indices: list[int] = []
     if mode == "note_sd_replacement":
+        before = corrupted["note"].x[:, NOTE_LAYOUT["sd_id"]].clone()
         applied = _replace_with_valid_ids(
             corrupted["note"].x,
             NOTE_LAYOUT["sd_id"],
             VALID_ID_SETS["note_sd_id"],
         )
+        if applied:
+            changed = torch.nonzero(corrupted["note"].x[:, NOTE_LAYOUT["sd_id"]] != before, as_tuple=False).view(-1)
+            note_corrupted_indices.extend(changed.tolist())
     elif mode == "chord_root_replacement":
+        before = corrupted["chord"].x[:, CHORD_LAYOUT["root_id"]].clone()
         applied = _replace_with_valid_ids(
             corrupted["chord"].x,
             CHORD_LAYOUT["root_id"],
             VALID_ID_SETS["chord_root_id"],
         )
+        if applied:
+            changed = torch.nonzero(corrupted["chord"].x[:, CHORD_LAYOUT["root_id"]] != before, as_tuple=False).view(-1)
+            chord_corrupted_indices.extend(changed.tolist())
     elif mode == "chord_type_replacement":
+        before = corrupted["chord"].x[:, CHORD_LAYOUT["type_id"]].clone()
         applied = _replace_with_valid_ids(
             corrupted["chord"].x,
             CHORD_LAYOUT["type_id"],
             VALID_ID_SETS["chord_type_id"],
         )
+        if applied:
+            changed = torch.nonzero(corrupted["chord"].x[:, CHORD_LAYOUT["type_id"]] != before, as_tuple=False).view(-1)
+            chord_corrupted_indices.extend(changed.tolist())
     elif mode == "swap_neighboring_chords":
-        applied = _swap_neighbor_rows(corrupted["chord"].x)
+        swap_idx = _swap_neighbor_rows(corrupted["chord"].x)
+        applied = swap_idx is not None
+        if swap_idx is not None:
+            chord_corrupted_indices.extend([swap_idx, swap_idx + 1])
+    elif mode == "onset_mismatch":
+        applied, note_idx, onset_idx = _onset_mismatch(corrupted)
+        if note_idx is not None:
+            note_corrupted_indices.append(note_idx)
+        if onset_idx is not None:
+            onset_corrupted_indices.append(onset_idx)
 
-    corrupted.corruption_metadata = {"mode": mode, "applied": applied}
+    corrupted.corruption_metadata = {
+        "mode": mode,
+        "applied": applied,
+        "note_corrupted_indices": sorted(set(note_corrupted_indices)),
+        "chord_corrupted_indices": sorted(set(chord_corrupted_indices)),
+        "onset_corrupted_indices": sorted(set(onset_corrupted_indices)),
+    }
     return corrupted
 
 

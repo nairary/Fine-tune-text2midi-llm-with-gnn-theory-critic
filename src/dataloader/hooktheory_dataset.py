@@ -54,6 +54,7 @@ class HookTheoryDataset(Dataset):
             "graph_masked": graph_masked,
             "graph_corrupted": graph_corrupted,
             "masked_labels": masked_labels,
+            "corruption_metadata": getattr(graph_corrupted, "corruption_metadata", None),
             "graph_score_label": 1.0,
         }
 
@@ -63,6 +64,7 @@ def collate_fn(batch):
     graphs_masked = [item["graph_masked"] for item in batch]
     graphs_corrupted = [item["graph_corrupted"] for item in batch]
     masked_labels = [item["masked_labels"] for item in batch]
+    corruption_metadata = [item.get("corruption_metadata") for item in batch]
     score_labels = torch.tensor([item["graph_score_label"] for item in batch], dtype=torch.float)
 
     return {
@@ -70,5 +72,6 @@ def collate_fn(batch):
         "graph_masked": Batch.from_data_list(graphs_masked),
         "graph_corrupted": Batch.from_data_list(graphs_corrupted),
         "masked_labels": masked_labels,
+        "corruption_metadata": corruption_metadata,
         "graph_score_label": score_labels,
     }

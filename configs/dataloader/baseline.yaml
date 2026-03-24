@@ -11,3 +11,4 @@ corruption_modes:
   - chord_root_replacement
   - chord_type_replacement
   - swap_neighboring_chords
+  - onset_mismatch
