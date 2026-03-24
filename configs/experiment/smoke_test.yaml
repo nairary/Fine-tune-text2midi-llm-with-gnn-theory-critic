@@ -1,0 +1,4 @@
+name: smoke_test
+limit_train_batches: 2
+limit_val_batches: 1
+epochs: 1
