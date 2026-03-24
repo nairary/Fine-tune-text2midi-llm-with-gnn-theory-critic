@@ -1,0 +1,29 @@
+defaults:
+  - model: teacher_gnn_base
+  - data: teacher_encoded_full
+  - dataloader: baseline
+  - training: default
+  - optimizer: adamw
+  - scheduler: none
+  - losses: teacher_ssl
+  - experiment: baseline
+  - hydra: default
+  - _self_
+
+project:
+  name: Fine-tune-text2midi-llm-with-gnn-theory-critic
+  task: teacher_ssl_training
+
+run_name: ${experiment.name}_${model.name}
+seed: ${training.seed}
+device: ${training.device}
+
+data:
+  split.val: train
+
+dataloader:
+  batch_size: 1
+
+training:
+  limit_train_samples: 8
+  limit_train_batches: 8
