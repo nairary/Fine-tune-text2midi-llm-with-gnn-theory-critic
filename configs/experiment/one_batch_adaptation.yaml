@@ -1,0 +1,4 @@
+name: one_batch_adaptation
+limit_train_batches: 1
+limit_val_batches: 1
+epochs: 20

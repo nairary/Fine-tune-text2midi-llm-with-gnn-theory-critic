@@ -81,6 +81,18 @@ python train_teacher.py experiment=debug
 python train_teacher.py --multirun optimizer.lr=1e-3,3e-4,1e-4 training.seed=1,2,3
 ```
 
+### Run small smoke-test config
+
+```bash
+python train_teacher.py experiment=smoke_test
+```
+
+### Run one-batch adaptation test
+
+```bash
+python train_teacher.py experiment=one_batch_adaptation
+```
+
 ## Outputs saved per run
 
 Each Hydra run directory stores:
