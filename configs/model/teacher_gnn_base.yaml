@@ -1,10 +1,10 @@
 name: teacher_gnn_base
-hidden_dim: 128
-num_layers: 3
+hidden_dim: 192
+num_layers: 4
 dropout: 0.1
 use_residual: true
-encoder_hidden_dims: [128, 128]
+encoder_hidden_dims: [192, 192]
 pooling_mode: mean
-pooling_output_dim: 128
-score_head_hidden_dim: 64
-reconstruction_head_hidden_dim: 128
+pooling_output_dim: 192
+score_head_hidden_dim: 96
+reconstruction_head_hidden_dim: 192

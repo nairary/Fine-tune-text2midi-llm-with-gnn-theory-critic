@@ -19,11 +19,17 @@ seed: ${training.seed}
 device: ${training.device}
 
 data:
-  split.val: train
+  split:
+    train: train
+    val: train
 
 dataloader:
   batch_size: 1
+  shuffle: false
+  corruption_modes:
+    - chord_type_replacement
 
 training:
-  limit_train_samples: 8
-  limit_train_batches: 8
+  limit_train_samples: 1
+  limit_val_samples: 1
+  epochs: 100
