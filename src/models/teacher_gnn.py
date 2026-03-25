@@ -19,7 +19,8 @@ class NodeEncoder(nn.Module):
         layers = []
         for in_dim, out_dim in zip(dims[:-1], dims[1:]):
             layers.append(nn.Linear(in_dim, out_dim))
-            if out_dim != hidden_dim or (in_dim, out_dim) != (dims[-2], dims[-1]):
+            # if out_dim != hidden_dim or (in_dim, out_dim) != (dims[-2], dims[-1]): было так, но будто первое условие избыточное
+            if (in_dim, out_dim) != (dims[-2], dims[-1]):
                 layers.append(nn.ReLU())
         if layers and isinstance(layers[-1], nn.ReLU):
             layers.pop()
