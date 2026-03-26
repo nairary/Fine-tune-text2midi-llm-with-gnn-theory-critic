@@ -22,6 +22,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.dataloader.hooktheory_dataset import HookTheoryDataset, collate_fn
+from src.evaluation.teacher_local_metrics import (
+    evaluate_teacher_local_corruption,
+    save_local_diagnostic_reports,
+)
 from src.models.teacher_gnn import TeacherGNN
 from src.training.teacher_losses import compute_teacher_ssl_losses
 
@@ -424,6 +428,18 @@ def main(cfg: DictConfig):
                 losses_cfg=cfg.losses,
                 training_cfg=cfg.training,
                 max_batches=val_batch_limit,
+            )
+            local_report, local_examples = evaluate_teacher_local_corruption(
+                model=model,
+                loader=val_loader,
+                device=device,
+                max_batches=val_batch_limit,
+                threshold=0.5,
+            )
+            save_local_diagnostic_reports(
+                output_dir=output_dir,
+                report=local_report,
+                examples=local_examples,
             )
         else:
             val_metrics = {}
