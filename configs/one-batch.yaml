@@ -27,9 +27,9 @@ dataloader:
   batch_size: 1
   shuffle: false
   corruption_modes:
-    - chord_type_replacement
+    - note_sd_replacement
 
 training:
-  limit_train_samples: 1
-  limit_val_samples: 1
+  limit_train_samples: 32
+  limit_val_samples: 32
   epochs: 100
