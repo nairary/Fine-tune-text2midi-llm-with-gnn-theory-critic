@@ -1,0 +1,12 @@
+name: debug_hybrid_rank
+limit_train_batches: 5
+limit_val_batches: 2
+epochs: 1
+
+model:
+  pooling_mode: mean_max
+  use_hybrid_graph_scorer: true
+  local_summary_use_mean: true
+  local_summary_use_max: true
+  local_summary_use_topk_mean: true
+  local_summary_topk: 3

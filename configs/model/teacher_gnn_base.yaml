@@ -12,3 +12,9 @@ use_note_score_head: true
 use_chord_score_head: true
 use_onset_score_head: true
 local_score_head_hidden_dim: 64
+
+use_hybrid_graph_scorer: false
+local_summary_use_mean: true
+local_summary_use_max: true
+local_summary_use_topk_mean: false
+local_summary_topk: 3

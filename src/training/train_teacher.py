@@ -123,6 +123,11 @@ def build_model(sample_graph, model_cfg: DictConfig, losses_cfg: DictConfig) -> 
         use_chord_score_head=bool(model_cfg.use_chord_score_head),
         use_onset_score_head=bool(model_cfg.use_onset_score_head),
         local_score_head_hidden_dim=model_cfg.local_score_head_hidden_dim,
+        use_hybrid_graph_scorer=bool(model_cfg.get("use_hybrid_graph_scorer", False)),
+        local_summary_use_mean=bool(model_cfg.get("local_summary_use_mean", True)),
+        local_summary_use_max=bool(model_cfg.get("local_summary_use_max", True)),
+        local_summary_use_topk_mean=bool(model_cfg.get("local_summary_use_topk_mean", False)),
+        local_summary_topk=int(model_cfg.get("local_summary_topk", 3)),
     )
 
 
