@@ -1,0 +1,35 @@
+batch_size: 2
+num_workers: 0
+shuffle: true
+pin_memory: false
+drop_last: false
+mask_prob: 0.15
+mask_min_nodes: 1
+optional_mask_field_prob: 0.5
+
+# Переключает источник коррапшена: graph (старый) или song_theory (новые theory-aware коррапшены на уровне песни).
+corruption_backend: song_theory
+
+theory_aware:
+  strongbeat_min_duration: 1.0
+  strongbeat_only: true
+  rhythm_shift_max_steps: 2
+
+  # Если true, для каждого idx в датасете коррапшен воспроизводится одинаково между запусками.
+  deterministic_per_sample: false
+  # Базовый seed для deterministic_per_sample (итоговый seed = deterministic_seed + idx).
+  deterministic_seed: 0
+
+corruption_modes:
+  # Меняет ноту на сильной доле так, чтобы она перестала быть аккордовым тоном.
+  - strongbeat_nonchord_note
+  # Подставляет ноту, конфликтующую с borrowed-ладом аккорда.
+  - borrowed_melody_conflict
+  # Переключает borrowed атрибуты аккорда без изменения мелодии.
+  - borrowed_kind_toggle_without_melody_change
+  # Сдвигает onset ноты на соседние позиции по ритмической сетке.
+  - note_onset_shift
+  # Переносит ноту между сильной и слабой долей внутри такта.
+  - strong_weak_beat_flip
+  # Ломает функциональный T/PD/D-паттерн в триплете аккордов.
+  - functional_progression_violation_strict
