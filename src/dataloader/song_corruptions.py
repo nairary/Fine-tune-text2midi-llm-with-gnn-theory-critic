@@ -29,8 +29,27 @@ def _identity_metadata(mode: str) -> dict:
     }
 
 
+def _safe_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_get_float(obj: dict, key: str) -> float | None:
+    return _safe_float(obj.get(key))
+
+
 def _onset_grid(song_obj: dict) -> list[float]:
-    return sorted({float(x.get("beat", 1.0)) for x in song_obj.get("melody", []) + song_obj.get("chords", [])})
+    beats: set[float] = set()
+    for item in song_obj.get("melody", []) + song_obj.get("chords", []):
+        beat = _safe_get_float(item, "beat")
+        if beat is None:
+            continue
+        beats.add(beat)
+    return sorted(beats)
 
 
 def _collect_post_onset_indices_for_metadata(post_grid: list[float], beats: set[float]) -> list[int]:
@@ -69,7 +88,10 @@ def _corrupt_strongbeat_nonchord_note(song_obj, theory_ctx, rng, corruption_cfg)
         note = song_obj["melody"][note_idx]
         if int(note.get("is_rest", 0)) == 1:
             continue
-        if float(note.get("duration", 0.0)) < min_duration and not is_strong_note_position(note, song_obj):
+        duration = _safe_get_float(note, "duration")
+        if duration is None:
+            continue
+        if duration < min_duration and not is_strong_note_position(note, song_obj):
             continue
         if strongbeat_only and not is_strong_note_position(note, song_obj):
             continue
@@ -217,7 +239,7 @@ def _corrupt_borrowed_kind_toggle(song_obj, theory_ctx, rng, corruption_cfg):
 def _corrupt_note_onset_shift(song_obj, theory_ctx, rng, corruption_cfg):
     metadata = _identity_metadata("note_onset_shift")
     max_steps = int(corruption_cfg.get("rhythm_shift_max_steps", 1))
-    onset_grid = sorted({float(x.get("beat", 1.0)) for x in song_obj.get("melody", []) + song_obj.get("chords", [])})
+    onset_grid = _onset_grid(song_obj)
     if len(onset_grid) < 2:
         return song_obj, metadata, False
 
@@ -227,7 +249,9 @@ def _corrupt_note_onset_shift(song_obj, theory_ctx, rng, corruption_cfg):
         note = song_obj["melody"][note_idx]
         if int(note.get("is_rest", 0)) == 1:
             continue
-        old_beat = float(note.get("beat", 1.0))
+        old_beat = _safe_get_float(note, "beat")
+        if old_beat is None:
+            continue
         if old_beat not in onset_grid:
             continue
         pos = onset_grid.index(old_beat)
@@ -262,7 +286,9 @@ def _corrupt_note_onset_shift(song_obj, theory_ctx, rng, corruption_cfg):
 def _corrupt_strong_weak_beat_flip(song_obj, theory_ctx, rng, corruption_cfg):
     metadata = _identity_metadata("strong_weak_beat_flip")
     notes = song_obj.get("melody", [])
-    num_beats = float(song_obj.get("meta", {}).get("main_num_beats", 4.0) or 4.0)
+    num_beats = _safe_float(song_obj.get("meta", {}).get("main_num_beats"))
+    if num_beats is None or num_beats <= 0:
+        num_beats = 4.0
 
     strong_offsets = {0.0}
     if abs(num_beats - 4.0) < 1e-6:
@@ -278,7 +304,9 @@ def _corrupt_strong_weak_beat_flip(song_obj, theory_ctx, rng, corruption_cfg):
         note = notes[note_idx]
         if int(note.get("is_rest", 0)) == 1:
             continue
-        old_beat = float(note.get("beat", 1.0))
+        old_beat = _safe_get_float(note, "beat")
+        if old_beat is None:
+            continue
         bar_idx = int((old_beat - 1.0) // num_beats)
         bar_start = 1.0 + bar_idx * num_beats
         old_pos = old_beat - bar_start

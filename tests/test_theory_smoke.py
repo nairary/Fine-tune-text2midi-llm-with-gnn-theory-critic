@@ -57,9 +57,20 @@ class TheorySmokeTests(unittest.TestCase):
             ],
         }
 
+    def _song_with_invalid_first_note(self):
+        song = self._song()
+        song["melody"][0]["beat"] = None
+        return song
+
+    def _song_with_all_invalid_beats(self):
+        song = self._song()
+        for note in song["melody"]:
+            note["beat"] = None
+        return song
+
     @staticmethod
     def _expected_post_onset_indices(corrupted_song: dict, source_beat: float, target_beat: float) -> list[int]:
-        post_grid = sorted({float(x["beat"]) for x in corrupted_song["melody"] + corrupted_song["chords"]})
+        post_grid = sorted({float(x["beat"]) for x in corrupted_song["melody"] + corrupted_song["chords"] if x.get("beat") is not None})
         indices = []
         if source_beat in post_grid:
             indices.append(post_grid.index(source_beat))
@@ -129,6 +140,46 @@ class TheorySmokeTests(unittest.TestCase):
             target = float(meta["details"]["target_onset_beat"])
             expected = self._expected_post_onset_indices(corrupted_song, source, target)
             self.assertEqual(sorted(meta["onset_corrupted_indices"]), expected)
+
+    def test_strong_weak_beat_flip_skips_none_beat_notes(self):
+        song = self._song_with_invalid_first_note()
+        cfg = {"rhythm_shift_max_steps": 1}
+
+        corrupted_song, meta = corrupt_song_obj(copy.deepcopy(song), ["strong_weak_beat_flip"], cfg, self.ctx, rng=random.Random(11))
+
+        self.assertIn("applied", meta)
+        if meta["applied"]:
+            self.assertEqual(meta["note_corrupted_indices"], [1])
+            self.assertNotEqual(corrupted_song["melody"][1]["beat"], song["melody"][1]["beat"])
+
+    def test_note_onset_shift_skips_none_beat_notes(self):
+        song = self._song_with_invalid_first_note()
+        cfg = {"rhythm_shift_max_steps": 1}
+
+        corrupted_song, meta = corrupt_song_obj(copy.deepcopy(song), ["note_onset_shift"], cfg, self.ctx, rng=random.Random(13))
+
+        self.assertIn("applied", meta)
+        if meta["applied"]:
+            self.assertEqual(meta["note_corrupted_indices"], [1])
+            self.assertNotEqual(corrupted_song["melody"][1]["beat"], song["melody"][1]["beat"])
+
+    def test_rhythm_corruptions_return_not_applied_when_all_candidates_invalid(self):
+        song = self._song_with_all_invalid_beats()
+        cfg = {"rhythm_shift_max_steps": 1}
+
+        for mode in ["note_onset_shift", "strong_weak_beat_flip"]:
+            _, meta = corrupt_song_obj(copy.deepcopy(song), [mode], cfg, self.ctx, rng=random.Random(17))
+            self.assertFalse(meta["applied"])
+
+    def test_rhythm_reproducibility_with_seed_on_valid_song(self):
+        song = self._song()
+        cfg = {"rhythm_shift_max_steps": 1}
+
+        s1, m1 = corrupt_song_obj(copy.deepcopy(song), ["strong_weak_beat_flip"], cfg, self.ctx, rng=random.Random(42))
+        s2, m2 = corrupt_song_obj(copy.deepcopy(song), ["strong_weak_beat_flip"], cfg, self.ctx, rng=random.Random(42))
+
+        self.assertEqual(m1, m2)
+        self.assertEqual(s1["melody"], s2["melody"])
 
 
 if __name__ == "__main__":
