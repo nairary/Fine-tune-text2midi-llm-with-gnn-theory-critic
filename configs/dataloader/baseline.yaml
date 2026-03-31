@@ -6,6 +6,16 @@ drop_last: false
 mask_prob: 0.15
 mask_min_nodes: 1
 optional_mask_field_prob: 0.5
+corruption_backend: graph
+theory_aware:
+  strongbeat_min_duration: 1.0
+  strongbeat_only: true
+  max_fragment_len: 4
+  enable_strict_function_corruption: true
+  allow_quality_aware_v2: false
+  rhythm_shift_max_steps: 1
+  deterministic_per_sample: false
+  deterministic_seed: 0
 corruption_modes:
   - note_sd_replacement
   - chord_root_replacement
