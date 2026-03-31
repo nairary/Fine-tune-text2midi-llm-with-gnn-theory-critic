@@ -1,5 +1,6 @@
 # src/dataloader/hooktheory_dataset.py
 import json
+import random
 from pathlib import Path
 from typing import Sequence
 
@@ -7,6 +8,8 @@ import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch
 
+from .song_corruptions import corrupt_song_obj
+from .theory_helpers import build_theory_context
 from .utils_graph import build_graph_from_encoded, corrupt_graph, mask_graph
 
 
@@ -18,12 +21,17 @@ class HookTheoryDataset(Dataset):
         mask_min_nodes: int = 1,
         optional_mask_field_prob: float = 0.5,
         corruption_modes: Sequence[str] | None = None,
+        corruption_backend: str = "graph",
+        theory_aware_cfg: dict | None = None,
     ):
         self.json_path = Path(json_path)
         self.mask_prob = mask_prob
         self.mask_min_nodes = mask_min_nodes
         self.optional_mask_field_prob = optional_mask_field_prob
         self.corruption_modes = tuple(corruption_modes) if corruption_modes is not None else None
+        self.corruption_backend = corruption_backend
+        self.theory_aware_cfg = theory_aware_cfg or {}
+        self.theory_ctx = build_theory_context() if self.corruption_backend == "song_theory" else None
 
         with open(self.json_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -47,7 +55,22 @@ class HookTheoryDataset(Dataset):
             min_nodes_to_mask=self.mask_min_nodes,
             optional_mask_field_prob=self.optional_mask_field_prob,
         )
-        graph_corrupted = corrupt_graph(graph_real, corruption_modes=self.corruption_modes)
+        if self.corruption_backend == "song_theory":
+            per_sample_rng = random
+            if bool(self.theory_aware_cfg.get("deterministic_per_sample", False)):
+                base_seed = int(self.theory_aware_cfg.get("deterministic_seed", 0))
+                per_sample_rng = random.Random(base_seed + int(idx))
+            song_corrupted, corruption_metadata = corrupt_song_obj(
+                song_obj,
+                corruption_modes=self.corruption_modes,
+                corruption_cfg=self.theory_aware_cfg,
+                theory_ctx=self.theory_ctx,
+                rng=per_sample_rng,
+            )
+            graph_corrupted = build_graph_from_encoded(song_corrupted)
+            graph_corrupted.corruption_metadata = corruption_metadata
+        else:
+            graph_corrupted = corrupt_graph(graph_real, corruption_modes=self.corruption_modes)
 
         return {
             "graph_real": graph_real,

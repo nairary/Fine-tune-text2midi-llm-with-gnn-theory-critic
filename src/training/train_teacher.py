@@ -161,6 +161,8 @@ def build_loaders(cfg: DictConfig):
         mask_min_nodes=int(cfg.dataloader.mask_min_nodes),
         optional_mask_field_prob=float(cfg.dataloader.optional_mask_field_prob),
         corruption_modes=list(cfg.dataloader.corruption_modes),
+        corruption_backend=str(cfg.dataloader.get("corruption_backend", "graph")),
+        theory_aware_cfg=OmegaConf.to_container(cfg.dataloader.get("theory_aware", {}), resolve=True),
     )
     train_dataset = SplitFilteredDataset(dataset, split=cfg.data.split.train)
     val_dataset = SplitFilteredDataset(dataset, split=cfg.data.split.val)
