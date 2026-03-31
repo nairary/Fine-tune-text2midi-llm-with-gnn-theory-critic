@@ -424,10 +424,13 @@ def corrupt_graph(graph: HeteroData, corruption_modes: Tuple[str, ...] | None = 
     if not available_corruption_modes:
         corrupted.corruption_metadata = {
             "mode": "identity",
+            "mode_family": "graph_baseline",
             "applied": False,
+            "topology_changed": False,
             "note_corrupted_indices": [],
             "chord_corrupted_indices": [],
             "onset_corrupted_indices": [],
+            "details": {},
         }
         return corrupted
 
@@ -480,10 +483,13 @@ def corrupt_graph(graph: HeteroData, corruption_modes: Tuple[str, ...] | None = 
 
     corrupted.corruption_metadata = {
         "mode": mode,
+        "mode_family": "graph_baseline",
         "applied": applied,
+        "topology_changed": mode in {"swap_neighboring_chords", "onset_mismatch"},
         "note_corrupted_indices": sorted(set(note_corrupted_indices)),
         "chord_corrupted_indices": sorted(set(chord_corrupted_indices)),
         "onset_corrupted_indices": sorted(set(onset_corrupted_indices)),
+        "details": {},
     }
     return corrupted
 
