@@ -79,6 +79,8 @@ class HookTheoryDataset(Dataset):
             "masked_labels": masked_labels,
             "corruption_metadata": getattr(graph_corrupted, "corruption_metadata", None),
             "graph_score_label": 1.0,
+            "raw_dataset_index": int(idx),
+            "song_id": song_obj.get("song_id") or song_obj.get("id") or song_obj.get("meta", {}).get("song_id"),
         }
 
 
@@ -97,4 +99,6 @@ def collate_fn(batch):
         "masked_labels": masked_labels,
         "corruption_metadata": corruption_metadata,
         "graph_score_label": score_labels,
+        "raw_dataset_index": [item.get("raw_dataset_index") for item in batch],
+        "song_id": [item.get("song_id") for item in batch],
     }
