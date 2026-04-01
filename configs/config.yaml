@@ -7,6 +7,7 @@ defaults:
   - scheduler: none
   - losses: teacher_ssl
   - experiment: baseline
+  - wandb: none
   - hydra: default
   - _self_
 
@@ -17,18 +18,3 @@ project:
 run_name: ${experiment.name}_${model.name}
 seed: ${training.seed}
 device: ${training.device}
-
-wandb:
-  enabled: false
-  project: theory_critic
-  entity: null
-  mode: online
-  log_train_metrics: true
-  log_val_metrics: true
-  log_diagnostics: true
-  diagnostics_split: val
-  diagnostics_every_epochs: 1
-  diagnostics_max_scan_batches: null
-  max_diagnostic_samples: 2
-  log_artifacts: true
-  artifact_examples_limit: 2

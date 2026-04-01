@@ -1,0 +1,4 @@
+name: full_features
+limit_train_batches: null
+limit_val_batches: null
+epochs: null

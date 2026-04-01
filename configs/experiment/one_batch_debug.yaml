@@ -1,7 +1,0 @@
-name: one_batch_debug
-# Ограничиваем обучение одним батчем, чтобы быстро проверить dataloader/forward/backward.
-limit_train_batches: 1
-# Одна валидационная итерация для быстрой sanity-check проверки.
-limit_val_batches: 1
-# Один epoch достаточно для one-batch smoke теста.
-epochs: 1
