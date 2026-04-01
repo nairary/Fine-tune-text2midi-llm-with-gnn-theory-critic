@@ -4,4 +4,4 @@ limit_train_batches: 1
 # Одна валидационная итерация для быстрой sanity-check проверки.
 limit_val_batches: 1
 # Один epoch достаточно для one-batch smoke теста.
-epochs: 1
+epochs: 500
