@@ -50,6 +50,11 @@ class TeacherGNN(nn.Module):
         use_chord_score_head: bool = True,
         use_onset_score_head: bool = True,
         local_score_head_hidden_dim: int | None = None,
+        use_hybrid_graph_scorer: bool = False,
+        local_summary_use_mean: bool = True,
+        local_summary_use_max: bool = True,
+        local_summary_use_topk_mean: bool = False,
+        local_summary_topk: int = 3,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -65,6 +70,15 @@ class TeacherGNN(nn.Module):
         self.use_note_score_head = bool(use_note_score_head)
         self.use_chord_score_head = bool(use_chord_score_head)
         self.use_onset_score_head = bool(use_onset_score_head)
+        self.use_hybrid_graph_scorer = bool(use_hybrid_graph_scorer)
+        self.local_summary_use_mean = bool(local_summary_use_mean)
+        self.local_summary_use_max = bool(local_summary_use_max)
+        self.local_summary_use_topk_mean = bool(local_summary_use_topk_mean)
+        self.local_summary_topk = int(local_summary_topk)
+        if self.local_summary_topk < 1:
+            raise ValueError("local_summary_topk must be >= 1.")
+        if not any([self.local_summary_use_mean, self.local_summary_use_max, self.local_summary_use_topk_mean]):
+            raise ValueError("At least one local score summary statistic must be enabled.")
 
         self.encoders = nn.ModuleDict(
             {
@@ -100,10 +114,6 @@ class TeacherGNN(nn.Module):
             head_hidden_dim=self.reconstruction_head_hidden_dim,
             enabled_heads=enabled_heads,
         )
-        self.graph_score_head = GraphScoreHead(
-            input_dim=self.pooling_output_dim,
-            hidden_dim=self.score_head_hidden_dim,
-        )
         self.local_score_heads = nn.ModuleDict()
         if self.use_note_score_head:
             self.local_score_heads["note"] = LocalScoreHead(hidden_dim, self.local_score_head_hidden_dim)
@@ -111,6 +121,16 @@ class TeacherGNN(nn.Module):
             self.local_score_heads["chord"] = LocalScoreHead(hidden_dim, self.local_score_head_hidden_dim)
         if self.use_onset_score_head:
             self.local_score_heads["onset"] = LocalScoreHead(hidden_dim, self.local_score_head_hidden_dim)
+        self.active_local_head_types = tuple(node_type for node_type in ("note", "chord", "onset") if node_type in self.local_score_heads)
+        self.local_summary_stats_count = sum(
+            [self.local_summary_use_mean, self.local_summary_use_max, self.local_summary_use_topk_mean]
+        )
+        self.local_summary_dim = len(self.active_local_head_types) * self.local_summary_stats_count
+        graph_score_input_dim = self.pooling_output_dim + (self.local_summary_dim if self.use_hybrid_graph_scorer else 0)
+        self.graph_score_head = GraphScoreHead(
+            input_dim=graph_score_input_dim,
+            hidden_dim=self.score_head_hidden_dim,
+        )
 
     def encode_nodes(self, batch) -> Dict[str, torch.Tensor]:
         encoded = {}
@@ -263,14 +283,57 @@ class TeacherGNN(nn.Module):
 
         return contextual_scores
 
+    def _summarize_type_scores(self, scores: torch.Tensor, batch_vector: torch.Tensor, num_graphs: int) -> torch.Tensor:
+        summary_rows = []
+        for graph_idx in range(num_graphs):
+            graph_mask = batch_vector == graph_idx
+            graph_scores = scores[graph_mask]
+            stats = []
+            if graph_scores.numel() == 0:
+                if self.local_summary_use_mean:
+                    stats.append(scores.new_zeros(()))
+                if self.local_summary_use_max:
+                    stats.append(scores.new_zeros(()))
+                if self.local_summary_use_topk_mean:
+                    stats.append(scores.new_zeros(()))
+            else:
+                if self.local_summary_use_mean:
+                    stats.append(graph_scores.mean())
+                if self.local_summary_use_max:
+                    stats.append(graph_scores.max())
+                if self.local_summary_use_topk_mean:
+                    top_k = min(self.local_summary_topk, graph_scores.numel())
+                    stats.append(torch.topk(graph_scores, k=top_k).values.mean())
+            summary_rows.append(torch.stack(stats, dim=0))
+        return torch.stack(summary_rows, dim=0)
+
+    def summarize_local_scores(self, batch, local_scores: Dict[str, torch.Tensor], batch_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+        num_graphs = self.pool._infer_num_graphs(batch_dict)
+        if not self.active_local_head_types:
+            song_x = batch["song"].x
+            return song_x.new_zeros((num_graphs, 0))
+
+        summaries = []
+        for node_type in self.active_local_head_types:
+            scores = local_scores.get(node_type)
+            if scores is None:
+                scores = batch[node_type].x.new_zeros((batch[node_type].x.size(0),), dtype=batch["song"].x.dtype)
+            summaries.append(self._summarize_type_scores(scores, batch_dict[node_type], num_graphs))
+        return torch.cat(summaries, dim=-1)
+
     def forward(self, batch):
         x_dict = self.encode_nodes(batch)
         node_embeddings = self.backbone(x_dict, batch.edge_index_dict)
         batch_dict = self._get_batch_dict(batch)
-        graph_embedding, pooled_by_type = self.pool(node_embeddings=node_embeddings, batch_dict=batch_dict)
-        recon_logits = self.reconstruction_heads(node_embeddings)
-        graph_score = self.graph_score_head(graph_embedding)
         local_scores = self.compute_contextual_local_scores(batch, node_embeddings)
+        graph_embedding, pooled_by_type = self.pool(node_embeddings=node_embeddings, batch_dict=batch_dict)
+        local_score_summaries = self.summarize_local_scores(batch, local_scores, batch_dict)
+        if self.use_hybrid_graph_scorer:
+            graph_score_features = torch.cat([graph_embedding, local_score_summaries], dim=-1)
+        else:
+            graph_score_features = graph_embedding
+        recon_logits = self.reconstruction_heads(node_embeddings)
+        graph_score = self.graph_score_head(graph_score_features)
 
         return {
             "node_embeddings": node_embeddings,
@@ -279,6 +342,8 @@ class TeacherGNN(nn.Module):
             "recon_logits": recon_logits,
             "local_scores": local_scores,
             "pooled_by_type": pooled_by_type,
+            "local_score_summaries": local_score_summaries,
+            "graph_score_features": graph_score_features,
         }
 
     @classmethod
@@ -299,6 +364,11 @@ class TeacherGNN(nn.Module):
         use_chord_score_head: bool = True,
         use_onset_score_head: bool = True,
         local_score_head_hidden_dim: int | None = None,
+        use_hybrid_graph_scorer: bool = False,
+        local_summary_use_mean: bool = True,
+        local_summary_use_max: bool = True,
+        local_summary_use_topk_mean: bool = False,
+        local_summary_topk: int = 3,
     ) -> "TeacherGNN":
         input_dims = {node_type: hetero_data[node_type].x.size(-1) for node_type in hetero_data.node_types}
         return cls(
@@ -319,4 +389,9 @@ class TeacherGNN(nn.Module):
             use_chord_score_head=use_chord_score_head,
             use_onset_score_head=use_onset_score_head,
             local_score_head_hidden_dim=local_score_head_hidden_dim,
+            use_hybrid_graph_scorer=use_hybrid_graph_scorer,
+            local_summary_use_mean=local_summary_use_mean,
+            local_summary_use_max=local_summary_use_max,
+            local_summary_use_topk_mean=local_summary_use_topk_mean,
+            local_summary_topk=local_summary_topk,
         )
