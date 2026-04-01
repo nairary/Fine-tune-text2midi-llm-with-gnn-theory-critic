@@ -1,7 +1,7 @@
 defaults:
   - model: teacher_gnn_base
   - data: teacher_encoded_full
-  - dataloader: baseline
+  - dataloader: theory_aware_extended
   - training: default
   - optimizer: adamw
   - scheduler: none
@@ -24,9 +24,15 @@ data:
     val: train
 
 dataloader:
-  batch_size: 1
+  # Для one-batch теста делаем батч минимальным и детерминированным.
+  batch_size: 2
   shuffle: false
-  corruption_backend: graph
+
+  # В one-batch режиме удобно фиксировать коррапшен для повторяемого дебага.
+  theory_aware:
+    deterministic_per_sample: true
+    deterministic_seed: 123
+
 
 training:
   limit_train_samples: 16
