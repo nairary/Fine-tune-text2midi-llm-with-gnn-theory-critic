@@ -1,0 +1,25 @@
+defaults:
+  - config
+  - override experiment: full_features
+  - override scheduler: cosine
+  - override wandb: offline
+  - _self_
+
+run_name: ${experiment.name}_${model.name}_full
+
+model:
+  pooling_mode: mean_max
+  use_hybrid_graph_scorer: true
+  local_summary_use_mean: true
+  local_summary_use_max: true
+  local_summary_use_topk_mean: true
+  local_summary_topk: 3
+
+wandb:
+  log_diagnostics: true
+  diagnostics_every_epochs: 1
+  diagnostics_split: val
+  diagnostics_max_scan_batches: 4
+  max_diagnostic_samples: 4
+  log_artifacts: true
+  artifact_examples_limit: 4

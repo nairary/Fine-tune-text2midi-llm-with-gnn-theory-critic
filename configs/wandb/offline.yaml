@@ -1,0 +1,13 @@
+enabled: true
+project: theory_critic
+entity: null
+mode: offline
+log_train_metrics: true
+log_val_metrics: true
+log_diagnostics: true
+diagnostics_split: val
+diagnostics_every_epochs: 1
+diagnostics_max_scan_batches: null
+max_diagnostic_samples: 2
+log_artifacts: true
+artifact_examples_limit: 2

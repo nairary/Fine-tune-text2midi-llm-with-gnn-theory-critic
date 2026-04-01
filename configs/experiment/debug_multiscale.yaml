@@ -1,4 +1,0 @@
-name: debug_multiscale
-limit_train_batches: 5
-limit_val_batches: 2
-epochs: 1

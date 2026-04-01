@@ -1,0 +1,13 @@
+enabled: false
+project: theory_critic
+entity: null
+mode: disabled
+log_train_metrics: false
+log_val_metrics: false
+log_diagnostics: false
+diagnostics_split: val
+diagnostics_every_epochs: 1
+diagnostics_max_scan_batches: null
+max_diagnostic_samples: 0
+log_artifacts: false
+artifact_examples_limit: 0
