@@ -1,0 +1,4 @@
+name: one_batch
+limit_train_batches: 1
+limit_val_batches: 1
+epochs: null

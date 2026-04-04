@@ -1,0 +1,23 @@
+name: theory_aware_ablation
+batch_size: 1
+num_workers: 0
+shuffle: false
+pin_memory: false
+drop_last: false
+mask_prob: 0.15
+mask_min_nodes: 1
+optional_mask_field_prob: 0.5
+corruption_backend: song_theory
+theory_aware:
+  strongbeat_min_duration: 1.0
+  strongbeat_only: true
+  rhythm_shift_max_steps: 2
+  deterministic_per_sample: true
+  deterministic_seed: 123
+corruption_modes:
+  - strongbeat_nonchord_note
+  - borrowed_melody_conflict
+  - borrowed_kind_toggle_without_melody_change
+  - note_onset_shift
+  - strong_weak_beat_flip
+  - functional_progression_violation_strict
