@@ -1,0 +1,32 @@
+defaults:
+  - config
+  - override experiment: full_data
+  - override dataloader: theory_aware_full
+  - override scheduler: cosine
+  - _self_
+
+run_name: ${experiment.name}_${model.name}_pool-${model.pooling_mode}_hyb-${model.use_hybrid_graph_scorer}_bs-${dataloader.batch_size}
+
+data:
+  split:
+    train: train
+    val: val
+
+training:
+  epochs: ${experiment.epochs}
+  log_every: 20
+  limit_train_batches: null
+  limit_val_batches: null
+
+optimizer:
+  lr: 0.0003
+
+scheduler:
+  t_max: ${experiment.epochs}
+  eta_min: 1.0e-6
+
+model:
+  pooling_mode: mean_max
+  use_hybrid_graph_scorer: true
+  local_summary_use_topk_mean: true
+  local_summary_topk: 5

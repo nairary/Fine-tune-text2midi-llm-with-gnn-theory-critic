@@ -1,0 +1,4 @@
+name: full_data
+limit_train_batches: null
+limit_val_batches: null
+epochs: 50
