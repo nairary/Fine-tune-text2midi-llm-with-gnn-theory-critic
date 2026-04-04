@@ -68,16 +68,16 @@ class HookTheoryDataset(Dataset):
                 rng=per_sample_rng,
             )
             graph_corrupted = build_graph_from_encoded(song_corrupted)
-            graph_corrupted.corruption_metadata = corruption_metadata
         else:
             graph_corrupted = corrupt_graph(graph_real, corruption_modes=self.corruption_modes)
+            corruption_metadata = getattr(graph_corrupted, "corruption_metadata", None)
 
         return {
             "graph_real": graph_real,
             "graph_masked": graph_masked,
             "graph_corrupted": graph_corrupted,
             "masked_labels": masked_labels,
-            "corruption_metadata": getattr(graph_corrupted, "corruption_metadata", None),
+            "corruption_metadata": corruption_metadata,
             "graph_score_label": 1.0,
         }
 
