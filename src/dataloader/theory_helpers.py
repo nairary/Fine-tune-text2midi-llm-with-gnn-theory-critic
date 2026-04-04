@@ -51,6 +51,22 @@ SD_TOKEN_TO_CHROMATIC = {
 }
 
 
+def try_parse_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def safe_float(value, default: float) -> float:
+    parsed = try_parse_float(value)
+    if parsed is None:
+        return float(default)
+    return parsed
+
+
 @lru_cache(maxsize=1)
 def _load_vocab_maps() -> dict:
     def _load_json(path: Path) -> dict:
@@ -206,12 +222,16 @@ def classify_function_from_root_raw(root_raw: int, mode_name: str, theory_ctx: d
 
 
 def is_strong_note_position(note: dict, song_obj: dict, include_midpoint: bool = True) -> bool:
-    num_beats = float(song_obj.get("meta", {}).get("main_num_beats", 4.0) or 4.0)
-    beat = float(note.get("beat", 1.0))
+    num_beats = safe_float(song_obj.get("meta", {}).get("main_num_beats", 4.0), 4.0)
+    beat = try_parse_float(note.get("beat"))
 
     if "pos_in_bar" in note and note.get("pos_in_bar") is not None:
-        pos = float(note.get("pos_in_bar"))
+        pos = try_parse_float(note.get("pos_in_bar"))
+        if pos is None:
+            return False
     else:
+        if beat is None:
+            return False
         bar_idx = int((beat - 1.0) // num_beats)
         bar_start = 1.0 + bar_idx * num_beats
         pos = beat - bar_start
@@ -224,11 +244,16 @@ def is_strong_note_position(note: dict, song_obj: dict, include_midpoint: bool =
 
 
 def find_covering_chord_index(song_obj: dict, note: dict) -> int | None:
-    beat = float(note.get("beat", 1.0))
+    beat = try_parse_float(note.get("beat"))
+    if beat is None:
+        return None
     chords = song_obj.get("chords", [])
     for idx, chord in enumerate(chords):
-        c_start = float(chord.get("beat", 1.0))
-        c_end = c_start + max(0.0, float(chord.get("duration", 0.0)))
+        c_start = try_parse_float(chord.get("beat"))
+        c_duration = safe_float(chord.get("duration", 0.0), 0.0)
+        if c_start is None:
+            continue
+        c_end = c_start + max(0.0, c_duration)
         if c_start <= beat < c_end:
             return idx
     return None
