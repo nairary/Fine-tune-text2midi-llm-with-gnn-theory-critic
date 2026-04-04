@@ -11,7 +11,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.dataloader.song_corruptions import corrupt_song_obj
-from src.dataloader.theory_helpers import build_theory_context, chord_pitch_classes_tertian, is_strong_note_position
+from src.dataloader.theory_helpers import (
+    build_theory_context,
+    chord_pitch_classes_tertian,
+    find_covering_chord_index,
+    is_strong_note_position,
+)
 
 
 class TheorySmokeTests(unittest.TestCase):
@@ -114,6 +119,31 @@ class TheorySmokeTests(unittest.TestCase):
         self.assertTrue(is_strong_note_position({"beat": 5.0}, song))
         self.assertTrue(is_strong_note_position({"beat": 7.0}, song))
         self.assertFalse(is_strong_note_position({"beat": 6.0}, song))
+
+    def test_helpers_handle_missing_or_invalid_timing_fields(self):
+        song = self._song()
+        self.assertIsNone(find_covering_chord_index(song, {"beat": None}))
+        self.assertFalse(is_strong_note_position({"beat": None}, song))
+        self.assertFalse(is_strong_note_position({"beat": 2.0, "pos_in_bar": None}, song))
+        self.assertFalse(is_strong_note_position({"beat": 2.0, "pos_in_bar": "bad"}, song))
+
+        song_bad_meta = copy.deepcopy(song)
+        song_bad_meta["meta"]["main_num_beats"] = None
+        self.assertTrue(is_strong_note_position({"beat": 1.0}, song_bad_meta))
+
+    def test_corrupt_song_obj_skips_none_beat_notes_without_crashing(self):
+        song = self._song()
+        song["melody"][0]["beat"] = None
+        corrupted_song, metadata = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["borrowed_melody_conflict", "note_onset_shift", "strong_weak_beat_flip"],
+            {"rhythm_shift_max_steps": 1},
+            self.ctx,
+            rng=random.Random(4),
+        )
+        self.assertIsInstance(corrupted_song, dict)
+        self.assertIsInstance(metadata, dict)
+        self.assertIn("applied", metadata)
 
     def test_rhythm_corruptions_keep_onset_metadata(self):
         song = self._song()

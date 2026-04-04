@@ -13,6 +13,8 @@ from .theory_helpers import (
     classify_function_from_root_raw,
     find_covering_chord_index,
     is_strong_note_position,
+    safe_float,
+    try_parse_float,
 )
 
 
@@ -30,7 +32,12 @@ def _identity_metadata(mode: str) -> dict:
 
 
 def _onset_grid(song_obj: dict) -> list[float]:
-    return sorted({float(x.get("beat", 1.0)) for x in song_obj.get("melody", []) + song_obj.get("chords", [])})
+    beats = set()
+    for event in song_obj.get("melody", []) + song_obj.get("chords", []):
+        beat = try_parse_float(event.get("beat"))
+        if beat is not None:
+            beats.add(beat)
+    return sorted(beats)
 
 
 def _collect_post_onset_indices_for_metadata(post_grid: list[float], beats: set[float]) -> list[int]:
@@ -60,7 +67,7 @@ def _pick_new_sd_id(exclude_pcs: set[int], include_pcs: set[int] | None, theory_
 
 def _corrupt_strongbeat_nonchord_note(song_obj, theory_ctx, rng, corruption_cfg):
     metadata = _identity_metadata("strongbeat_nonchord_note")
-    min_duration = float(corruption_cfg.get("strongbeat_min_duration", 1.0))
+    min_duration = safe_float(corruption_cfg.get("strongbeat_min_duration", 1.0), 1.0)
     strongbeat_only = bool(corruption_cfg.get("strongbeat_only", True))
 
     indices = list(range(len(song_obj.get("melody", []))))
@@ -69,7 +76,8 @@ def _corrupt_strongbeat_nonchord_note(song_obj, theory_ctx, rng, corruption_cfg)
         note = song_obj["melody"][note_idx]
         if int(note.get("is_rest", 0)) == 1:
             continue
-        if float(note.get("duration", 0.0)) < min_duration and not is_strong_note_position(note, song_obj):
+        note_duration = safe_float(note.get("duration", 0.0), 0.0)
+        if note_duration < min_duration and not is_strong_note_position(note, song_obj):
             continue
         if strongbeat_only and not is_strong_note_position(note, song_obj):
             continue
@@ -217,7 +225,7 @@ def _corrupt_borrowed_kind_toggle(song_obj, theory_ctx, rng, corruption_cfg):
 def _corrupt_note_onset_shift(song_obj, theory_ctx, rng, corruption_cfg):
     metadata = _identity_metadata("note_onset_shift")
     max_steps = int(corruption_cfg.get("rhythm_shift_max_steps", 1))
-    onset_grid = sorted({float(x.get("beat", 1.0)) for x in song_obj.get("melody", []) + song_obj.get("chords", [])})
+    onset_grid = _onset_grid(song_obj)
     if len(onset_grid) < 2:
         return song_obj, metadata, False
 
@@ -227,7 +235,9 @@ def _corrupt_note_onset_shift(song_obj, theory_ctx, rng, corruption_cfg):
         note = song_obj["melody"][note_idx]
         if int(note.get("is_rest", 0)) == 1:
             continue
-        old_beat = float(note.get("beat", 1.0))
+        old_beat = try_parse_float(note.get("beat"))
+        if old_beat is None:
+            continue
         if old_beat not in onset_grid:
             continue
         pos = onset_grid.index(old_beat)
@@ -239,7 +249,7 @@ def _corrupt_note_onset_shift(song_obj, theory_ctx, rng, corruption_cfg):
                 candidates.append(onset_grid[pos + step])
         if not candidates:
             continue
-        new_beat = float(rng.choice(candidates))
+        new_beat = rng.choice(candidates)
         note["beat"] = new_beat
         post_grid = _onset_grid(song_obj)
         onset_indices = _collect_post_onset_indices_for_metadata(post_grid, {old_beat, new_beat})
@@ -262,7 +272,7 @@ def _corrupt_note_onset_shift(song_obj, theory_ctx, rng, corruption_cfg):
 def _corrupt_strong_weak_beat_flip(song_obj, theory_ctx, rng, corruption_cfg):
     metadata = _identity_metadata("strong_weak_beat_flip")
     notes = song_obj.get("melody", [])
-    num_beats = float(song_obj.get("meta", {}).get("main_num_beats", 4.0) or 4.0)
+    num_beats = safe_float(song_obj.get("meta", {}).get("main_num_beats", 4.0), 4.0)
 
     strong_offsets = {0.0}
     if abs(num_beats - 4.0) < 1e-6:
@@ -278,7 +288,9 @@ def _corrupt_strong_weak_beat_flip(song_obj, theory_ctx, rng, corruption_cfg):
         note = notes[note_idx]
         if int(note.get("is_rest", 0)) == 1:
             continue
-        old_beat = float(note.get("beat", 1.0))
+        old_beat = try_parse_float(note.get("beat"))
+        if old_beat is None:
+            continue
         bar_idx = int((old_beat - 1.0) // num_beats)
         bar_start = 1.0 + bar_idx * num_beats
         old_pos = old_beat - bar_start
