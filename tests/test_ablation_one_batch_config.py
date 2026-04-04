@@ -25,7 +25,13 @@ EXPECTED_AXES = {
     "model.use_hybrid_graph_scorer": "false,true",
     "model.pooling_mode": "mean,mean_max",
     "dataloader": "graph_ablation,theory_aware_ablation",
-    "dataloader.batch_size": "1,16",
+    "dataloader.batch_size": "16",
+}
+
+EXPECTED_FIXED_OVERRIDES = {
+    "model.local_summary_use_topk_mean": "true",
+    "model.local_summary_topk": "5",
+    "data.split.val": "train",
 }
 
 
@@ -38,12 +44,18 @@ def _compose(overrides: list[str] | None = None, *, return_hydra_config: bool = 
         )
 
 
-def test_ablation_one_batch_compose_limits_batches_and_hydra_subdir():
+def test_ablation_one_batch_compose_limits_batches_hydra_subdir_and_overfit_defaults():
     cfg = _compose(return_hydra_config=True)
     assert cfg.experiment.limit_train_batches == 1
     assert cfg.experiment.limit_val_batches == 1
     assert cfg.hydra.sweep.dir == "multirun/ablation_one_batch"
     assert cfg.hydra.sweep.subdir == cfg.run_name
+
+    assert cfg.data.split.train == "train"
+    assert cfg.data.split.val == "train"
+    assert cfg.dataloader.batch_size == 16
+    assert cfg.model.local_summary_use_topk_mean is True
+    assert cfg.model.local_summary_topk == 5
 
 
 def test_ablation_dataloader_backends():
@@ -61,14 +73,14 @@ def test_run_name_contains_all_sweep_dimensions():
             "model.use_hybrid_graph_scorer=false",
             "model.pooling_mode=mean",
             "dataloader=graph_ablation",
-            "dataloader.batch_size=1",
+            "dataloader.batch_size=16",
         ]
     )
     run_name_1 = OmegaConf.to_container(cfg, resolve=True)["run_name"]
     assert "graph_ablation" in run_name_1
     assert "pool-mean" in run_name_1
     assert "hyb-False" in run_name_1 or "hyb-false" in run_name_1
-    assert "bs-1" in run_name_1
+    assert "bs-16" in run_name_1
     assert "ep-50" in run_name_1
 
     cfg = _compose(
@@ -88,14 +100,13 @@ def test_run_name_contains_all_sweep_dimensions():
     assert "ep-500" in run_name_2
 
 
-def test_run_names_are_unique_for_all_32_sweep_combinations():
+def test_run_names_are_unique_for_all_16_sweep_combinations():
     names: set[str] = set()
-    for epochs, hybrid, pool, dataloader_name, batch_size in itertools.product(
+    for epochs, hybrid, pool, dataloader_name in itertools.product(
         [50, 500],
         [False, True],
         ["mean", "mean_max"],
         ["graph_ablation", "theory_aware_ablation"],
-        [1, 16],
     ):
         cfg = _compose(
             [
@@ -103,7 +114,7 @@ def test_run_names_are_unique_for_all_32_sweep_combinations():
                 f"model.use_hybrid_graph_scorer={str(hybrid).lower()}",
                 f"model.pooling_mode={pool}",
                 f"dataloader={dataloader_name}",
-                f"dataloader.batch_size={batch_size}",
+                "dataloader.batch_size=16",
             ]
         )
         run_name = OmegaConf.to_container(cfg, resolve=True)["run_name"]
@@ -112,10 +123,10 @@ def test_run_names_are_unique_for_all_32_sweep_combinations():
         assert dataloader_name in run_name
         assert f"pool-{pool}" in run_name
         assert ("hyb-True" in run_name or "hyb-true" in run_name) if hybrid else ("hyb-False" in run_name or "hyb-false" in run_name)
-        assert f"bs-{batch_size}" in run_name
+        assert "bs-16" in run_name
         assert f"ep-{epochs}" in run_name
 
-    assert len(names) == 32
+    assert len(names) == 16
 
 
 def test_integration_ablation_dataloaders_runtime_smoke_via_build_loaders():
@@ -125,7 +136,7 @@ def test_integration_ablation_dataloaders_runtime_smoke_via_build_loaders():
     for dataloader_name in ["graph_ablation", "theory_aware_ablation"]:
         overrides = [
             f"dataloader={dataloader_name}",
-            "dataloader.batch_size=1",
+            "dataloader.batch_size=16",
             "training.limit_train_samples=16",
             "training.limit_val_samples=16",
         ]
@@ -146,12 +157,13 @@ def test_integration_ablation_dataloaders_runtime_smoke_via_build_loaders():
         assert "graph_score_label" in batch
 
 
-def test_shell_script_has_expected_axes_without_max_pooling_and_32_combinations():
+def test_shell_script_has_expected_axes_and_16_combinations_with_fixed_overrides():
     content = SCRIPT_PATH.read_text(encoding="utf-8")
 
     for key, values in EXPECTED_AXES.items():
         assert f"{key}={values}" in content
 
+    assert "dataloader.batch_size=1,16" not in content
     assert "pooling_mode=max" not in content
 
     axis_pattern = re.compile(r"([a-zA-Z0-9_.]+)=([^\\\n]+)")
@@ -160,4 +172,16 @@ def test_shell_script_has_expected_axes_without_max_pooling_and_32_combinations(
         assert axes_in_script[key].strip() == values
 
     total = math.prod(len(values.split(",")) for values in EXPECTED_AXES.values())
-    assert total == 32
+    assert total == 16
+
+
+def test_shell_script_has_fixed_topk_mean_and_train_val_same_split_overrides():
+    content = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    for key, value in EXPECTED_FIXED_OVERRIDES.items():
+        assert f"{key}={value}" not in content
+
+    cfg = _compose()
+    assert cfg.model.local_summary_use_topk_mean is True
+    assert cfg.model.local_summary_topk == 5
+    assert cfg.data.split.val == "train"

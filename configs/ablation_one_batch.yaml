@@ -10,3 +10,15 @@ hydra:
   sweep:
     dir: multirun/ablation_one_batch
     subdir: ${run_name}
+
+data:
+  split:
+    train: train
+    val: train
+
+model:
+  local_summary_use_topk_mean: true
+  local_summary_topk: 5
+
+dataloader:
+  batch_size: 16
