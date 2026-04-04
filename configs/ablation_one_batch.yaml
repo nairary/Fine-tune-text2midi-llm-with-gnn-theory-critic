@@ -1,0 +1,12 @@
+defaults:
+  - config
+  - override experiment: one_batch
+  - override dataloader: graph_ablation
+  - _self_
+
+run_name: abl_${dataloader.name}_pool-${model.pooling_mode}_hyb-${model.use_hybrid_graph_scorer}_bs-${dataloader.batch_size}_ep-${experiment.epochs}
+
+hydra:
+  sweep:
+    dir: multirun/ablation_one_batch
+    subdir: ${run_name}
