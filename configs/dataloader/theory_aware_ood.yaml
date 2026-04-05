@@ -1,0 +1,21 @@
+name: theory_aware_full
+batch_size: 32
+num_workers: 0
+shuffle: true
+pin_memory: false
+drop_last: false
+mask_prob: 0.15
+mask_min_nodes: 1
+optional_mask_field_prob: 0.5
+corruption_backend: song_theory
+theory_aware:
+  strongbeat_min_duration: 1.0
+  strongbeat_only: true
+  rhythm_shift_max_steps: 2
+  deterministic_per_sample: false
+  deterministic_seed: 123
+corruption_modes:
+  - out_of_key_note
+  - local_semitone_fragment_shift
+  - octave_leap_violation
+  - semitone_from_bass_or_chord_tone
