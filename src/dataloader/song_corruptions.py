@@ -8,11 +8,14 @@ from typing import Callable
 
 from .function_rules import STRICT_TRIPLET_PATTERNS_V1
 from .theory_helpers import (
+    chord_bass_and_top_pcs,
     decode_root_raw,
+    decode_sd_to_chromatic,
     chord_pitch_classes_tertian,
     classify_function_from_root_raw,
     find_covering_chord_index,
     is_strong_note_position,
+    select_active_mode_name,
     safe_float,
     try_parse_float,
 )
@@ -62,6 +65,22 @@ def _pick_new_sd_id(exclude_pcs: set[int], include_pcs: set[int] | None, theory_
         if include_pcs is not None and pc not in include_pcs:
             continue
         candidates.append(sd_id)
+    return int(rng.choice(candidates)) if candidates else None
+
+
+def _pick_sd_id_for_pc(
+    target_pc: int,
+    theory_ctx: dict,
+    rng: random.Random,
+    exclude_sd_ids: set[int] | None = None,
+) -> int | None:
+    exclude_sd_ids = exclude_sd_ids or set()
+    candidates = []
+    for sd_id, token in theory_ctx["sd_id_to_token"].items():
+        if token.startswith("<") or int(sd_id) in exclude_sd_ids:
+            continue
+        if theory_ctx["sd_token_to_chromatic"].get(token) == target_pc % 12:
+            candidates.append(int(sd_id))
     return int(rng.choice(candidates)) if candidates else None
 
 
@@ -400,6 +419,221 @@ def _corrupt_functional_progression_violation(song_obj, theory_ctx, rng, corrupt
     return song_obj, metadata, False
 
 
+def _corrupt_out_of_key_note(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("out_of_key_note")
+    note_indices = list(range(len(song_obj.get("melody", []))))
+    rng.shuffle(note_indices)
+
+    for note_idx in note_indices:
+        note = song_obj["melody"][note_idx]
+        if int(note.get("is_rest", 0)) == 1:
+            continue
+        old_sd = int(note.get("sd_id", 0))
+        old_pc = decode_sd_to_chromatic(old_sd, theory_ctx)
+        if old_pc is None:
+            continue
+
+        chord_idx = find_covering_chord_index(song_obj, note)
+        chord = song_obj["chords"][chord_idx] if chord_idx is not None and chord_idx < len(song_obj.get("chords", [])) else None
+        mode_name = select_active_mode_name(song_obj, chord, theory_ctx)
+        allowed_pcs = set(theory_ctx["mode_to_pcset"].get(mode_name, theory_ctx["mode_to_pcset"]["major"]))
+        out_of_key_pcs = {pc for pc in range(12) if pc not in allowed_pcs}
+        if not out_of_key_pcs:
+            continue
+        out_of_key_pcs.discard(old_pc)
+        if not out_of_key_pcs:
+            continue
+        new_sd = _pick_new_sd_id(exclude_pcs=set(), include_pcs=out_of_key_pcs, theory_ctx=theory_ctx, rng=rng)
+        if new_sd is None or new_sd == old_sd:
+            continue
+
+        new_pc = decode_sd_to_chromatic(new_sd, theory_ctx)
+        if new_pc is None or new_pc == old_pc:
+            continue
+
+        note["sd_id"] = new_sd
+        metadata.update({
+            "applied": True,
+            "note_corrupted_indices": [note_idx],
+            "details": {
+                "reason": "out_of_key_note",
+                "original_sd_id": old_sd,
+                "new_sd_id": new_sd,
+                "active_mode_name": mode_name,
+                "covering_chord_index": chord_idx,
+            },
+        })
+        return song_obj, metadata, True
+
+    return song_obj, metadata, False
+
+
+def _corrupt_local_semitone_fragment_shift(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("local_semitone_fragment_shift")
+    notes = song_obj.get("melody", [])
+    n_notes = len(notes)
+    if n_notes < 2:
+        return song_obj, metadata, False
+
+    fragment_lengths = [2, 3, 4]
+    rng.shuffle(fragment_lengths)
+    shift_options = [-1, 1]
+    rng.shuffle(shift_options)
+
+    for frag_len in fragment_lengths:
+        if frag_len > n_notes:
+            continue
+        start_indices = list(range(0, n_notes - frag_len + 1))
+        rng.shuffle(start_indices)
+        for start_idx in start_indices:
+            frag_indices = list(range(start_idx, start_idx + frag_len))
+            fragment_notes = [notes[i] for i in frag_indices]
+            if any(int(n.get("is_rest", 0)) == 1 for n in fragment_notes):
+                continue
+
+            for shift in shift_options:
+                original_sd_ids = [int(n.get("sd_id", 0)) for n in fragment_notes]
+                original_pcs = [decode_sd_to_chromatic(sd_id, theory_ctx) for sd_id in original_sd_ids]
+                if any(pc is None for pc in original_pcs):
+                    continue
+
+                new_sd_ids = []
+                valid = True
+                for sd_id, pc in zip(original_sd_ids, original_pcs):
+                    target_pc = (int(pc) + shift) % 12
+                    new_sd = _pick_sd_id_for_pc(target_pc, theory_ctx, rng, exclude_sd_ids={sd_id})
+                    if new_sd is None:
+                        valid = False
+                        break
+                    new_sd_ids.append(new_sd)
+                if not valid:
+                    continue
+
+                for idx, new_sd in zip(frag_indices, new_sd_ids):
+                    notes[idx]["sd_id"] = new_sd
+
+                metadata.update({
+                    "applied": True,
+                    "note_corrupted_indices": frag_indices,
+                    "details": {
+                        "fragment_note_indices": frag_indices,
+                        "shift_semitones": int(shift),
+                        "original_sd_ids": original_sd_ids,
+                        "new_sd_ids": new_sd_ids,
+                    },
+                })
+                return song_obj, metadata, True
+
+    return song_obj, metadata, False
+
+
+def _corrupt_octave_leap_violation(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("octave_leap_violation")
+    notes = song_obj.get("melody", [])
+    if len(notes) < 2:
+        return song_obj, metadata, False
+
+    octave_min = int(corruption_cfg.get("octave_min_id", 1))
+    octave_max = int(corruption_cfg.get("octave_max_id", 8))
+    shifts = [2, -2, 1, -1]
+
+    candidate_indices = list(range(len(notes)))
+    rng.shuffle(candidate_indices)
+    for note_idx in candidate_indices:
+        note = notes[note_idx]
+        if int(note.get("is_rest", 0)) == 1:
+            continue
+        if note_idx > 0 and int(notes[note_idx - 1].get("is_rest", 0)) == 0:
+            neighbor_idx = note_idx - 1
+        elif note_idx + 1 < len(notes) and int(notes[note_idx + 1].get("is_rest", 0)) == 0:
+            neighbor_idx = note_idx + 1
+        else:
+            continue
+
+        old_oct = int(note.get("octave_id", 0))
+        for shift in shifts:
+            new_oct = old_oct + shift
+            if not (octave_min <= new_oct <= octave_max):
+                continue
+            if new_oct == old_oct:
+                continue
+            note["octave_id"] = new_oct
+            metadata.update({
+                "applied": True,
+                "note_corrupted_indices": [note_idx],
+                "details": {
+                    "reason": "octave_leap_violation",
+                    "target_note_index": note_idx,
+                    "neighbor_note_index": neighbor_idx,
+                    "original_octave_id": old_oct,
+                    "new_octave_id": new_oct,
+                    "octave_shift": shift,
+                    "neighbor_octave_id": int(notes[neighbor_idx].get("octave_id", 0)),
+                },
+            })
+            return song_obj, metadata, True
+
+    return song_obj, metadata, False
+
+
+def _corrupt_semitone_from_bass_or_chord_tone(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("semitone_from_bass_or_chord_tone")
+    note_indices = list(range(len(song_obj.get("melody", []))))
+    rng.shuffle(note_indices)
+
+    for note_idx in note_indices:
+        note = song_obj["melody"][note_idx]
+        if int(note.get("is_rest", 0)) == 1:
+            continue
+        chord_idx = find_covering_chord_index(song_obj, note)
+        if chord_idx is None:
+            continue
+        chord = song_obj["chords"][chord_idx]
+        if int(chord.get("is_rest", 0)) == 1:
+            continue
+
+        bass_top = chord_bass_and_top_pcs(song_obj, chord, theory_ctx)
+        if bass_top is None:
+            continue
+        bass_pc, top_pc = bass_top
+        chord_pcs = chord_pitch_classes_tertian(song_obj, chord, theory_ctx)
+        if not chord_pcs:
+            continue
+
+        old_sd = int(note.get("sd_id", 0))
+        candidate_refs = [("bass", bass_pc), ("top_voice", top_pc)]
+        rng.shuffle(candidate_refs)
+
+        for role, ref_pc in candidate_refs:
+            conflict_pcs = {(ref_pc + 1) % 12, (ref_pc - 1) % 12}
+            conflict_pcs = {pc for pc in conflict_pcs if pc not in chord_pcs and pc not in {bass_pc, top_pc}}
+            if not conflict_pcs:
+                continue
+            target_pc = int(rng.choice(sorted(conflict_pcs)))
+            new_sd = _pick_sd_id_for_pc(target_pc, theory_ctx, rng, exclude_sd_ids={old_sd})
+            if new_sd is None:
+                continue
+
+            note["sd_id"] = new_sd
+            metadata.update({
+                "applied": True,
+                "note_corrupted_indices": [note_idx],
+                "chord_corrupted_indices": [chord_idx],
+                "details": {
+                    "target_note_index": note_idx,
+                    "covering_chord_index": chord_idx,
+                    "original_sd_id": old_sd,
+                    "new_sd_id": new_sd,
+                    "target_conflict_pc": target_pc,
+                    "reference_pc": ref_pc,
+                    "reference_role": role,
+                },
+            })
+            return song_obj, metadata, True
+
+    return song_obj, metadata, False
+
+
 def _not_implemented_mode(song_obj, theory_ctx, rng, corruption_cfg, mode_name: str):
     metadata = _identity_metadata(mode_name)
     metadata["details"] = {"reason": "registered_but_not_implemented"}
@@ -413,13 +647,13 @@ _CORRUPTION_REGISTRY: dict[str, Callable] = {
     "note_onset_shift": _corrupt_note_onset_shift,
     "strong_weak_beat_flip": _corrupt_strong_weak_beat_flip,
     "functional_progression_violation_strict": _corrupt_functional_progression_violation,
+    "out_of_key_note": _corrupt_out_of_key_note,
+    "local_semitone_fragment_shift": _corrupt_local_semitone_fragment_shift,
+    "octave_leap_violation": _corrupt_octave_leap_violation,
+    "semitone_from_bass_or_chord_tone": _corrupt_semitone_from_bass_or_chord_tone,
 }
 
 _PLACEHOLDER_MODES = {
-    "out_of_key_note",
-    "local_semitone_fragment_shift",
-    "octave_leap_violation",
-    "semitone_from_bass_or_chord_tone",
     "drop_note_from_onset",
     "drop_chord_from_onset",
     "chord_onset_shift",
