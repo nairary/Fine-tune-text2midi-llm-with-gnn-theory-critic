@@ -13,7 +13,9 @@ if str(REPO_ROOT) not in sys.path:
 from src.dataloader.song_corruptions import corrupt_song_obj
 from src.dataloader.theory_helpers import (
     build_theory_context,
+    chord_bass_and_top_pcs,
     chord_pitch_classes_tertian,
+    decode_sd_to_chromatic,
     find_covering_chord_index,
     is_strong_note_position,
 )
@@ -159,6 +161,82 @@ class TheorySmokeTests(unittest.TestCase):
             target = float(meta["details"]["target_onset_beat"])
             expected = self._expected_post_onset_indices(corrupted_song, source, target)
             self.assertEqual(sorted(meta["onset_corrupted_indices"]), expected)
+
+    def test_out_of_key_note_smoke(self):
+        song = self._song()
+        corrupted_song, meta = corrupt_song_obj(copy.deepcopy(song), ["out_of_key_note"], {}, self.ctx, rng=random.Random(1))
+        self.assertTrue(meta["applied"])
+        self.assertEqual(meta["mode"], "out_of_key_note")
+        idx = meta["note_corrupted_indices"][0]
+        new_sd = int(corrupted_song["melody"][idx]["sd_id"])
+        new_pc = decode_sd_to_chromatic(new_sd, self.ctx)
+        main_mode = self.ctx["scale_id_to_name"][song["meta"]["main_key_scale_id"]]
+        self.assertNotIn(new_pc, set(self.ctx["mode_to_pcset"][main_mode]))
+
+    def test_local_semitone_fragment_shift_smoke(self):
+        song = self._song()
+        song["melody"].extend([
+            {"beat": 3.0, "duration": 0.5, "sd_id": self.ctx["sd_token_to_id"]["3"], "octave_id": 5, "is_rest": 0},
+            {"beat": 3.5, "duration": 0.5, "sd_id": self.ctx["sd_token_to_id"]["4"], "octave_id": 5, "is_rest": 0},
+        ])
+        before = [n["sd_id"] for n in song["melody"]]
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["local_semitone_fragment_shift"],
+            {},
+            self.ctx,
+            rng=random.Random(2),
+        )
+        self.assertTrue(meta["applied"])
+        changed = meta["note_corrupted_indices"]
+        self.assertGreaterEqual(len(changed), 2)
+        after = [n["sd_id"] for n in corrupted_song["melody"]]
+        self.assertNotEqual(before, after)
+        for idx in changed:
+            old_pc = decode_sd_to_chromatic(int(before[idx]), self.ctx)
+            new_pc = decode_sd_to_chromatic(int(after[idx]), self.ctx)
+            self.assertEqual((new_pc - old_pc) % 12, meta["details"]["shift_semitones"] % 12)
+
+    def test_octave_leap_violation_smoke(self):
+        song = self._song()
+        corrupted_song, meta = corrupt_song_obj(copy.deepcopy(song), ["octave_leap_violation"], {}, self.ctx, rng=random.Random(3))
+        self.assertTrue(meta["applied"])
+        idx = meta["details"]["target_note_index"]
+        self.assertNotEqual(
+            song["melody"][idx]["octave_id"],
+            corrupted_song["melody"][idx]["octave_id"],
+        )
+        self.assertIn("octave_shift", meta["details"])
+        self.assertIn("neighbor_octave_id", meta["details"])
+
+    def test_semitone_from_bass_or_chord_tone_smoke(self):
+        song = self._song()
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["semitone_from_bass_or_chord_tone"],
+            {},
+            self.ctx,
+            rng=random.Random(4),
+        )
+        self.assertTrue(meta["applied"])
+        self.assertIn(meta["details"]["reference_role"], {"bass", "top_voice"})
+
+        note_idx = meta["details"]["target_note_index"]
+        chord_idx = meta["details"]["covering_chord_index"]
+        chord = corrupted_song["chords"][chord_idx]
+        bass_top = chord_bass_and_top_pcs(corrupted_song, chord, self.ctx)
+        self.assertIsNotNone(bass_top)
+        bass_pc, top_pc = bass_top
+
+        new_sd = int(corrupted_song["melody"][note_idx]["sd_id"])
+        new_pc = decode_sd_to_chromatic(new_sd, self.ctx)
+        if meta["details"]["reference_role"] == "bass":
+            self.assertIn((new_pc - bass_pc) % 12, {1, 11})
+        else:
+            self.assertIn((new_pc - top_pc) % 12, {1, 11})
+
+        chord_pcs = chord_pitch_classes_tertian(corrupted_song, chord, self.ctx)
+        self.assertIn(meta["details"]["reference_pc"], chord_pcs)
 
 
 if __name__ == "__main__":
