@@ -195,6 +195,30 @@ def chord_pitch_classes_tertian(song_obj: dict, chord: dict, theory_ctx: dict) -
     return pcs
 
 
+def chord_bass_and_top_pcs(song_obj: dict, chord: dict, theory_ctx: dict) -> tuple[int, int] | None:
+    """Return approximate (bass_pc, top_voice_pc) from tertian construction."""
+    root_raw = decode_root_raw(chord, theory_ctx)
+    type_raw = decode_type_raw(chord, theory_ctx)
+    if root_raw is None or type_raw is None:
+        return None
+    if type_raw not in {5, 7, 9, 11, 13}:
+        return None
+
+    active_mode = select_active_mode_name(song_obj, chord, theory_ctx)
+    template = ordered_mode_template(active_mode, theory_ctx)
+    if template is None:
+        return None
+    root_resolution = _resolve_root_anchor(root_raw, template)
+    if root_resolution is None:
+        return None
+    anchor_degree_idx, root_pc = root_resolution
+
+    n_tones = (type_raw + 1) // 2
+    top_degree_idx = (anchor_degree_idx + 2 * (n_tones - 1)) % 7
+    top_pc = template[top_degree_idx] % 12
+    return root_pc % 12, top_pc
+
+
 def select_active_mode_name(song_obj: dict, chord: dict | None, theory_ctx: dict) -> str:
     if chord:
         borrowed_kind = theory_ctx["borrowed_id_to_kind"].get(int(chord.get("borrowed_kind_id", 0)))
