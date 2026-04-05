@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import random
+from pathlib import Path
+from typing import Any
+
+import torch
+from omegaconf import OmegaConf
+from torch_geometric.data import Batch
+
+from src.dataloader.song_corruptions import corrupt_song_obj
+from src.dataloader.theory_helpers import build_theory_context
+from src.dataloader.utils_graph import build_graph_from_encoded
+from src.models.teacher_gnn import TeacherGNN
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Score one encoded song object with a trained TeacherGNN and optional song-level corruptions."
+    )
+    parser.add_argument("--encoded-json", type=Path, required=True, help="Path to a single encoded song JSON object.")
+    parser.add_argument("--checkpoint", type=Path, required=True, help="Path to a model checkpoint (.pt).")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to the matching composed_config.yaml used to train the checkpoint.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["none", "song_theory"],
+        default="none",
+        help="'none' scores the input as-is. 'song_theory' applies the requested corruption modes in order.",
+    )
+    parser.add_argument(
+        "--modes",
+        nargs="*",
+        default=[],
+        help="Ordered list of corruption modes to apply sequentially during inference.",
+    )
+    parser.add_argument("--device", default="cpu", help="Device for inference, e.g. cpu or cuda.")
+    parser.add_argument("--seed", type=int, default=123, help="Base random seed used for corruption application.")
+    parser.add_argument(
+        "--save-corrupted-json",
+        type=Path,
+        default=None,
+        help="Optional path to save the corrupted encoded song JSON.",
+    )
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print the JSON result.")
+    return parser.parse_args()
+
+
+def load_song_obj(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"{path} does not contain a single song object. Expected a JSON object with keys like "
+            "'meta', 'melody', and 'chords'."
+        )
+
+    required_keys = {"meta", "melody", "chords"}
+    if not required_keys.issubset(payload.keys()):
+        raise ValueError(
+            f"{path} does not look like a single encoded song object. Missing any of: {sorted(required_keys)}."
+        )
+    return payload
+
+
+def build_model_from_config(
+    cfg,
+    sample_song_obj: dict[str, Any],
+    checkpoint_path: Path,
+    device: torch.device,
+) -> TeacherGNN:
+    sample_graph = build_graph_from_encoded(sample_song_obj)
+
+    model = TeacherGNN.from_hetero_data(
+        sample_graph,
+        hidden_dim=cfg.model.hidden_dim,
+        num_layers=cfg.model.num_layers,
+        dropout=cfg.model.dropout,
+        residual=cfg.model.use_residual,
+        encoder_hidden_dims=list(cfg.model.encoder_hidden_dims),
+        pooling_mode=cfg.model.pooling_mode,
+        pooling_output_dim=cfg.model.pooling_output_dim,
+        score_head_hidden_dim=cfg.model.score_head_hidden_dim,
+        reconstruction_head_hidden_dim=cfg.model.reconstruction_head_hidden_dim,
+        enabled_heads=OmegaConf.to_container(cfg.losses.enabled_heads, resolve=True),
+        use_note_score_head=bool(cfg.model.use_note_score_head),
+        use_chord_score_head=bool(cfg.model.use_chord_score_head),
+        use_onset_score_head=bool(cfg.model.use_onset_score_head),
+        local_score_head_hidden_dim=cfg.model.local_score_head_hidden_dim,
+        use_hybrid_graph_scorer=bool(cfg.model.use_hybrid_graph_scorer),
+        local_summary_use_mean=bool(cfg.model.local_summary_use_mean),
+        local_summary_use_max=bool(cfg.model.local_summary_use_max),
+        local_summary_use_topk_mean=bool(cfg.model.local_summary_use_topk_mean),
+        local_summary_topk=int(cfg.model.local_summary_topk),
+    ).to(device)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def score_song(model: TeacherGNN, song_obj: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    graph = build_graph_from_encoded(song_obj)
+    batch = Batch.from_data_list([graph]).to(device)
+    outputs = model(batch)
+
+    result: dict[str, Any] = {
+        "graph_score": float(outputs["graph_score"].view(-1)[0].item()),
+    }
+
+    summaries = outputs.get("local_score_summaries")
+    if summaries is not None and summaries.numel() > 0:
+        result["local_score_summaries"] = summaries[0].detach().cpu().tolist()
+
+    return result
+
+
+def apply_song_theory_corruptions(
+    song_obj: dict[str, Any],
+    modes: list[str],
+    seed: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    theory_ctx = build_theory_context()
+    working = copy.deepcopy(song_obj)
+    metadata_list: list[dict[str, Any]] = []
+
+    for offset, mode in enumerate(modes):
+        rng = random.Random(seed + offset)
+        working, metadata = corrupt_song_obj(
+            working,
+            corruption_modes=[mode],
+            corruption_cfg={},
+            theory_ctx=theory_ctx,
+            rng=rng,
+        )
+        metadata_list.append(metadata)
+
+    return working, metadata_list
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device(args.device)
+
+    song_obj = load_song_obj(args.encoded_json)
+    cfg = OmegaConf.load(args.config)
+    model = build_model_from_config(cfg, song_obj, args.checkpoint, device)
+
+    original = score_song(model, song_obj, device)
+
+    result: dict[str, Any] = {
+        "input_json": str(args.encoded_json),
+        "checkpoint": str(args.checkpoint),
+        "config": str(args.config),
+        "backend": args.backend,
+        "modes": list(args.modes),
+        "original_score": original["graph_score"],
+        "original_local_score_summaries": original.get("local_score_summaries"),
+    }
+
+    if args.backend == "none":
+        result["corrupted_score"] = None
+        result["score_gap"] = None
+        result["applied_corruptions"] = []
+    elif args.backend == "song_theory":
+        corrupted_song_obj, metadata_list = apply_song_theory_corruptions(song_obj, args.modes, args.seed)
+        corrupted = score_song(model, corrupted_song_obj, device)
+
+        result["corrupted_score"] = corrupted["graph_score"]
+        result["corrupted_local_score_summaries"] = corrupted.get("local_score_summaries")
+        result["score_gap"] = result["original_score"] - result["corrupted_score"]
+        result["applied_corruptions"] = metadata_list
+
+        if args.save_corrupted_json is not None:
+            args.save_corrupted_json.parent.mkdir(parents=True, exist_ok=True)
+            with args.save_corrupted_json.open("w", encoding="utf-8") as handle:
+                json.dump(corrupted_song_obj, handle, ensure_ascii=False, indent=2)
+            result["saved_corrupted_json"] = str(args.save_corrupted_json)
+    else:
+        raise ValueError(f"Unsupported backend: {args.backend}")
+
+    if args.pretty:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
