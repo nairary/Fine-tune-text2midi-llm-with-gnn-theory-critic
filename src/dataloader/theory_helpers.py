@@ -104,6 +104,9 @@ def _load_vocab_maps() -> dict:
         "inversion_id_to_raw": inversion_id_to_raw,
         "applied_id_to_raw": applied_id_to_raw,
         "chord_add_allowed_values": spec_chord_sets["adds"]["allowed_values"],
+        "chord_omit_allowed_values": spec_chord_sets["omits"]["allowed_values"],
+        "chord_susp_allowed_values": spec_chord_sets["suspensions"]["allowed_values"],
+        "chord_alter_allowed_values": spec_chord_sets["alterations"]["allowed_values"],
     }
 
 
@@ -217,6 +220,108 @@ def chord_bass_and_top_pcs(song_obj: dict, chord: dict, theory_ctx: dict) -> tup
     top_degree_idx = (anchor_degree_idx + 2 * (n_tones - 1)) % 7
     top_pc = template[top_degree_idx] % 12
     return root_pc % 12, top_pc
+
+
+def _bitvec_to_allowed_values(vec: list[int] | None, allowed_values: list) -> list:
+    out = []
+    for idx, bit in enumerate(vec or []):
+        if bit and idx < len(allowed_values):
+            out.append(allowed_values[idx])
+    return out
+
+
+def decode_chord_components(song_obj: dict, chord: dict, theory_ctx: dict) -> dict | None:
+    """
+    Decode encoded chord fields into structured pitch-class components.
+
+    Uses canonical root/type/mode logic (including borrowed mode selection) and
+    applies adds/suspensions/omits/alterations. `applied_id` is intentionally
+    ignored in v1.
+    """
+    root_raw = decode_root_raw(chord, theory_ctx)
+    type_raw = decode_type_raw(chord, theory_ctx)
+    if root_raw is None or type_raw is None or type_raw not in {5, 7, 9, 11, 13}:
+        return None
+
+    active_mode_name = select_active_mode_name(song_obj, chord, theory_ctx)
+    template = ordered_mode_template(active_mode_name, theory_ctx)
+    if template is None:
+        return None
+    root_resolution = _resolve_root_anchor(root_raw, template)
+    if root_resolution is None:
+        return None
+    anchor_degree_idx, _ = root_resolution
+
+    degree_to_pc: dict[int, int] = {}
+    for degree in (1, 2, 3, 4, 5, 6, 7, 9, 11, 13):
+        degree_idx = (anchor_degree_idx + (degree - 1)) % 7
+        degree_to_pc[degree] = int(template[degree_idx] % 12)
+
+    if root_raw == 7:
+        degree_to_pc[1] = 10
+
+    included = {degree for degree in (1, 3, 5, 7, 9, 11, 13) if degree <= type_raw}
+
+    adds = _bitvec_to_allowed_values(chord.get("adds_vec"), theory_ctx.get("chord_add_allowed_values", []))
+    suspensions = _bitvec_to_allowed_values(chord.get("suspensions_vec"), theory_ctx.get("chord_susp_allowed_values", []))
+    omits = _bitvec_to_allowed_values(chord.get("omits_vec"), theory_ctx.get("chord_omit_allowed_values", []))
+    alterations = _bitvec_to_allowed_values(chord.get("alterations_vec"), theory_ctx.get("chord_alter_allowed_values", []))
+
+    for sus_degree in suspensions:
+        sus_degree = int(sus_degree)
+        included.discard(3)
+        included.add(sus_degree)
+
+    for add_degree in adds:
+        included.add(int(add_degree))
+
+    for omit_degree in omits:
+        included.discard(int(omit_degree))
+
+    for token in alterations:
+        accidental = 0
+        degree_str = str(token)
+        if degree_str.startswith("b"):
+            accidental = -1
+            degree_str = degree_str[1:]
+        elif degree_str.startswith("#"):
+            accidental = 1
+            degree_str = degree_str[1:]
+        try:
+            degree = int(degree_str)
+        except ValueError:
+            continue
+        if degree not in degree_to_pc:
+            degree_idx = (anchor_degree_idx + (degree - 1)) % 7
+            degree_to_pc[degree] = int(template[degree_idx] % 12)
+        degree_to_pc[degree] = (degree_to_pc[degree] + accidental) % 12
+        included.add(degree)
+
+    add_degree_set = {int(x) for x in adds}
+    body_degrees = sorted([d for d in included if d not in add_degree_set])
+    add_degrees = sorted([d for d in included if d in add_degree_set])
+
+    body_pcs: list[int] = []
+    for degree in body_degrees:
+        pc = degree_to_pc[degree]
+        if pc not in body_pcs:
+            body_pcs.append(pc)
+
+    add_pcs: list[int] = []
+    for degree in add_degrees:
+        pc = degree_to_pc[degree]
+        if pc not in add_pcs and pc not in body_pcs:
+            add_pcs.append(pc)
+
+    if not body_pcs:
+        return None
+    return {
+        "body_pcs": body_pcs,
+        "add_pcs": add_pcs,
+        "active_mode_name": active_mode_name,
+        "root_raw": root_raw,
+        "type_raw": type_raw,
+    }
 
 
 def select_active_mode_name(song_obj: dict, chord: dict | None, theory_ctx: dict) -> str:

@@ -14,6 +14,7 @@ from src.dataloader.song_corruptions import corrupt_song_obj
 from src.dataloader.theory_helpers import (
     build_theory_context,
     chord_bass_and_top_pcs,
+    decode_chord_components,
     chord_pitch_classes_tertian,
     decode_sd_to_chromatic,
     find_covering_chord_index,
@@ -103,6 +104,92 @@ class TheorySmokeTests(unittest.TestCase):
         song_minor["meta"]["main_key_scale_id"] = self.ctx["scale_name_to_id"]["minor"]
         # bVII in minor should keep b7 root class 10 (not collapse to VI).
         self.assertEqual(chord_pitch_classes_tertian(song_minor, bvii, self.ctx), {10, 2, 5})
+
+    def test_decode_chord_components_base_body(self):
+        song = self._song()
+        chord = copy.deepcopy(song["chords"][0])
+        chord.update({
+            "root_id": 1,  # I
+            "type_id": 1,  # triad
+            "adds_vec": [0, 0, 0, 0, 0, 0],
+            "suspensions_vec": [0, 0],
+            "omits_vec": [0, 0],
+            "alterations_vec": [0, 0, 0, 0, 0, 0],
+        })
+        decoded = decode_chord_components(song, chord, self.ctx)
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded["body_pcs"], [0, 4, 7])
+
+    def test_decode_chord_components_adds_vec(self):
+        song = self._song()
+        chord = copy.deepcopy(song["chords"][0])
+        chord.update({
+            "adds_vec": [0, 0, 0, 0, 1, 0],  # add11
+            "suspensions_vec": [0, 0],
+            "omits_vec": [0, 0],
+            "alterations_vec": [0, 0, 0, 0, 0, 0],
+        })
+        decoded = decode_chord_components(song, chord, self.ctx)
+        self.assertIsNotNone(decoded)
+        self.assertIn(5, decoded["add_pcs"])
+
+    def test_decode_chord_components_suspensions_vec(self):
+        song = self._song()
+        chord = copy.deepcopy(song["chords"][0])
+        chord.update({
+            "adds_vec": [0, 0, 0, 0, 0, 0],
+            "suspensions_vec": [1, 0],  # sus2
+            "omits_vec": [0, 0],
+            "alterations_vec": [0, 0, 0, 0, 0, 0],
+        })
+        decoded = decode_chord_components(song, chord, self.ctx)
+        self.assertIsNotNone(decoded)
+        self.assertIn(2, decoded["body_pcs"])
+        self.assertNotIn(4, decoded["body_pcs"])
+
+    def test_decode_chord_components_omits_vec(self):
+        song = self._song()
+        chord = copy.deepcopy(song["chords"][0])
+        chord.update({
+            "adds_vec": [0, 0, 0, 0, 0, 0],
+            "suspensions_vec": [0, 0],
+            "omits_vec": [0, 1],  # omit5
+            "alterations_vec": [0, 0, 0, 0, 0, 0],
+        })
+        decoded = decode_chord_components(song, chord, self.ctx)
+        self.assertIsNotNone(decoded)
+        self.assertNotIn(7, decoded["body_pcs"])
+
+    def test_decode_chord_components_alterations_vec(self):
+        song = self._song()
+        chord = copy.deepcopy(song["chords"][0])
+        chord.update({
+            "adds_vec": [0, 0, 0, 0, 0, 0],
+            "suspensions_vec": [0, 0],
+            "omits_vec": [0, 0],
+            "alterations_vec": [0, 1, 0, 0, 0, 0],  # #5
+        })
+        decoded = decode_chord_components(song, chord, self.ctx)
+        self.assertIsNotNone(decoded)
+        self.assertIn(8, decoded["body_pcs"])
+
+    def test_decode_chord_components_borrowed_mode_changes_body(self):
+        song = self._song()
+        chord = copy.deepcopy(song["chords"][0])
+        chord.update({
+            "root_id": 2,  # II degree in active mode
+            "type_id": 1,  # triad
+            "borrowed_kind_id": self.ctx["borrowed_kind_to_id"]["mode_name"],
+            "borrowed_mode_name_id": self.ctx["borrowed_mode_to_id"]["dorian"],
+            "adds_vec": [0, 0, 0, 0, 0, 0],
+            "suspensions_vec": [0, 0],
+            "omits_vec": [0, 0],
+            "alterations_vec": [0, 0, 0, 0, 0, 0],
+        })
+        decoded = decode_chord_components(song, chord, self.ctx)
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded["active_mode_name"], "dorian")
+        self.assertEqual(decoded["body_pcs"], [2, 5, 9])
 
     def test_reproducibility_with_seed(self):
         song = self._song()
