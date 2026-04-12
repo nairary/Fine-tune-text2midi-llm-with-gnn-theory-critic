@@ -18,7 +18,7 @@ class EnrichMidiWithChordsSmokeTest(unittest.TestCase):
             src_midi = tmp / "input.mid"
             out_midi = tmp / "out.mid"
 
-            mid = MidiFile(ticks_per_beat=480)
+            mid = MidiFile(type=0, ticks_per_beat=480)
             melody = MidiTrack()
             melody.append(Message("program_change", program=0, channel=0, time=0))
             melody.append(Message("note_on", note=72, velocity=80, channel=0, time=0))
@@ -59,7 +59,8 @@ class EnrichMidiWithChordsSmokeTest(unittest.TestCase):
 
             self.assertTrue(out_midi.exists())
             enriched = MidiFile(out_midi)
-            self.assertGreaterEqual(len(enriched.tracks), 2)
+            self.assertEqual(enriched.type, 1)
+            self.assertEqual(len(enriched.tracks), len(mid.tracks) + 1)
             chord_track = enriched.tracks[-1]
             note_on_count = sum(1 for msg in chord_track if msg.type == "note_on" and msg.velocity > 0)
             self.assertGreater(note_on_count, 0)
