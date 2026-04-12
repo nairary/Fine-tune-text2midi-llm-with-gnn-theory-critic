@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """OOD evaluation for TeacherGNN on unseen theory-aware corruption modes."""
 
-from __future__ import annotations
 
+
+from __future__ import annotations
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 import argparse
 import copy
 import json
