@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mido import Message, MidiFile, MidiTrack
+import pretty_midi
 
 from src.data.enrich_midi_with_chords import build_theory_context, enrich_midi_file
 
@@ -18,15 +18,12 @@ class EnrichMidiWithChordsSmokeTest(unittest.TestCase):
             src_midi = tmp / "input.mid"
             out_midi = tmp / "out.mid"
 
-            mid = MidiFile(type=0, ticks_per_beat=480)
-            melody = MidiTrack()
-            melody.append(Message("program_change", program=0, channel=0, time=0))
-            melody.append(Message("note_on", note=72, velocity=80, channel=0, time=0))
-            melody.append(Message("note_off", note=72, velocity=0, channel=0, time=480))
-            melody.append(Message("note_on", note=76, velocity=80, channel=0, time=0))
-            melody.append(Message("note_off", note=76, velocity=0, channel=0, time=480))
-            mid.tracks.append(melody)
-            mid.save(src_midi)
+            pm = pretty_midi.PrettyMIDI(initial_tempo=120)
+            melody = pretty_midi.Instrument(program=0, name="melody", is_drum=False)
+            melody.notes.append(pretty_midi.Note(velocity=80, pitch=72, start=0.0, end=0.5))
+            melody.notes.append(pretty_midi.Note(velocity=80, pitch=76, start=0.5, end=1.0))
+            pm.instruments.append(melody)
+            pm.write(str(src_midi))
 
             song_obj = {
                 "meta": {
@@ -58,12 +55,11 @@ class EnrichMidiWithChordsSmokeTest(unittest.TestCase):
             enrich_midi_file("song_a", song_obj, src_midi, out_midi, theory_ctx)
 
             self.assertTrue(out_midi.exists())
-            enriched = MidiFile(out_midi)
-            self.assertEqual(enriched.type, 1)
-            self.assertEqual(len(enriched.tracks), len(mid.tracks) + 1)
-            chord_track = enriched.tracks[-1]
-            note_on_count = sum(1 for msg in chord_track if msg.type == "note_on" and msg.velocity > 0)
-            self.assertGreater(note_on_count, 0)
+            enriched = pretty_midi.PrettyMIDI(str(out_midi))
+            self.assertEqual(len(enriched.instruments), len(pm.instruments) + 1)
+            chord_instr = enriched.instruments[-1]
+            self.assertGreater(len(chord_instr.notes), 0)
+            self.assertTrue(all(note.start < note.end for note in chord_instr.notes))
 
 
 if __name__ == "__main__":

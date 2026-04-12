@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mido import Message, MetaMessage, MidiFile, MidiTrack, bpm2tempo, merge_tracks
+import pretty_midi
 
 from src.dataloader.theory_helpers import (
     build_theory_context,
@@ -67,46 +67,37 @@ def find_midi_for_song_id(song_id: str, midi_dir: Path) -> Path:
     raise FileNotFoundError(f"MIDI for song_id={song_id} not found in {midi_dir}")
 
 
-def _tempo_events(mid: MidiFile) -> list[tuple[int, int]]:
-    merged = merge_tracks(mid.tracks)
-    abs_tick = 0
-    events = [(0, bpm2tempo(120))]
-    for msg in merged:
-        abs_tick += msg.time
-        if msg.type == "set_tempo":
-            events.append((abs_tick, msg.tempo))
-    events.sort(key=lambda x: x[0])
-    compact = []
-    for tick, tempo in events:
-        if compact and compact[-1][0] == tick:
-            compact[-1] = (tick, tempo)
-        else:
-            compact.append((tick, tempo))
-    return compact
+def load_pretty_midi(midi_path: Path) -> pretty_midi.PrettyMIDI:
+    return pretty_midi.PrettyMIDI(str(midi_path))
 
 
-def beats_to_seconds(beat: float, ppq: int, tempo_events: list[tuple[int, int]]) -> float:
-    tick_target = int(round(max(0.0, beat - 1.0) * ppq))
-    total = 0.0
-    for i, (start_tick, tempo) in enumerate(tempo_events):
-        end_tick = tempo_events[i + 1][0] if i + 1 < len(tempo_events) else tick_target
-        if tick_target <= start_tick:
-            break
-        seg_end = min(end_tick, tick_target)
-        if seg_end > start_tick:
-            total += ((seg_end - start_tick) * tempo) / (1_000_000.0 * ppq)
-        if seg_end == tick_target:
-            break
-    return total
-
-
-def estimate_melody_register(mid: MidiFile) -> float:
+def estimate_melody_register(pm: pretty_midi.PrettyMIDI) -> float:
     pitches: list[int] = []
-    for track in mid.tracks:
-        for msg in track:
-            if msg.type == "note_on" and msg.velocity > 0 and getattr(msg, "channel", 0) != 9:
-                pitches.append(int(msg.note))
+    for instrument in pm.instruments:
+        if instrument.is_drum:
+            continue
+        for note in instrument.notes:
+            pitches.append(int(note.pitch))
     return float(statistics.median(pitches)) if pitches else 60.0
+
+
+def pick_constant_bpm(meta: dict) -> float:
+    # v1 limitation: chord rendering assumes constant tempo and ignores tempo changes.
+    tempo_regions = meta.get("tempo_regions") or []
+    if tempo_regions:
+        bpm = tempo_regions[0].get("bpm")
+        if bpm is not None:
+            return float(bpm)
+
+    main_bpm = meta.get("main_bpm")
+    if main_bpm is not None:
+        return float(main_bpm)
+    return 120.0
+
+
+def beat_to_seconds(beat: float, bpm: float) -> float:
+    seconds_per_beat = 60.0 / max(1e-8, bpm)
+    return max(0.0, beat - 1.0) * seconds_per_beat
 
 
 def _nearest_pitch_for_pc(pc: int, target: float) -> int:
@@ -153,14 +144,15 @@ def voice_chord(body_pcs: list[int], add_pcs: list[int], inversion_raw: int, tar
     return full, bass_pitch
 
 
-def render_chord_track(mid: MidiFile, song_obj: dict, theory_ctx: dict, velocity: int = 68) -> MidiTrack:
-    target_center = estimate_melody_register(mid) - 8.0
-    _ = _tempo_events(mid)  # v1: preserve tempo awareness, events are placed on beat grid in ticks.
-
-    events: list[tuple[int, Message]] = []
-    track = MidiTrack()
-    track.append(MetaMessage("track_name", name="chords", time=0))
-    track.append(Message("program_change", program=0, channel=1, time=0))
+def render_chord_instrument(
+    pm: pretty_midi.PrettyMIDI,
+    song_obj: dict,
+    theory_ctx: dict,
+    velocity: int = 68,
+) -> pretty_midi.Instrument:
+    target_center = estimate_melody_register(pm) - 8.0
+    bpm = pick_constant_bpm(song_obj.get("meta", {}))
+    chord_instr = pretty_midi.Instrument(program=0, name="chords", is_drum=False)
 
     for chord in song_obj.get("chords", []):
         if int(chord.get("is_rest", 0)) == 1:
@@ -178,54 +170,40 @@ def render_chord_track(mid: MidiFile, song_obj: dict, theory_ctx: dict, velocity
         inversion_raw = theory_ctx["inversion_id_to_raw"].get(int(chord.get("inversion_id", 0)), 0)
         voiced, bass_pitch = voice_chord(body_pcs, add_pcs, inversion_raw=inversion_raw, target_center=target_center)
 
-        start_tick = int(round(max(0.0, beat - 1.0) * mid.ticks_per_beat))
-        end_tick = max(start_tick + 1, int(round(max(0.0, beat + duration - 1.0) * mid.ticks_per_beat)))
+        start_sec = beat_to_seconds(beat, bpm)
+        end_sec = beat_to_seconds(beat + duration, bpm)
+        if end_sec <= start_sec:
+            end_sec = start_sec + (60.0 / bpm) * 0.125
 
         all_notes = [bass_pitch] + voiced
         for note in all_notes:
             if note < 0 or note > 127:
                 continue
-            events.append((start_tick, Message("note_on", note=int(note), velocity=velocity, channel=1, time=0)))
-            events.append((end_tick, Message("note_off", note=int(note), velocity=0, channel=1, time=0)))
-
-    events.sort(key=lambda x: (x[0], 0 if x[1].type == "note_off" else 1))
-    last_tick = 0
-    for tick, msg in events:
-        msg.time = tick - last_tick
-        track.append(msg)
-        last_tick = tick
-    return track
-
-
-def clone_track(track: MidiTrack) -> MidiTrack:
-    cloned = MidiTrack()
-    for msg in track:
-        cloned.append(msg.copy(time=msg.time))
-    return cloned
+            chord_instr.notes.append(
+                pretty_midi.Note(
+                    velocity=velocity,
+                    pitch=int(note),
+                    start=start_sec,
+                    end=end_sec,
+                )
+            )
+    return chord_instr
 
 
 def enrich_midi_file(song_id: str, song_obj: dict, midi_path: Path, output_path: Path, theory_ctx: dict) -> None:
-    src_mid = MidiFile(midi_path)
-    chord_track = render_chord_track(src_mid, song_obj, theory_ctx)
+    pm = load_pretty_midi(midi_path)
+    chord_instr = render_chord_instrument(pm, song_obj, theory_ctx)
 
     logging.debug(
-        "Enrich %s: src_type=%d ticks_per_beat=%d src_tracks=%d",
+        "Enrich %s: instruments_before=%d",
         song_id,
-        src_mid.type,
-        src_mid.ticks_per_beat,
-        len(src_mid.tracks),
+        len(pm.instruments),
     )
-    if src_mid.type != 1:
-        logging.debug("Enrich %s: source MIDI is type=%d, forcing output type=1", song_id, src_mid.type)
+    pm.instruments.append(chord_instr)
 
-    out_mid = MidiFile(type=1, ticks_per_beat=src_mid.ticks_per_beat)
-    for track in src_mid.tracks:
-        out_mid.tracks.append(clone_track(track))
-    out_mid.tracks.append(chord_track)
-
-    logging.debug("Enrich %s: output_type=%d output_tracks=%d", song_id, out_mid.type, len(out_mid.tracks))
+    logging.debug("Enrich %s: instruments_after=%d", song_id, len(pm.instruments))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    out_mid.save(output_path)
+    pm.write(str(output_path))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
