@@ -197,12 +197,35 @@ def render_chord_track(mid: MidiFile, song_obj: dict, theory_ctx: dict, velocity
     return track
 
 
+def clone_track(track: MidiTrack) -> MidiTrack:
+    cloned = MidiTrack()
+    for msg in track:
+        cloned.append(msg.copy(time=msg.time))
+    return cloned
+
+
 def enrich_midi_file(song_id: str, song_obj: dict, midi_path: Path, output_path: Path, theory_ctx: dict) -> None:
-    mid = MidiFile(midi_path)
-    chord_track = render_chord_track(mid, song_obj, theory_ctx)
-    mid.tracks.append(chord_track)
+    src_mid = MidiFile(midi_path)
+    chord_track = render_chord_track(src_mid, song_obj, theory_ctx)
+
+    logging.debug(
+        "Enrich %s: src_type=%d ticks_per_beat=%d src_tracks=%d",
+        song_id,
+        src_mid.type,
+        src_mid.ticks_per_beat,
+        len(src_mid.tracks),
+    )
+    if src_mid.type != 1:
+        logging.debug("Enrich %s: source MIDI is type=%d, forcing output type=1", song_id, src_mid.type)
+
+    out_mid = MidiFile(type=1, ticks_per_beat=src_mid.ticks_per_beat)
+    for track in src_mid.tracks:
+        out_mid.tracks.append(clone_track(track))
+    out_mid.tracks.append(chord_track)
+
+    logging.debug("Enrich %s: output_type=%d output_tracks=%d", song_id, out_mid.type, len(out_mid.tracks))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    mid.save(output_path)
+    out_mid.save(output_path)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
