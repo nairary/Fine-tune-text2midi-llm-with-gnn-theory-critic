@@ -109,6 +109,49 @@ def estimate_melody_register(mid: MidiFile) -> float:
     return float(statistics.median(pitches)) if pitches else 60.0
 
 
+def _first_midi_note_on_tick(mid: MidiFile) -> int | None:
+    first_tick: int | None = None
+    for track in mid.tracks:
+        abs_tick = 0
+        for msg in track:
+            abs_tick += msg.time
+            if msg.type == "note_on" and msg.velocity > 0 and getattr(msg, "channel", 0) != 9:
+                if first_tick is None or abs_tick < first_tick:
+                    first_tick = abs_tick
+    return first_tick
+
+
+def estimate_song_to_midi_tick_offset(mid: MidiFile, song_obj: dict) -> int:
+    """
+    Align symbolic beat grid to the existing MIDI timeline.
+
+    We anchor the earliest non-rest melody beat in `song_obj` to the earliest
+    note_on tick in the source MIDI. This prevents chord events from being
+    rendered at tick 0 when the clip actually starts later in the MIDI file.
+    """
+    melody = song_obj.get("melody", [])
+    melody_beats: list[float] = []
+    for note in melody:
+        if int(note.get("is_rest", 0)) == 1:
+            continue
+        beat_raw = note.get("beat")
+        if beat_raw is None:
+            continue
+        try:
+            melody_beats.append(float(beat_raw))
+        except (TypeError, ValueError):
+            continue
+    if not melody_beats:
+        return 0
+
+    first_midi_tick = _first_midi_note_on_tick(mid)
+    if first_midi_tick is None:
+        return 0
+
+    first_song_beat = min(melody_beats)
+    return int(round(first_midi_tick - (first_song_beat - 1.0) * mid.ticks_per_beat))
+
+
 def _nearest_pitch_for_pc(pc: int, target: float) -> int:
     base = int(round((target - pc) / 12.0))
     candidates = [pc + 12 * (base + delta) for delta in (-1, 0, 1)]
@@ -156,6 +199,7 @@ def voice_chord(body_pcs: list[int], add_pcs: list[int], inversion_raw: int, tar
 def render_chord_track(mid: MidiFile, song_obj: dict, theory_ctx: dict, velocity: int = 68) -> MidiTrack:
     target_center = estimate_melody_register(mid) - 8.0
     _ = _tempo_events(mid)  # v1: preserve tempo awareness, events are placed on beat grid in ticks.
+    tick_offset = estimate_song_to_midi_tick_offset(mid, song_obj)
 
     events: list[tuple[int, Message]] = []
     track = MidiTrack()
@@ -178,8 +222,11 @@ def render_chord_track(mid: MidiFile, song_obj: dict, theory_ctx: dict, velocity
         inversion_raw = theory_ctx["inversion_id_to_raw"].get(int(chord.get("inversion_id", 0)), 0)
         voiced, bass_pitch = voice_chord(body_pcs, add_pcs, inversion_raw=inversion_raw, target_center=target_center)
 
-        start_tick = int(round(max(0.0, beat - 1.0) * mid.ticks_per_beat))
-        end_tick = max(start_tick + 1, int(round(max(0.0, beat + duration - 1.0) * mid.ticks_per_beat)))
+        start_tick = int(round(max(0.0, tick_offset + (beat - 1.0) * mid.ticks_per_beat)))
+        end_tick = max(
+            start_tick + 1,
+            int(round(max(0.0, tick_offset + (beat + duration - 1.0) * mid.ticks_per_beat))),
+        )
 
         all_notes = [bass_pitch] + voiced
         for note in all_notes:
