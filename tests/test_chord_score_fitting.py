@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -8,6 +12,7 @@ import torch
 from src.dataloader.theory_helpers import build_theory_context
 from src.observer.chord_parser import ChordCandidate, explain_score_candidate
 import src.observer.chord_score_fitting as chord_score_fitting
+import scripts.fit_chord_score_weights as fit_script
 from src.observer.chord_score_fitting import (
     LearnableChordScore,
     compute_weighted_candidate_score,
@@ -267,7 +272,7 @@ class ChordScoreFittingTests(unittest.TestCase):
             )
 
         info_msgs = [call.args[0] for call in mock_info.call_args_list]
-        epoch_logs = [msg for msg in info_msgs if isinstance(msg, str) and msg.startswith("epoch=")]
+        epoch_logs = [msg for msg in info_msgs if isinstance(msg, str) and msg.startswith("epoch=") and "train_loss" in msg]
         best_logs = [msg for msg in info_msgs if isinstance(msg, str) and msg.startswith("new_best")]
 
         self.assertEqual(len(metrics_log), 5)
@@ -277,11 +282,150 @@ class ChordScoreFittingTests(unittest.TestCase):
         self.assertEqual(len(epoch_logs), 4)
         self.assertEqual(len(best_logs), 4)
 
-        logged_epochs = [call.args[1] for call in mock_info.call_args_list if call.args and call.args[0].startswith("epoch=")]
+        logged_epochs = [
+            call.args[1]
+            for call in mock_info.call_args_list
+            if call.args and call.args[0].startswith("epoch=") and "train_loss" in call.args[0]
+        ]
         self.assertEqual(logged_epochs, [1, 2, 4, 5])
 
         new_best_epochs = [call.args[1] for call in mock_info.call_args_list if call.args and call.args[0].startswith("new_best")]
         self.assertEqual(new_best_epochs, [1, 2, 3, 5])
+
+    def test_iter_chunked_song_items_splits_expected_sizes(self):
+        song_items = [(f"s{i}", {"meta": {"split": "train"}}) for i in range(5)]
+        chunks = list(chord_score_fitting.iter_chunked_song_items(song_items, chunk_size=2))
+        self.assertEqual([len(chunk) for chunk in chunks], [2, 2, 1])
+
+    def test_train_chunked_uses_chunk_provider_without_train_groups_list(self):
+        base_group = {
+            "features": [{"body_match_count": 1.0}],
+            "positive_mask": [True],
+            "candidates": [{"root_degree_raw": 0, "type_raw": 5}],
+        }
+        train_call_counter = {"count": 0}
+        val_call_counter = {"count": 0}
+
+        def train_provider():
+            train_call_counter["count"] += 1
+            yield [dict(base_group)], {"songs_total": 1}
+
+        def val_provider():
+            val_call_counter["count"] += 1
+            yield [dict(base_group)], {"songs_total": 1}
+
+        with patch.object(chord_score_fitting, "evaluate_group_chunks") as mock_eval_chunks:
+            mock_eval_chunks.return_value = {
+                "loss": 0.1,
+                "top1_exact_acc": 1.0,
+                "topk_contains_gt_acc": 1.0,
+                "root_acc": 1.0,
+                "type_acc": 1.0,
+                "group_count": 1.0,
+                "positive_coverage": 1.0,
+                "valid_group_count": 1.0,
+            }
+            _, _, metrics_log = chord_score_fitting.train_learnable_chord_score(
+                train_group_chunks=train_provider,
+                val_group_chunks=val_provider,
+                epochs=3,
+                lr=0.01,
+                weight_decay=0.0,
+                device="cpu",
+            )
+
+        self.assertEqual(len(metrics_log), 3)
+        self.assertGreater(train_call_counter["count"], 0)
+        self.assertTrue(mock_eval_chunks.called)
+
+    def test_collect_chunked_train_stats_merges_chunk_stats(self):
+        chunks = [
+            ([], {"songs_total": 2, "events_total": 4, "groups_kept": 1}),
+            ([], {"songs_total": 1, "events_total": 3, "events_positive_missing": 2, "groups_kept": 0}),
+        ]
+        merged = fit_script.collect_chunked_train_stats(chunks)
+        self.assertEqual(merged["songs_total"], 3)
+        self.assertEqual(merged["events_total"], 7)
+        self.assertEqual(merged["events_positive_missing"], 2)
+        self.assertEqual(merged["groups_kept"], 1)
+
+    def test_main_save_train_groups_json_materializes_train_groups(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            encoded_path = tmp / "encoded.json"
+            encoded_path.write_text(json.dumps({"song": {"meta": {"split": "train"}, "chords": []}}), encoding="utf-8")
+            outdir = tmp / "out"
+            args = SimpleNamespace(
+                encoded_json=encoded_path,
+                midi_root=tmp / "midi",
+                train_split="train",
+                val_split="val",
+                instrument_name="chords",
+                epochs=1,
+                lr=0.01,
+                weight_decay=0.0,
+                seed=123,
+                log_every=1,
+                chunk_size=2,
+                eval_every=1,
+                limit_train=None,
+                limit_val=None,
+                outdir=outdir,
+                device="cpu",
+                save_train_groups_json=True,
+                save_val_groups_json=False,
+                verbose=False,
+            )
+
+            class _DummyModel:
+                def export_weights(self):
+                    return {"bias": 0.0, "positive": {}, "negative": {}}
+
+                def state_dict(self):
+                    return {}
+
+            train_groups_payload = [{"features": [], "positive_mask": []}]
+            train_stats_payload = fit_script.empty_build_stats() | {"songs_total": 1, "groups_kept": 1}
+            val_stats_payload = fit_script.empty_build_stats()
+            with (
+                patch.object(fit_script, "build_arg_parser") as mock_parser,
+                patch.object(fit_script, "build_theory_context", return_value={}),
+                patch.object(fit_script, "build_training_groups", side_effect=[([], val_stats_payload), (train_groups_payload, train_stats_payload)]),
+                patch.object(fit_script, "train_learnable_chord_score", return_value=(_DummyModel(), {"epoch": 1}, [{"epoch": 1}])),
+                patch.object(fit_script, "save_json") as mock_save_json,
+                patch.object(fit_script.torch, "save"),
+            ):
+                mock_parser.return_value.parse_args.return_value = args
+                fit_script.main()
+
+            saved_train_payloads = [
+                call.args[1] for call in mock_save_json.call_args_list if str(call.args[0]).endswith("train_groups.json")
+            ]
+            self.assertEqual(saved_train_payloads, [train_groups_payload])
+
+    def test_train_groups_without_positives_do_not_update_weights(self):
+        no_positive_group = {
+            "features": [{"body_match_count": 2.0}],
+            "positive_mask": [False],
+        }
+
+        def provider():
+            yield [dict(no_positive_group)], {"songs_total": 1}
+
+        model_before = LearnableChordScore()
+        before_state = {k: v.detach().clone() for k, v in model_before.state_dict().items()}
+        with patch.object(chord_score_fitting, "LearnableChordScore", return_value=model_before):
+            model_after, _, _ = chord_score_fitting.train_learnable_chord_score(
+                train_group_chunks=provider,
+                val_groups=[],
+                epochs=2,
+                lr=0.1,
+                weight_decay=0.0,
+                device="cpu",
+            )
+
+        for key, tensor in model_after.state_dict().items():
+            self.assertTrue(torch.equal(tensor.detach(), before_state[key]))
 
 
 if __name__ == "__main__":
