@@ -30,6 +30,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--limit-train", type=int, default=None)
     parser.add_argument("--limit-val", type=int, default=None)
     parser.add_argument("--outdir", type=Path, required=True)
@@ -84,6 +85,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         seed=args.seed,
         device=args.device,
+        log_every=args.log_every,
     )
 
     learned_weights = model.export_weights()
