@@ -44,24 +44,26 @@ def load_midi_notes(midi_path: str) -> list[dict[str, float | int]]:
     return notes
 
 
-def extract_harmonic_onsets(pm: Any) -> list[float]:
-    onsets = set()
-    for instrument in pm.instruments:
-        if instrument.is_drum:
-            continue
-        for note in instrument.notes:
-            onsets.add(float(note.start))
+def select_target_instrument(pm: Any, instrument_name: str = "chords") -> Any:
+    matches = [instrument for instrument in pm.instruments if not instrument.is_drum and instrument.name == instrument_name]
+    if not matches:
+        available = [instrument.name for instrument in pm.instruments if not instrument.is_drum]
+        raise ValueError(f"Instrument '{instrument_name}' not found. Available non-drum instruments: {available}")
+    if len(matches) > 1:
+        raise ValueError(f"Instrument '{instrument_name}' is ambiguous: found {len(matches)} non-drum tracks with this name.")
+    return matches[0]
+
+
+def extract_harmonic_onsets(instrument: Any) -> list[float]:
+    onsets = {float(note.start) for note in instrument.notes}
     return sorted(onsets)
 
 
-def build_sounding_sonority(pm: Any, onset_time: float) -> dict[str, Any]:
+def build_sounding_sonority(instrument: Any, onset_time: float) -> dict[str, Any]:
     observed_pitches: list[int] = []
-    for instrument in pm.instruments:
-        if instrument.is_drum:
-            continue
-        for note in instrument.notes:
-            if note.start <= onset_time < note.end:
-                observed_pitches.append(int(note.pitch))
+    for note in instrument.notes:
+        if note.start <= onset_time < note.end:
+            observed_pitches.append(int(note.pitch))
 
     observed_pcs = sorted({p % 12 for p in observed_pitches})
     bass_pitch = min(observed_pitches) if observed_pitches else None
@@ -224,28 +226,59 @@ def _resolve_inversion(bass_pc: int | None, body_pcs: list[int]) -> int | None:
     return None
 
 
-def score_candidate(candidate: ChordCandidate, observed_pcs: list[int], bass_pc: int | None, main_mode: str, theory_ctx: dict) -> int:
+def explain_score_candidate(
+    candidate: ChordCandidate,
+    observed_pcs: list[int],
+    bass_pc: int | None,
+    main_mode: str,
+    theory_ctx: dict,
+) -> dict[str, Any]:
     observed_set = set(observed_pcs)
     body_set = set(candidate.body_pcs)
     extras_explained = set(candidate.explained_pcs) - body_set
+    mode_distance = _mode_distance(candidate.mode_name, main_mode, theory_ctx)
+    borrowed_mode_penalty = 1 if candidate.mode_name != main_mode else 0
+    body_size_penalty = BODY_TYPES.index(candidate.type_raw)
+
+    positive_terms = {
+        "body_match_count": len(observed_set.intersection(body_set)),
+        "extras_explained_count": len(extras_explained),
+        "bass_matches_body": 1 if bass_pc in body_set else 0,
+        "mode_equals_main": 1 if candidate.mode_name == main_mode else 0,
+    }
+    negative_terms = {
+        "unexplained_pcs_count": len(candidate.unexplained_pcs),
+        "missing_core_pcs_count": len(candidate.missing_core_pcs),
+        "borrowed_mode_penalty": borrowed_mode_penalty,
+        "mode_distance_penalty": mode_distance,
+        "add_penalty": len(candidate.add_degrees),
+        "suspension_penalty": len(candidate.suspension_degrees),
+        "alteration_penalty": len(candidate.alteration_tokens),
+        "omit_penalty": len(candidate.omit_degrees),
+        "body_size_penalty": body_size_penalty,
+    }
+
+    human_readable_terms: list[str] = []
+    for key, val in positive_terms.items():
+        if val > 0:
+            human_readable_terms.append(f"+{val} {key}")
+    for key, val in negative_terms.items():
+        if val > 0:
+            human_readable_terms.append(f"-{val} {key}")
 
     score = 0
-    score += len(observed_set.intersection(body_set))
-    score += len(extras_explained)
-    score += 1 if bass_pc in body_set else 0
-    score += 1 if candidate.mode_name == main_mode else 0
+    score += sum(positive_terms.values())
+    score -= sum(negative_terms.values())
+    return {
+        "total": score,
+        "positive_terms": positive_terms,
+        "negative_terms": negative_terms,
+        "human_readable_terms": human_readable_terms,
+    }
 
-    score -= len(candidate.unexplained_pcs)
-    score -= len(candidate.missing_core_pcs)
-    score -= 1 if candidate.mode_name != main_mode else 0
-    score -= _mode_distance(candidate.mode_name, main_mode, theory_ctx)
-    score -= len(candidate.add_degrees)
-    score -= len(candidate.suspension_degrees)
-    score -= len(candidate.alteration_tokens)
-    score -= len(candidate.omit_degrees)
-    score -= BODY_TYPES.index(candidate.type_raw)
 
-    return score
+def score_candidate(candidate: ChordCandidate, observed_pcs: list[int], bass_pc: int | None, main_mode: str, theory_ctx: dict) -> int:
+    return int(explain_score_candidate(candidate, observed_pcs, bass_pc, main_mode, theory_ctx)["total"])
 
 
 def generate_candidates_for_mode_and_degree(
@@ -332,12 +365,30 @@ def select_best_candidates(candidates: list[ChordCandidate]) -> list[ChordCandid
     return [c for c in candidates if c.score == best_score]
 
 
-def _serialize_candidate(candidate: ChordCandidate) -> dict[str, Any]:
+def _serialize_candidate(
+    candidate: ChordCandidate,
+    observed_pcs: list[int] | None = None,
+    bass_pc: int | None = None,
+    main_mode: str | None = None,
+    theory_ctx: dict[str, Any] | None = None,
+    include_score_breakdown: bool = False,
+) -> dict[str, Any]:
     payload = asdict(candidate)
+    if include_score_breakdown:
+        if observed_pcs is None or main_mode is None or theory_ctx is None:
+            raise ValueError("observed_pcs, main_mode, and theory_ctx are required when include_score_breakdown=True")
+        payload["score_breakdown"] = explain_score_candidate(candidate, observed_pcs, bass_pc, main_mode, theory_ctx)
     return payload
 
 
-def predict_chords_for_midi(midi_path: str, tonic_pc: int, main_mode: str) -> list[dict[str, Any]]:
+def predict_chords_for_midi(
+    midi_path: str,
+    tonic_pc: int,
+    main_mode: str,
+    instrument_name: str = "chords",
+    include_all_candidates: bool = False,
+    include_score_breakdown: bool = False,
+) -> list[dict[str, Any]]:
     if not 0 <= int(tonic_pc) <= 11:
         raise ValueError("tonic_pc must be in [0, 11]")
 
@@ -346,9 +397,10 @@ def predict_chords_for_midi(midi_path: str, tonic_pc: int, main_mode: str) -> li
     pm = pretty_midi.PrettyMIDI(str(midi_path))
     theory_ctx = build_theory_context()
 
+    target_instrument = select_target_instrument(pm, instrument_name=instrument_name)
     results: list[dict[str, Any]] = []
-    for onset_time in extract_harmonic_onsets(pm):
-        sonority = build_sounding_sonority(pm, onset_time)
+    for onset_time in extract_harmonic_onsets(target_instrument):
+        sonority = build_sounding_sonority(target_instrument, onset_time)
         observed_pcs = sonority["observed_pcs"]
         if len(observed_pcs) < 3:
             continue
@@ -358,13 +410,26 @@ def predict_chords_for_midi(midi_path: str, tonic_pc: int, main_mode: str) -> li
         rel_bass_pc = None if bass_pc is None else (bass_pc - tonic_pc) % 12
 
         candidates = generate_all_candidates(rel_observed_pcs, rel_bass_pc, main_mode, theory_ctx)
+        sorted_candidates = sorted(candidates, key=lambda c: _candidate_sort_key(c, main_mode, theory_ctx))
         best_candidates = sorted(select_best_candidates(candidates), key=lambda c: _candidate_sort_key(c, main_mode, theory_ctx))
+        candidate_key = "candidates" if include_all_candidates else "best_candidates"
+        selected = sorted_candidates if include_all_candidates else best_candidates
 
         results.append(
             {
                 "onset_time": float(onset_time),
                 "observed_pcs": rel_observed_pcs,
-                "best_candidates": [_serialize_candidate(c) for c in best_candidates],
+                candidate_key: [
+                    _serialize_candidate(
+                        c,
+                        observed_pcs=rel_observed_pcs,
+                        bass_pc=rel_bass_pc,
+                        main_mode=main_mode,
+                        theory_ctx=theory_ctx,
+                        include_score_breakdown=include_score_breakdown,
+                    )
+                    for c in selected
+                ],
             }
         )
 
@@ -379,24 +444,39 @@ def _cli() -> None:
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--pretty", action="store_true")
     parser.add_argument("--json-out", type=str, default=None)
+    parser.add_argument("--instrument-name", type=str, default="chords")
+    parser.add_argument("--all-candidates", action="store_true")
+    parser.add_argument("--debug-score", action="store_true")
     args = parser.parse_args()
 
-    predictions = predict_chords_for_midi(args.midi_path, args.tonic_pc, args.mode)
+    predictions = predict_chords_for_midi(
+        args.midi_path,
+        args.tonic_pc,
+        args.mode,
+        instrument_name=args.instrument_name,
+        include_all_candidates=args.all_candidates,
+        include_score_breakdown=args.debug_score,
+    )
 
     if args.top_k is not None and args.top_k > 0:
         for onset_payload in predictions:
-            onset_payload["best_candidates"] = onset_payload["best_candidates"][: args.top_k]
+            candidate_key = "candidates" if args.all_candidates else "best_candidates"
+            onset_payload[candidate_key] = onset_payload[candidate_key][: args.top_k]
 
     if args.pretty:
         for onset_payload in predictions:
             print(f"onset={onset_payload['onset_time']:.3f}s pcs={onset_payload['observed_pcs']}")
-            for idx, candidate in enumerate(onset_payload["best_candidates"], start=1):
+            candidate_key = "candidates" if args.all_candidates else "best_candidates"
+            for idx, candidate in enumerate(onset_payload[candidate_key], start=1):
                 print(
                     f"  [{idx}] mode={candidate['mode_name']} borrowed={candidate['borrowed']} "
                     f"root={candidate['root_degree_raw']} type={candidate['type_raw']} inv={candidate['inversion_raw']} "
                     f"adds={candidate['add_degrees']} sus={candidate['suspension_degrees']} "
                     f"omits={candidate['omit_degrees']} alt={candidate['alteration_tokens']} score={candidate['score']}"
                 )
+                if args.debug_score and "score_breakdown" in candidate:
+                    for term in candidate["score_breakdown"]["human_readable_terms"]:
+                        print(f"      {term}")
     else:
         print(json.dumps(predictions, ensure_ascii=False, indent=2))
 
