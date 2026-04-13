@@ -153,6 +153,11 @@ def render_song_to_pretty_midi(
 ) -> tuple[pretty_midi.PrettyMIDI, dict[str, int]]:
     bpm = pick_song_bpm(song_obj)
     pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+    tonic_pc_raw = song_obj.get("meta", {}).get("main_key_tonic_pc")
+    try:
+        tonic_pc = int(tonic_pc_raw) % 12
+    except (TypeError, ValueError):
+        tonic_pc = 0
 
     meta = song_obj.get("meta", {})
     meter_regions = meta.get("meter_regions") or []
@@ -216,10 +221,12 @@ def render_song_to_pretty_midi(
             skipped_chord_decode += 1
             continue
 
+        body_pcs_abs = [((int(pc) + tonic_pc) % 12) for pc in components["body_pcs"]]
+        add_pcs_abs = [((int(pc) + tonic_pc) % 12) for pc in components["add_pcs"]]
         inversion_raw = theory_ctx["inversion_id_to_raw"].get(int(chord.get("inversion_id", 0)), 0)
         voiced, bass_pitch = voice_chord(
-            components["body_pcs"],
-            components["add_pcs"],
+            body_pcs_abs,
+            add_pcs_abs,
             inversion_raw=inversion_raw,
             target_center=target_center,
         )
