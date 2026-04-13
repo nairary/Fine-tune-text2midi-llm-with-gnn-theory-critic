@@ -18,7 +18,7 @@ VALID_SD = {
 }
 
 VALID_CHORD_TYPES = {5, 7, 9, 11, 13}
-VALID_ROOTS = set(range(0, 8))          # 0..7
+VALID_ROOTS = set(range(0, 9))          # raw HookTheory values: 0..8
 VALID_INVERSIONS = set(range(0, 8))     # оставим с запасом
 VALID_APPLIED = set(range(0, 16))       # оставим с запасом
 
@@ -349,7 +349,10 @@ def normalize_alterations(values, reporter=None, song_id=None):
 # Chord scalars
 # =========================================================
 
-def canonical_root(x, reporter=None, song_id=None):
+def canonical_root(x, is_rest=False, reporter=None, song_id=None):
+    if is_rest is True:
+        return None
+
     raw = safe_int(x)
     if raw is None:
         if x is not None and reporter is not None:
@@ -359,7 +362,17 @@ def canonical_root(x, reporter=None, song_id=None):
         if reporter is not None:
             reporter.warn("out_of_domain_root", raw_value=x, song_id=song_id)
         return None
-    return raw
+
+    # HookTheory raw root is 1-based:
+    # 1..7 => I..VII, 8 => bVII (special case in internal format).
+    # raw 0 is used as pause/empty marker in raw data and must not be interpreted as I.
+    if raw == 0:
+        if reporter is not None:
+            reporter.warn("unexpected_non_rest_root_zero", raw_value=x, song_id=song_id)
+        return None
+    if raw == 8:
+        return 7
+    return raw - 1
 
 
 def canonical_chord_type(x, reporter=None, song_id=None):
@@ -745,7 +758,9 @@ def normalize_song(song_id, song, reporter=None, keep_raw=False):
         borrowed_raw = chord.get("borrowed")
         alternate_raw = chord.get("alternate")
 
-        root = canonical_root(root_raw, reporter=reporter, song_id=song_id)
+        is_rest = safe_bool(chord.get("is_rest"))
+
+        root = canonical_root(root_raw, is_rest=is_rest, reporter=reporter, song_id=song_id)
         chord_type = canonical_chord_type(type_raw, reporter=reporter, song_id=song_id)
         inversion = canonical_inversion(inversion_raw, reporter=reporter, song_id=song_id)
         applied = canonical_applied(applied_raw, reporter=reporter, song_id=song_id)
@@ -766,8 +781,6 @@ def normalize_song(song_id, song, reporter=None, keep_raw=False):
         if alternate_raw is not None:
             s = str(alternate_raw).strip()
             alternate = s if s != "" else None
-
-        is_rest = safe_bool(chord.get("is_rest"))
 
         item = {
             "beat": beat,
