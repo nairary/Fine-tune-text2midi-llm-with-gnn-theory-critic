@@ -14,9 +14,44 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.dataloader.theory_helpers import build_theory_context
-from src.observer.chord_score_fitting import build_training_groups, save_json, train_learnable_chord_score
+from src.observer.chord_score_fitting import (
+    build_training_groups,
+    iter_training_group_chunks,
+    save_json,
+    train_learnable_chord_score,
+)
 
 LOGGER = logging.getLogger("fit_chord_score_weights")
+BUILD_STATS_KEYS = [
+    "songs_total",
+    "songs_missing_midi",
+    "songs_bad_midi",
+    "songs_no_instrument",
+    "events_total",
+    "events_skipped_rest",
+    "events_skipped_bad_gt",
+    "events_skipped_sparse_sonority",
+    "events_skipped_no_candidates",
+    "events_positive_missing",
+    "groups_kept",
+]
+
+
+def empty_build_stats() -> dict[str, int]:
+    return {key: 0 for key in BUILD_STATS_KEYS}
+
+
+def merge_build_stats(total: dict[str, int], chunk_stats: dict[str, int]) -> dict[str, int]:
+    for key in BUILD_STATS_KEYS:
+        total[key] = int(total.get(key, 0)) + int(chunk_stats.get(key, 0))
+    return total
+
+
+def collect_chunked_train_stats(chunk_iterable) -> dict[str, int]:
+    total = empty_build_stats()
+    for _, chunk_stats in chunk_iterable:
+        merge_build_stats(total, chunk_stats)
+    return total
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -31,6 +66,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--chunk-size", type=int, default=16)
+    parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--limit-train", type=int, default=None)
     parser.add_argument("--limit-val", type=int, default=None)
     parser.add_argument("--outdir", type=Path, required=True)
@@ -52,14 +89,8 @@ def main() -> None:
     encoded_data = json.loads(args.encoded_json.read_text(encoding="utf-8"))
     theory_ctx = build_theory_context()
 
-    train_groups, train_stats = build_training_groups(
-        encoded_data=encoded_data,
-        midi_root=args.midi_root,
-        split=args.train_split,
-        instrument_name=args.instrument_name,
-        limit=args.limit_train,
-        theory_ctx=theory_ctx,
-    )
+    train_groups: list[dict] = []
+    train_stats: dict[str, int] = empty_build_stats()
     val_groups, val_stats = build_training_groups(
         encoded_data=encoded_data,
         midi_root=args.midi_root,
@@ -69,6 +100,30 @@ def main() -> None:
         theory_ctx=theory_ctx,
     )
 
+    if args.save_train_groups_json:
+        train_groups, train_stats = build_training_groups(
+            encoded_data=encoded_data,
+            midi_root=args.midi_root,
+            split=args.train_split,
+            instrument_name=args.instrument_name,
+            limit=args.limit_train,
+            theory_ctx=theory_ctx,
+        )
+    else:
+        train_stats = collect_chunked_train_stats(
+            iter_training_group_chunks(
+                encoded_data=encoded_data,
+                midi_root=args.midi_root,
+                split=args.train_split,
+                instrument_name=args.instrument_name,
+                limit=args.limit_train,
+                chunk_size=args.chunk_size,
+                theory_ctx=theory_ctx,
+                include_candidate_metadata=False,
+                drop_groups_without_positives=True,
+            )
+        )
+
     LOGGER.info("Train groups=%d stats=%s", len(train_groups), train_stats)
     LOGGER.info("Val groups=%d stats=%s", len(val_groups), val_stats)
 
@@ -77,16 +132,40 @@ def main() -> None:
     if args.save_val_groups_json:
         save_json(args.outdir / "val_groups.json", val_groups)
 
-    model, summary, metrics_log = train_learnable_chord_score(
-        train_groups=train_groups,
-        val_groups=val_groups,
-        epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        seed=args.seed,
-        device=args.device,
-        log_every=args.log_every,
-    )
+    if args.save_train_groups_json:
+        model, summary, metrics_log = train_learnable_chord_score(
+            train_groups=train_groups,
+            val_groups=val_groups,
+            epochs=args.epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            seed=args.seed,
+            device=args.device,
+            log_every=args.log_every,
+            eval_every=args.eval_every,
+        )
+    else:
+        model, summary, metrics_log = train_learnable_chord_score(
+            train_group_chunks=lambda: iter_training_group_chunks(
+                encoded_data=encoded_data,
+                midi_root=args.midi_root,
+                split=args.train_split,
+                instrument_name=args.instrument_name,
+                limit=args.limit_train,
+                chunk_size=args.chunk_size,
+                theory_ctx=theory_ctx,
+                include_candidate_metadata=False,
+                drop_groups_without_positives=True,
+            ),
+            val_groups=val_groups,
+            epochs=args.epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            seed=args.seed,
+            device=args.device,
+            log_every=args.log_every,
+            eval_every=args.eval_every,
+        )
 
     learned_weights = model.export_weights()
     (args.outdir / "learned_weights.yaml").write_text(yaml.safe_dump(learned_weights, sort_keys=False), encoding="utf-8")
@@ -108,6 +187,8 @@ def main() -> None:
         "val_positive_coverage": summary.get("val_positive_coverage"),
         "train_build_stats": train_stats,
         "val_build_stats": val_stats,
+        "chunk_size": args.chunk_size,
+        "eval_every": args.eval_every,
     }
     save_json(args.outdir / "metrics.json", metrics)
 
