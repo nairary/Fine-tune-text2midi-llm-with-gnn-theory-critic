@@ -229,6 +229,60 @@ class ChordScoreFittingTests(unittest.TestCase):
         self.assertNotEqual(summary["epoch"], metrics_log[-1]["epoch"])
         self.assertEqual(summary["learned_weights"], model.export_weights())
 
+    def test_train_logging_interval_and_new_best(self):
+        base_metrics = {
+            "loss": 0.5,
+            "top1_exact_acc": 0.0,
+            "topk_contains_gt_acc": 0.0,
+            "root_acc": 0.0,
+            "type_acc": 0.0,
+            "group_count": 1.0,
+            "positive_coverage": 1.0,
+            "valid_group_count": 1.0,
+        }
+        val_top1_seq = [0.1, 0.1, 0.2, 0.15, 0.25]
+
+        side_effect = []
+        for epoch, val_top1 in enumerate(val_top1_seq, start=1):
+            side_effect.extend(
+                [
+                    {**base_metrics, "loss": 0.6 - 0.01 * epoch},
+                    {**base_metrics, "top1_exact_acc": val_top1, "loss": 0.7 - 0.02 * epoch},
+                ]
+            )
+
+        with (
+            patch.object(chord_score_fitting, "evaluate_groups", side_effect=side_effect),
+            patch.object(chord_score_fitting.LOGGER, "info") as mock_info,
+        ):
+            model, summary, metrics_log = chord_score_fitting.train_learnable_chord_score(
+                train_groups=[],
+                val_groups=[],
+                epochs=5,
+                lr=0.01,
+                weight_decay=0.0,
+                seed=123,
+                device="cpu",
+                log_every=2,
+            )
+
+        info_msgs = [call.args[0] for call in mock_info.call_args_list]
+        epoch_logs = [msg for msg in info_msgs if isinstance(msg, str) and msg.startswith("epoch=")]
+        best_logs = [msg for msg in info_msgs if isinstance(msg, str) and msg.startswith("new_best")]
+
+        self.assertEqual(len(metrics_log), 5)
+        self.assertIsInstance(model, LearnableChordScore)
+        self.assertIn("learned_weights", summary)
+
+        self.assertEqual(len(epoch_logs), 4)
+        self.assertEqual(len(best_logs), 4)
+
+        logged_epochs = [call.args[1] for call in mock_info.call_args_list if call.args and call.args[0].startswith("epoch=")]
+        self.assertEqual(logged_epochs, [1, 2, 4, 5])
+
+        new_best_epochs = [call.args[1] for call in mock_info.call_args_list if call.args and call.args[0].startswith("new_best")]
+        self.assertEqual(new_best_epochs, [1, 2, 3, 5])
+
 
 if __name__ == "__main__":
     unittest.main()
