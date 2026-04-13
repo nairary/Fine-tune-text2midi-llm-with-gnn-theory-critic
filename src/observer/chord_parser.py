@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from src.dataloader.theory_helpers import build_theory_context
 
 BODY_TYPES = (5, 7, 9, 11, 13)
@@ -365,6 +367,61 @@ def select_best_candidates(candidates: list[ChordCandidate]) -> list[ChordCandid
     return [c for c in candidates if c.score == best_score]
 
 
+def load_learned_weights(weights_yaml: str | None) -> dict[str, Any] | None:
+    if weights_yaml is None:
+        return None
+    yaml_path = Path(weights_yaml)
+    try:
+        payload = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Learned weights YAML not found: {weights_yaml}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Failed to parse learned weights YAML: {weights_yaml}") from exc
+    if payload is None:
+        raise ValueError(f"Learned weights YAML is empty: {weights_yaml}")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Learned weights YAML must contain a mapping: {weights_yaml}")
+    return payload
+
+
+def _build_weighted_score_breakdown(feature_dict: dict[str, float], learned_weights: dict[str, Any]) -> dict[str, Any]:
+    positive_weights = learned_weights.get("positive", {})
+    negative_weights = learned_weights.get("negative", {})
+    bias = float(learned_weights.get("bias", 0.0))
+    positive_terms = {name: float(positive_weights.get(name, 0.0)) * float(feature_dict.get(name, 0.0)) for name in positive_weights}
+    negative_terms = {name: float(negative_weights.get(name, 0.0)) * float(feature_dict.get(name, 0.0)) for name in negative_weights}
+    total = bias + sum(positive_terms.values()) - sum(negative_terms.values())
+    return {
+        "total": float(total),
+        "bias": bias,
+        "positive_terms": positive_terms,
+        "negative_terms": negative_terms,
+    }
+
+
+def rerank_candidates_with_learned_weights(
+    candidates: list[ChordCandidate],
+    observed_pcs: list[int],
+    bass_pc: int | None,
+    main_mode: str,
+    theory_ctx: dict[str, Any],
+    learned_weights: dict[str, Any] | None,
+) -> tuple[list[ChordCandidate], dict[int, dict[str, Any]], str]:
+    if learned_weights is None:
+        sorted_candidates = sorted(candidates, key=lambda c: _candidate_sort_key(c, main_mode, theory_ctx))
+        return sorted_candidates, {}, "manual"
+
+    from src.observer.chord_score_fitting import compute_weighted_candidate_score, extract_candidate_feature_dict
+
+    weighted_breakdowns: dict[int, dict[str, Any]] = {}
+    for candidate in candidates:
+        feature_dict = extract_candidate_feature_dict(candidate, observed_pcs, bass_pc, main_mode, theory_ctx)
+        candidate.score = float(compute_weighted_candidate_score(feature_dict, learned_weights))
+        weighted_breakdowns[id(candidate)] = _build_weighted_score_breakdown(feature_dict, learned_weights)
+    sorted_candidates = sorted(candidates, key=lambda c: _candidate_sort_key(c, main_mode, theory_ctx))
+    return sorted_candidates, weighted_breakdowns, "learned_weights"
+
+
 def _serialize_candidate(
     candidate: ChordCandidate,
     observed_pcs: list[int] | None = None,
@@ -372,12 +429,20 @@ def _serialize_candidate(
     main_mode: str | None = None,
     theory_ctx: dict[str, Any] | None = None,
     include_score_breakdown: bool = False,
+    score_source: str = "manual",
+    weighted_breakdown: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = asdict(candidate)
+    payload["score_source"] = score_source
     if include_score_breakdown:
         if observed_pcs is None or main_mode is None or theory_ctx is None:
             raise ValueError("observed_pcs, main_mode, and theory_ctx are required when include_score_breakdown=True")
-        payload["score_breakdown"] = explain_score_candidate(candidate, observed_pcs, bass_pc, main_mode, theory_ctx)
+        manual_breakdown = explain_score_candidate(candidate, observed_pcs, bass_pc, main_mode, theory_ctx)
+        if weighted_breakdown is None:
+            payload["score_breakdown"] = manual_breakdown
+        else:
+            payload["score_breakdown_manual"] = manual_breakdown
+            payload["score_breakdown_weighted"] = weighted_breakdown
     return payload
 
 
@@ -388,6 +453,7 @@ def predict_chords_for_midi(
     instrument_name: str = "chords",
     include_all_candidates: bool = False,
     include_score_breakdown: bool = False,
+    weights_yaml: str | None = None,
 ) -> list[dict[str, Any]]:
     if not 0 <= int(tonic_pc) <= 11:
         raise ValueError("tonic_pc must be in [0, 11]")
@@ -396,6 +462,7 @@ def predict_chords_for_midi(
 
     pm = pretty_midi.PrettyMIDI(str(midi_path))
     theory_ctx = build_theory_context()
+    learned_weights = load_learned_weights(weights_yaml)
 
     target_instrument = select_target_instrument(pm, instrument_name=instrument_name)
     results: list[dict[str, Any]] = []
@@ -410,8 +477,18 @@ def predict_chords_for_midi(
         rel_bass_pc = None if bass_pc is None else (bass_pc - tonic_pc) % 12
 
         candidates = generate_all_candidates(rel_observed_pcs, rel_bass_pc, main_mode, theory_ctx)
-        sorted_candidates = sorted(candidates, key=lambda c: _candidate_sort_key(c, main_mode, theory_ctx))
-        best_candidates = sorted(select_best_candidates(candidates), key=lambda c: _candidate_sort_key(c, main_mode, theory_ctx))
+        sorted_candidates, weighted_breakdowns, score_source = rerank_candidates_with_learned_weights(
+            candidates,
+            observed_pcs=rel_observed_pcs,
+            bass_pc=rel_bass_pc,
+            main_mode=main_mode,
+            theory_ctx=theory_ctx,
+            learned_weights=learned_weights,
+        )
+        best_candidates = sorted(
+            select_best_candidates(sorted_candidates),
+            key=lambda c: _candidate_sort_key(c, main_mode, theory_ctx),
+        )
         candidate_key = "candidates" if include_all_candidates else "best_candidates"
         selected = sorted_candidates if include_all_candidates else best_candidates
 
@@ -427,6 +504,8 @@ def predict_chords_for_midi(
                         main_mode=main_mode,
                         theory_ctx=theory_ctx,
                         include_score_breakdown=include_score_breakdown,
+                        score_source=score_source,
+                        weighted_breakdown=weighted_breakdowns.get(id(c)),
                     )
                     for c in selected
                 ],
@@ -447,6 +526,7 @@ def _cli() -> None:
     parser.add_argument("--instrument-name", type=str, default="chords")
     parser.add_argument("--all-candidates", action="store_true")
     parser.add_argument("--debug-score", action="store_true")
+    parser.add_argument("--weights-yaml", type=str, default=None)
     args = parser.parse_args()
 
     predictions = predict_chords_for_midi(
@@ -456,6 +536,7 @@ def _cli() -> None:
         instrument_name=args.instrument_name,
         include_all_candidates=args.all_candidates,
         include_score_breakdown=args.debug_score,
+        weights_yaml=args.weights_yaml,
     )
 
     if args.top_k is not None and args.top_k > 0:
@@ -474,9 +555,12 @@ def _cli() -> None:
                     f"adds={candidate['add_degrees']} sus={candidate['suspension_degrees']} "
                     f"omits={candidate['omit_degrees']} alt={candidate['alteration_tokens']} score={candidate['score']}"
                 )
-                if args.debug_score and "score_breakdown" in candidate:
-                    for term in candidate["score_breakdown"]["human_readable_terms"]:
-                        print(f"      {term}")
+                if args.debug_score:
+                    if "score_breakdown" in candidate:
+                        for term in candidate["score_breakdown"]["human_readable_terms"]:
+                            print(f"      {term}")
+                    if "score_breakdown_weighted" in candidate:
+                        print(f"      weighted_total={candidate['score_breakdown_weighted']['total']}")
     else:
         print(json.dumps(predictions, ensure_ascii=False, indent=2))
 
