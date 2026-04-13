@@ -47,7 +47,7 @@ def merge_build_stats(total: dict[str, int], chunk_stats: dict[str, int]) -> dic
     return total
 
 
-def collect_chunked_train_stats(chunk_iterable) -> dict[str, int]:
+def collect_chunked_build_stats(chunk_iterable) -> dict[str, int]:
     total = empty_build_stats()
     for _, chunk_stats in chunk_iterable:
         merge_build_stats(total, chunk_stats)
@@ -74,6 +74,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--save-train-groups-json", action="store_true")
     parser.add_argument("--save-val-groups-json", action="store_true")
+    parser.add_argument("--materialize-val", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -91,14 +92,10 @@ def main() -> None:
 
     train_groups: list[dict] = []
     train_stats: dict[str, int] = empty_build_stats()
-    val_groups, val_stats = build_training_groups(
-        encoded_data=encoded_data,
-        midi_root=args.midi_root,
-        split=args.val_split,
-        instrument_name=args.instrument_name,
-        limit=args.limit_val,
-        theory_ctx=theory_ctx,
-    )
+    train_group_chunks = None
+    val_groups: list[dict] = []
+    val_stats: dict[str, int] = empty_build_stats()
+    val_group_chunks = None
 
     if args.save_train_groups_json:
         train_groups, train_stats = build_training_groups(
@@ -110,62 +107,76 @@ def main() -> None:
             theory_ctx=theory_ctx,
         )
     else:
-        train_stats = collect_chunked_train_stats(
-            iter_training_group_chunks(
-                encoded_data=encoded_data,
-                midi_root=args.midi_root,
-                split=args.train_split,
-                instrument_name=args.instrument_name,
-                limit=args.limit_train,
-                chunk_size=args.chunk_size,
-                theory_ctx=theory_ctx,
-                include_candidate_metadata=False,
-                drop_groups_without_positives=True,
-            )
+        train_group_chunks = lambda: iter_training_group_chunks(
+            encoded_data=encoded_data,
+            midi_root=args.midi_root,
+            split=args.train_split,
+            instrument_name=args.instrument_name,
+            limit=args.limit_train,
+            chunk_size=args.chunk_size,
+            theory_ctx=theory_ctx,
+            include_candidate_metadata=False,
+            drop_groups_without_positives=True,
         )
+        train_stats = collect_chunked_build_stats(train_group_chunks())
 
+    materialize_val = bool(args.materialize_val or args.save_val_groups_json)
+    if materialize_val:
+        val_groups, val_stats = build_training_groups(
+            encoded_data=encoded_data,
+            midi_root=args.midi_root,
+            split=args.val_split,
+            instrument_name=args.instrument_name,
+            limit=args.limit_val,
+            theory_ctx=theory_ctx,
+        )
+    else:
+        val_group_chunks = lambda: iter_training_group_chunks(
+            encoded_data=encoded_data,
+            midi_root=args.midi_root,
+            split=args.val_split,
+            instrument_name=args.instrument_name,
+            limit=args.limit_val,
+            chunk_size=args.chunk_size,
+            theory_ctx=theory_ctx,
+            include_candidate_metadata=True,
+            drop_groups_without_positives=False,
+        )
+        val_stats = collect_chunked_build_stats(val_group_chunks())
+
+    train_mode = "materialized" if args.save_train_groups_json else "chunked"
+    val_mode = "materialized" if materialize_val else "chunked"
+    LOGGER.info(
+        "train_mode=%s val_mode=%s chunk_size=%d eval_every=%d",
+        train_mode,
+        val_mode,
+        int(args.chunk_size),
+        int(args.eval_every),
+    )
     LOGGER.info("Train groups=%d stats=%s", len(train_groups), train_stats)
-    LOGGER.info("Val groups=%d stats=%s", len(val_groups), val_stats)
+    if materialize_val:
+        LOGGER.info("Val groups=%d stats=%s", len(val_groups), val_stats)
+    else:
+        LOGGER.info("Val groups materialized=0 (chunked mode) stats=%s", val_stats)
 
     if args.save_train_groups_json:
         save_json(args.outdir / "train_groups.json", train_groups)
     if args.save_val_groups_json:
         save_json(args.outdir / "val_groups.json", val_groups)
 
-    if args.save_train_groups_json:
-        model, summary, metrics_log = train_learnable_chord_score(
-            train_groups=train_groups,
-            val_groups=val_groups,
-            epochs=args.epochs,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            seed=args.seed,
-            device=args.device,
-            log_every=args.log_every,
-            eval_every=args.eval_every,
-        )
-    else:
-        model, summary, metrics_log = train_learnable_chord_score(
-            train_group_chunks=lambda: iter_training_group_chunks(
-                encoded_data=encoded_data,
-                midi_root=args.midi_root,
-                split=args.train_split,
-                instrument_name=args.instrument_name,
-                limit=args.limit_train,
-                chunk_size=args.chunk_size,
-                theory_ctx=theory_ctx,
-                include_candidate_metadata=False,
-                drop_groups_without_positives=True,
-            ),
-            val_groups=val_groups,
-            epochs=args.epochs,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            seed=args.seed,
-            device=args.device,
-            log_every=args.log_every,
-            eval_every=args.eval_every,
-        )
+    model, summary, metrics_log = train_learnable_chord_score(
+        train_groups=train_groups if args.save_train_groups_json else None,
+        val_groups=val_groups if materialize_val else None,
+        train_group_chunks=train_group_chunks,
+        val_group_chunks=val_group_chunks,
+        epochs=args.epochs,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        seed=args.seed,
+        device=args.device,
+        log_every=args.log_every,
+        eval_every=args.eval_every,
+    )
 
     learned_weights = model.export_weights()
     (args.outdir / "learned_weights.yaml").write_text(yaml.safe_dump(learned_weights, sort_keys=False), encoding="utf-8")
@@ -189,6 +200,8 @@ def main() -> None:
         "val_build_stats": val_stats,
         "chunk_size": args.chunk_size,
         "eval_every": args.eval_every,
+        "materialize_val": bool(args.materialize_val),
+        "val_mode": val_mode,
     }
     save_json(args.outdir / "metrics.json", metrics)
 
