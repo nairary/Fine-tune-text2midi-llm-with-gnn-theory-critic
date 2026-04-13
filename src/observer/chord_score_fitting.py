@@ -349,6 +349,7 @@ def train_learnable_chord_score(
     seed: int = 123,
     device: str = "cpu",
     topk: int = 5,
+    log_every: int = 10,
 ) -> tuple[LearnableChordScore, dict[str, Any], list[dict[str, Any]]]:
     torch.manual_seed(int(seed))
     model = LearnableChordScore().to(device)
@@ -358,6 +359,7 @@ def train_learnable_chord_score(
     best_val_top1 = -1.0
     best_row: dict[str, Any] | None = None
     metrics_log: list[dict[str, Any]] = []
+    log_step = max(1, int(log_every))
 
     for epoch in range(1, int(epochs) + 1):
         model.train()
@@ -402,6 +404,30 @@ def train_learnable_chord_score(
         }
         metrics_log.append(row)
 
+        should_log_epoch = epoch == 1 or epoch == int(epochs) or (epoch % log_step == 0)
+        if should_log_epoch:
+            LOGGER.info(
+                (
+                    "epoch=%d/%d train_loss=%.4f val_loss=%.4f "
+                    "train_top1=%.4f val_top1=%.4f train_top%d=%.4f val_top%d=%.4f "
+                    "train_root=%.4f val_root=%.4f train_type=%.4f val_type=%.4f"
+                ),
+                epoch,
+                int(epochs),
+                float(row["train_loss"]),
+                float(row["val_loss"]),
+                float(row["train_top1_exact_acc"]),
+                float(row["val_top1_exact_acc"]),
+                int(topk),
+                float(row["train_topk_contains_gt_acc"]),
+                int(topk),
+                float(row["val_topk_contains_gt_acc"]),
+                float(row["train_root_acc"]),
+                float(row["val_root_acc"]),
+                float(row["train_type_acc"]),
+                float(row["val_type_acc"]),
+            )
+
         if val_metrics["top1_exact_acc"] >= best_val_top1:
             best_val_top1 = val_metrics["top1_exact_acc"]
             best_state = {
@@ -410,6 +436,12 @@ def train_learnable_chord_score(
                 "best_val_top1_exact_acc": best_val_top1,
             }
             best_row = dict(row)
+            LOGGER.info(
+                "new_best epoch=%d val_top1=%.4f val_loss=%.4f",
+                epoch,
+                float(row["val_top1_exact_acc"]),
+                float(row["val_loss"]),
+            )
 
     if best_state is not None:
         model.load_state_dict(best_state["model_state"])
