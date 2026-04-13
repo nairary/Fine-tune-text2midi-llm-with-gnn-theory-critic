@@ -4,6 +4,7 @@ import json
 import logging
 import math
 from dataclasses import asdict
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -137,6 +138,50 @@ def build_training_groups(
     limit: int | None = None,
     theory_ctx: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    song_subset = list(iter_split_song_items(encoded_data=encoded_data, split=split, limit=limit))
+    return build_groups_for_song_subset(
+        song_subset=song_subset,
+        midi_root=midi_root,
+        instrument_name=instrument_name,
+        theory_ctx=theory_ctx,
+        include_candidate_metadata=True,
+        drop_groups_without_positives=False,
+    )
+
+
+def iter_split_song_items(
+    encoded_data: dict[str, Any],
+    split: str,
+    limit: int | None = None,
+):
+    count = 0
+    for song_id, song_obj in encoded_data.items():
+        if song_obj.get("meta", {}).get("split") != split:
+            continue
+        if limit is not None and count >= int(limit):
+            break
+        count += 1
+        yield song_id, song_obj
+
+
+def iter_chunked_song_items(song_items: Any, chunk_size: int = 16):
+    chunk_n = max(1, int(chunk_size))
+    iterator = iter(song_items)
+    while True:
+        chunk = list(islice(iterator, chunk_n))
+        if not chunk:
+            break
+        yield chunk
+
+
+def build_groups_for_song_subset(
+    song_subset: list[tuple[str, dict[str, Any]]],
+    midi_root: str | Path,
+    instrument_name: str = "chords",
+    theory_ctx: dict[str, Any] | None = None,
+    include_candidate_metadata: bool = True,
+    drop_groups_without_positives: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
     import pretty_midi
 
     theory_ctx = theory_ctx or build_theory_context()
@@ -157,12 +202,8 @@ def build_training_groups(
         "groups_kept": 0,
     }
 
-    for song_id, song_obj in encoded_data.items():
-        if song_obj.get("meta", {}).get("split") != split:
-            continue
-        if limit is not None and stats["songs_total"] >= int(limit):
-            break
-
+    for song_id, song_obj in song_subset:
+        split = str(song_obj.get("meta", {}).get("split") or "")
         stats["songs_total"] += 1
         midi_path = midi_root / split / f"{song_id}.mid"
         if not midi_path.exists():
@@ -217,27 +258,57 @@ def build_training_groups(
             candidates = sorted(candidates, key=lambda c: _candidate_sort_key(c, main_mode, theory_ctx))
 
             positive_mask = [match_candidate_to_ground_truth(candidate, gt_chord, theory_ctx) for candidate in candidates]
-            if not any(positive_mask):
+            has_positive = any(positive_mask)
+            if not has_positive:
                 stats["events_positive_missing"] += 1
+                if drop_groups_without_positives:
+                    continue
 
             features = [extract_candidate_feature_dict(c, observed_pcs, bass_pc, main_mode, theory_ctx) for c in candidates]
-            groups.append(
-                {
-                    "song_id": song_id,
-                    "split": split,
-                    "onset_time": float(onset_sec),
-                    "features": features,
-                    "candidates": [_serialize_candidate(c) for c in candidates],
-                    "positive_mask": positive_mask,
-                    "ground_truth": gt_chord,
-                    "observed_pcs": observed_pcs,
-                    "bass_pc": bass_pc,
-                    "main_mode": main_mode,
-                }
-            )
+            payload = {
+                "features": features,
+                "positive_mask": positive_mask,
+            }
+            if include_candidate_metadata:
+                payload.update(
+                    {
+                        "song_id": song_id,
+                        "split": split,
+                        "onset_time": float(onset_sec),
+                        "candidates": [_serialize_candidate(c) for c in candidates],
+                        "ground_truth": gt_chord,
+                        "observed_pcs": observed_pcs,
+                        "bass_pc": bass_pc,
+                        "main_mode": main_mode,
+                    }
+                )
+            groups.append(payload)
             stats["groups_kept"] += 1
 
     return groups, stats
+
+
+def iter_training_group_chunks(
+    encoded_data: dict[str, Any],
+    midi_root: str | Path,
+    split: str,
+    instrument_name: str = "chords",
+    limit: int | None = None,
+    chunk_size: int = 16,
+    theory_ctx: dict[str, Any] | None = None,
+    include_candidate_metadata: bool = False,
+    drop_groups_without_positives: bool = False,
+):
+    song_items = iter_split_song_items(encoded_data=encoded_data, split=split, limit=limit)
+    for song_chunk in iter_chunked_song_items(song_items, chunk_size=chunk_size):
+        yield build_groups_for_song_subset(
+            song_subset=song_chunk,
+            midi_root=midi_root,
+            instrument_name=instrument_name,
+            theory_ctx=theory_ctx,
+            include_candidate_metadata=include_candidate_metadata,
+            drop_groups_without_positives=drop_groups_without_positives,
+        )
 
 
 class LearnableChordScore(nn.Module):
@@ -299,6 +370,7 @@ def evaluate_groups(
     root_hits = 0
     type_hits = 0
     coverage_hits = 0
+    candidate_meta_groups = 0
 
     with torch.no_grad():
         for group in groups:
@@ -318,22 +390,84 @@ def evaluate_groups(
             topk_idx = torch.topk(scores, k=k).indices
             topk_hits += int(bool(torch.any(positive_mask[topk_idx]).item()))
 
-            gt_ref = next(
-                candidate
-                for candidate, is_positive in zip(group["candidates"], group["positive_mask"], strict=False)
-                if is_positive
-            )
-            pred_ref = group["candidates"][top_idx]
-            root_hits += int(int(pred_ref["root_degree_raw"]) == int(gt_ref["root_degree_raw"]))
-            type_hits += int(int(pred_ref["type_raw"]) == int(gt_ref["type_raw"]))
+            if "candidates" in group:
+                candidate_meta_groups += 1
+                gt_ref = next(
+                    candidate
+                    for candidate, is_positive in zip(group["candidates"], group["positive_mask"], strict=False)
+                    if is_positive
+                )
+                pred_ref = group["candidates"][top_idx]
+                root_hits += int(int(pred_ref["root_degree_raw"]) == int(gt_ref["root_degree_raw"]))
+                type_hits += int(int(pred_ref["type_raw"]) == int(gt_ref["type_raw"]))
 
     group_count = len(groups)
     return {
         "loss": float(sum(losses) / len(losses)) if losses else math.nan,
         "top1_exact_acc": float(top1_hits / valid_groups) if valid_groups else 0.0,
         "topk_contains_gt_acc": float(topk_hits / valid_groups) if valid_groups else 0.0,
-        "root_acc": float(root_hits / valid_groups) if valid_groups else 0.0,
-        "type_acc": float(type_hits / valid_groups) if valid_groups else 0.0,
+        "root_acc": float(root_hits / candidate_meta_groups) if candidate_meta_groups else math.nan,
+        "type_acc": float(type_hits / candidate_meta_groups) if candidate_meta_groups else math.nan,
+        "group_count": float(group_count),
+        "positive_coverage": float(coverage_hits / group_count) if group_count else 0.0,
+        "valid_group_count": float(valid_groups),
+    }
+
+
+def evaluate_group_chunks(
+    model: LearnableChordScore,
+    group_chunks: Any,
+    device: str | torch.device = "cpu",
+    topk: int = 5,
+) -> dict[str, float]:
+    model.eval()
+    losses: list[float] = []
+    valid_groups = 0
+    top1_hits = 0
+    topk_hits = 0
+    root_hits = 0
+    type_hits = 0
+    coverage_hits = 0
+    group_count = 0
+    candidate_meta_groups = 0
+
+    with torch.no_grad():
+        for chunk_groups, _ in group_chunks:
+            for group in chunk_groups:
+                group_count += 1
+                scores = model.score_group(group["features"], device=device)
+                positive_mask = torch.tensor(group["positive_mask"], dtype=torch.bool, device=device)
+                if int(positive_mask.sum().item()) == 0:
+                    continue
+
+                coverage_hits += 1
+                valid_groups += 1
+                losses.append(float(multi_positive_softmax_loss(scores, positive_mask).item()))
+
+                top_idx = int(torch.argmax(scores).item())
+                top1_hits += int(bool(positive_mask[top_idx].item()))
+
+                k = min(int(topk), int(scores.shape[0]))
+                topk_idx = torch.topk(scores, k=k).indices
+                topk_hits += int(bool(torch.any(positive_mask[topk_idx]).item()))
+
+                if "candidates" in group:
+                    candidate_meta_groups += 1
+                    gt_ref = next(
+                        candidate
+                        for candidate, is_positive in zip(group["candidates"], group["positive_mask"], strict=False)
+                        if is_positive
+                    )
+                    pred_ref = group["candidates"][top_idx]
+                    root_hits += int(int(pred_ref["root_degree_raw"]) == int(gt_ref["root_degree_raw"]))
+                    type_hits += int(int(pred_ref["type_raw"]) == int(gt_ref["type_raw"]))
+
+    return {
+        "loss": float(sum(losses) / len(losses)) if losses else math.nan,
+        "top1_exact_acc": float(top1_hits / valid_groups) if valid_groups else 0.0,
+        "topk_contains_gt_acc": float(topk_hits / valid_groups) if valid_groups else 0.0,
+        "root_acc": float(root_hits / candidate_meta_groups) if candidate_meta_groups else math.nan,
+        "type_acc": float(type_hits / candidate_meta_groups) if candidate_meta_groups else math.nan,
         "group_count": float(group_count),
         "positive_coverage": float(coverage_hits / group_count) if group_count else 0.0,
         "valid_group_count": float(valid_groups),
@@ -341,8 +475,10 @@ def evaluate_groups(
 
 
 def train_learnable_chord_score(
-    train_groups: list[dict[str, Any]],
-    val_groups: list[dict[str, Any]],
+    train_groups: list[dict[str, Any]] | None = None,
+    val_groups: list[dict[str, Any]] | None = None,
+    train_group_chunks: Any = None,
+    val_group_chunks: Any = None,
     epochs: int = 200,
     lr: float = 0.05,
     weight_decay: float = 1e-4,
@@ -350,6 +486,7 @@ def train_learnable_chord_score(
     device: str = "cpu",
     topk: int = 5,
     log_every: int = 10,
+    eval_every: int = 1,
 ) -> tuple[LearnableChordScore, dict[str, Any], list[dict[str, Any]]]:
     torch.manual_seed(int(seed))
     model = LearnableChordScore().to(device)
@@ -360,30 +497,73 @@ def train_learnable_chord_score(
     best_row: dict[str, Any] | None = None
     metrics_log: list[dict[str, Any]] = []
     log_step = max(1, int(log_every))
+    eval_step = max(1, int(eval_every))
 
     for epoch in range(1, int(epochs) + 1):
         model.train()
-        optimizer.zero_grad(set_to_none=True)
+        epoch_chunk_losses: list[float] = []
+        chunk_source = train_group_chunks() if callable(train_group_chunks) else [((train_groups or []), {"songs_total": 0})]
+        for chunk_idx, (chunk_groups, chunk_stats) in enumerate(chunk_source, start=1):
+            optimizer.zero_grad(set_to_none=True)
+            loss_terms: list[torch.Tensor] = []
+            for group in chunk_groups:
+                scores = model.score_group(group["features"], device=device)
+                positive_mask = torch.tensor(group["positive_mask"], dtype=torch.bool, device=device)
+                if int(positive_mask.sum().item()) == 0:
+                    continue
+                loss_terms.append(multi_positive_softmax_loss(scores, positive_mask))
+            if loss_terms:
+                chunk_loss_tensor = torch.stack(loss_terms).mean()
+                chunk_loss_tensor.backward()
+                optimizer.step()
+                chunk_loss = float(chunk_loss_tensor.detach().cpu().item())
+                epoch_chunk_losses.append(chunk_loss)
+            else:
+                chunk_loss = math.nan
+            LOGGER.info(
+                "epoch=%d/%d train_chunk=%d chunk_songs=%d chunk_groups=%d chunk_loss=%.4f",
+                epoch,
+                int(epochs),
+                chunk_idx,
+                int(chunk_stats.get("songs_total", 0)),
+                len(chunk_groups),
+                float(chunk_loss),
+            )
+            del chunk_groups
 
-        loss_terms: list[torch.Tensor] = []
-        for group in train_groups:
-            scores = model.score_group(group["features"], device=device)
-            positive_mask = torch.tensor(group["positive_mask"], dtype=torch.bool, device=device)
-            if int(positive_mask.sum().item()) == 0:
-                continue
-            loss_terms.append(multi_positive_softmax_loss(scores, positive_mask))
-
-        if loss_terms:
-            train_loss_tensor = torch.stack(loss_terms).mean()
-            train_loss_tensor.backward()
-            optimizer.step()
-            train_loss = float(train_loss_tensor.detach().cpu().item())
+        train_loss = float(sum(epoch_chunk_losses) / len(epoch_chunk_losses)) if epoch_chunk_losses else math.nan
+        should_eval = epoch == 1 or epoch == int(epochs) or (epoch % eval_step == 0)
+        if should_eval:
+            train_metrics = (
+                evaluate_group_chunks(model, train_group_chunks(), device=device, topk=topk)
+                if callable(train_group_chunks)
+                else evaluate_groups(model, train_groups or [], device=device, topk=topk)
+            )
+            val_metrics = (
+                evaluate_group_chunks(model, val_group_chunks(), device=device, topk=topk)
+                if callable(val_group_chunks)
+                else evaluate_groups(model, val_groups or [], device=device, topk=topk)
+            )
+            train_metrics["loss"] = train_loss if not math.isnan(train_loss) else train_metrics["loss"]
         else:
-            train_loss = math.nan
-
-        train_metrics = evaluate_groups(model, train_groups, device=device, topk=topk)
-        val_metrics = evaluate_groups(model, val_groups, device=device, topk=topk)
-        train_metrics["loss"] = train_loss if not math.isnan(train_loss) else train_metrics["loss"]
+            train_metrics = {
+                "loss": train_loss,
+                "top1_exact_acc": math.nan,
+                "topk_contains_gt_acc": math.nan,
+                "root_acc": math.nan,
+                "type_acc": math.nan,
+                "group_count": 0.0,
+                "positive_coverage": math.nan,
+            }
+            val_metrics = {
+                "loss": math.nan,
+                "top1_exact_acc": math.nan,
+                "topk_contains_gt_acc": math.nan,
+                "root_acc": math.nan,
+                "type_acc": math.nan,
+                "group_count": 0.0,
+                "positive_coverage": math.nan,
+            }
 
         row = {
             "epoch": epoch,
@@ -428,7 +608,7 @@ def train_learnable_chord_score(
                 float(row["val_type_acc"]),
             )
 
-        if val_metrics["top1_exact_acc"] >= best_val_top1:
+        if should_eval and val_metrics["top1_exact_acc"] >= best_val_top1:
             best_val_top1 = val_metrics["top1_exact_acc"]
             best_state = {
                 "epoch": epoch,
