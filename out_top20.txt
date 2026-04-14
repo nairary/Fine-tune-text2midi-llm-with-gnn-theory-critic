@@ -1,0 +1,8 @@
+PYTHONPATH=. python scripts/predict_midi_chords.py \
+  --midi-path data/rendered/test/nKexEvjOo_B.mid \
+  --tonic-pc 0 \
+  --mode minor \
+  --instrument-name chords \
+  --weights-yaml outputs/chord_score_fit/fast_probe/learned_weights.yaml \
+  --top-k 20 \
+  --json-out outputs/chord_preds/_QLgnBnpg-V.json
