@@ -5,10 +5,19 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import torch
 from torch_geometric.data import HeteroData
 
+from src.data.encode_teacher_features import (
+    build_allowed_value_id_map,
+    build_range_value_id_map,
+    encode_vocab,
+    encode_with_value_map,
+)
+from src.dataloader.graph_layouts import CHORD_COMPONENT_SIZES
 from src.dataloader.theory_helpers import build_theory_context
 from src.observer.chord_parser import predict_observer_chords_for_midi, select_target_instrument
+from src.observer.schema import OBSERVER_EDGE_TYPES
 
 ONSET_EPSILON = 1e-4
 
@@ -126,11 +135,41 @@ def _load_octave_bounds() -> tuple[int, int]:
     return int(spec_global["octave"]["min"]), int(spec_global["octave"]["max"])
 
 
-def _octave_value_to_teacher_octave_id(octave_value: int) -> int | None:
-    octave_min, octave_max = _load_octave_bounds()
-    if octave_min <= octave_value <= octave_max:
-        return octave_value - octave_min + 1
-    return None
+@lru_cache(maxsize=1)
+def _load_teacher_global_spec() -> dict[str, Any]:
+    spec_path = Path(__file__).resolve().parents[2] / "metadata" / "specs" / "spec_global.json"
+    with spec_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+@lru_cache(maxsize=1)
+def _load_teacher_chord_sets_spec() -> dict[str, Any]:
+    spec_path = Path(__file__).resolve().parents[2] / "metadata" / "specs" / "spec_chord_sets.json"
+    with spec_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+@lru_cache(maxsize=1)
+def _load_teacher_vocabs() -> dict[str, dict[str, int]]:
+    vocabs_dir = Path(__file__).resolve().parents[2] / "metadata" / "vocabs"
+    with (vocabs_dir / "vocab_melody_sd.json").open("r", encoding="utf-8") as handle:
+        melody_sd = json.load(handle)
+    with (vocabs_dir / "vocab_key_scale.json").open("r", encoding="utf-8") as handle:
+        key_scale = json.load(handle)
+    with (vocabs_dir / "vocab_borrowed_kind.json").open("r", encoding="utf-8") as handle:
+        borrowed_kind = json.load(handle)
+    with (vocabs_dir / "vocab_borrowed_mode_name.json").open("r", encoding="utf-8") as handle:
+        borrowed_mode_name = json.load(handle)
+    return {
+        "melody_sd": melody_sd,
+        "key_scale": key_scale,
+        "borrowed_kind": borrowed_kind,
+        "borrowed_mode_name": borrowed_mode_name,
+    }
+
+
+def _octave_value_to_teacher_octave_id(octave_value: int, octave_id_map: dict[int, int]) -> int:
+    return int(encode_with_value_map(octave_id_map, octave_value, unknown_id=0))
 
 
 def _build_relpc_to_sd_id(theory_ctx: dict[str, Any]) -> dict[int, int]:
@@ -149,8 +188,46 @@ def _build_relpc_to_sd_id(theory_ctx: dict[str, Any]) -> dict[int, int]:
     return {chrom: sd_token_to_id[token] for chrom, token in rel_to_token.items() if token in sd_token_to_id}
 
 
+@lru_cache(maxsize=1)
+def _build_runtime_id_maps() -> dict[str, dict[int, int]]:
+    spec_global = _load_teacher_global_spec()
+    octave_id_map = build_range_value_id_map(
+        int(spec_global["octave"]["min"]),
+        int(spec_global["octave"]["max"]),
+        reserve_zero_for_unknown=True,
+    )
+    return {
+        "root_id_map": build_allowed_value_id_map(spec_global["root"]["allowed_values"], reserve_zero_for_unknown=True),
+        "type_id_map": build_allowed_value_id_map(spec_global["type"]["allowed_values"], reserve_zero_for_unknown=True),
+        "inversion_id_map": build_allowed_value_id_map(spec_global["inversion"]["allowed_values"], reserve_zero_for_unknown=True),
+        "tonic_pc_id_map": build_allowed_value_id_map(spec_global["tonic_pc"]["allowed_values"], reserve_zero_for_unknown=True),
+        "num_beats_id_map": build_allowed_value_id_map(spec_global["num_beats"]["allowed_values"], reserve_zero_for_unknown=True),
+        "beat_unit_id_map": build_allowed_value_id_map(spec_global["beat_unit"]["allowed_values"], reserve_zero_for_unknown=True),
+        "octave_id_map": octave_id_map,
+    }
+
+
+def _multi_hot(values: list[Any] | None, allowed_values: list[Any]) -> list[float]:
+    index = {value: idx for idx, value in enumerate(allowed_values)}
+    out = [0.0] * len(allowed_values)
+    for value in values or []:
+        if value in index:
+            out[index[value]] = 1.0
+    return out
+
+
+def _fixed_range_multi_hot(values: list[int] | None, size: int) -> list[float]:
+    out = [0.0] * int(size)
+    for value in values or []:
+        if isinstance(value, int) and 0 <= value < int(size):
+            out[value] = 1.0
+    return out
+
+
 def extract_observer_note_events(pm: Any, tonic_pc: int, bpm: float | None) -> list[dict[str, Any]]:
     theory_ctx = build_theory_context()
+    vocabs = _load_teacher_vocabs()
+    runtime_maps = _build_runtime_id_maps()
     relpc_to_sd_id = _build_relpc_to_sd_id(theory_ctx)
 
     notes: list[dict[str, Any]] = []
@@ -169,7 +246,8 @@ def extract_observer_note_events(pm: Any, tonic_pc: int, bpm: float | None) -> l
 
         midi_octave = pitch // 12 - 1
         octave_value = midi_octave - 5
-        octave_id = _octave_value_to_teacher_octave_id(octave_value)
+        octave_id = _octave_value_to_teacher_octave_id(octave_value, runtime_maps["octave_id_map"])
+        sd_id = encode_vocab(vocabs["melody_sd"], theory_ctx["sd_id_to_token"].get(relpc_to_sd_id.get(rel_pc, 0), "<UNK>"))
 
         notes.append(
             {
@@ -180,7 +258,7 @@ def extract_observer_note_events(pm: Any, tonic_pc: int, bpm: float | None) -> l
                 "pitch": pitch,
                 "pitch_class": pitch_class,
                 "rel_pc": rel_pc,
-                "sd_id": relpc_to_sd_id.get(rel_pc),
+                "sd_id": sd_id,
                 "octave_id": octave_id,
             }
         )
@@ -339,90 +417,126 @@ def build_observer_graph(record: dict[str, Any]) -> HeteroData:
     num_beats = meta.get("num_beats") or 4
 
     theory_ctx = build_theory_context()
-    mode_to_id = theory_ctx["scale_name_to_id"]
-    mode_id = int(mode_to_id.get(meta.get("mode_name"), 0))
+    vocabs = _load_teacher_vocabs()
+    runtime_maps = _build_runtime_id_maps()
+    chord_set_spec = _load_teacher_chord_sets_spec()
 
-    graph["song"].x = __import__("torch").tensor(
+    song_cat = torch.tensor(
         [[
-            float(meta.get("tonic_pc", 0)),
-            float(mode_id),
-            float(meta.get("bpm") or 0.0),
-            float(meta.get("num_beats") or 0.0),
-            float(meta.get("beat_unit") or 0.0),
-            float(meta.get("end_beat") or 0.0),
-            float(len(bars)),
-            float(len(onsets)),
-            float(len(notes)),
-            float(len(chords)),
-        ]]
+            int(encode_with_value_map(runtime_maps["tonic_pc_id_map"], meta.get("tonic_pc"), unknown_id=0)),
+            int(encode_vocab(vocabs["key_scale"], meta.get("mode_name"))),
+            int(encode_with_value_map(runtime_maps["num_beats_id_map"], meta.get("num_beats"), unknown_id=0)),
+            int(encode_with_value_map(runtime_maps["beat_unit_id_map"], meta.get("beat_unit"), unknown_id=0)),
+        ]],
+        dtype=torch.long,
     )
+    song_num = torch.tensor([[float(meta.get("bpm") or 0.0), float(meta.get("end_beat") or 0.0)]], dtype=torch.float)
+    graph["song"].x_cat = song_cat
+    graph["song"].x_num = song_num
+    graph["song"].x = torch.cat([song_cat.float(), song_num], dim=1)
 
-    torch = __import__("torch")
-    graph["bar"].x = torch.tensor(
+    bar_num = torch.tensor(
         [
             [
                 float(bar["bar_index"]),
-                float(bar["bar_index"]) / max(1.0, float(len(bars))),
                 float(bar["start_beat"]),
                 float(bar["end_beat"]),
-                float(sum(1 for o in onsets if o.get("bar_index") == bar["bar_index"])),
                 float(sum(1 for n in notes if n.get("beat") is not None and int(n["beat"] // num_beats) == bar["bar_index"])),
                 float(sum(1 for c in chords if c.get("beat") is not None and int(c["beat"] // num_beats) == bar["bar_index"])),
+                float(sum(1 for o in onsets if o.get("bar_index") == bar["bar_index"])),
             ]
             for bar in bars
         ],
         dtype=torch.float,
-    ) if bars else torch.empty((0, 7), dtype=torch.float)
+    ) if bars else torch.empty((0, 6), dtype=torch.float)
+    graph["bar"].x_cat = torch.empty((bar_num.size(0), 0), dtype=torch.long)
+    graph["bar"].x_num = bar_num
+    graph["bar"].x = bar_num
 
     onset_times = [float(o["onset_time"]) for o in onsets]
-    graph["onset"].x = torch.tensor(
+    onset_num = torch.tensor(
         [
             [
                 float(o.get("beat") or 0.0),
+                float(-1 if o.get("bar_index") is None else o.get("bar_index")),
                 float(o.get("pos_in_bar") or 0.0),
-                float(1.0 if (o.get("pos_in_bar") or 0.0) < ONSET_EPSILON else 0.0),
                 float(sum(1 for n in notes if abs(n["onset_time"] - o["onset_time"]) <= ONSET_EPSILON)),
                 float(sum(1 for c in chords if abs(c["onset_time"] - o["onset_time"]) <= ONSET_EPSILON)),
-                float(1.0 if any(abs(c["onset_time"] - o["onset_time"]) <= ONSET_EPSILON for c in chords) else 0.0),
             ]
             for o in onsets
         ],
         dtype=torch.float,
-    ) if onsets else torch.empty((0, 6), dtype=torch.float)
+    ) if onsets else torch.empty((0, 5), dtype=torch.float)
+    graph["onset"].x_cat = torch.empty((onset_num.size(0), 0), dtype=torch.long)
+    graph["onset"].x_num = onset_num
+    graph["onset"].x = onset_num
 
-    graph["note"].x = torch.tensor(
+    note_cat = torch.tensor(
+        [
+            [
+                int(n.get("sd_id") or 0),
+                int(n.get("octave_id") or 0),
+            ]
+            for n in notes
+        ],
+        dtype=torch.long,
+    ) if notes else torch.empty((0, 2), dtype=torch.long)
+    note_num = torch.tensor(
         [
             [
                 float(n.get("beat") or 0.0),
                 float(n.get("duration_beats") or 0.0),
-                float(n.get("rel_pc") or 0),
-                float(-1 if n.get("sd_id") is None else n.get("sd_id")),
-                float(-1 if n.get("octave_id") is None else n.get("octave_id")),
+                float(-1 if n.get("beat") is None else int((n["beat"] // num_beats))),
+                float(0.0 if n.get("beat") is None else (n["beat"] % num_beats)),
             ]
             for n in notes
         ],
         dtype=torch.float,
-    ) if notes else torch.empty((0, 5), dtype=torch.float)
+    ) if notes else torch.empty((0, 4), dtype=torch.float)
+    graph["note"].x_cat = note_cat
+    graph["note"].x_num = note_num
+    graph["note"].x = torch.cat([note_cat.float(), note_num], dim=1)
 
-    graph["chord"].x = torch.tensor(
-        [
+    chord_cat_rows: list[list[int]] = []
+    chord_num_rows: list[list[float]] = []
+    for chord in chords:
+        borrowed = bool(chord.get("borrowed"))
+        chord_cat_rows.append(
             [
-                float(c.get("beat") or 0.0),
-                float(c.get("duration_beats") or 0.0),
-                float(c.get("root_degree_raw") or 0),
-                float(c.get("type_raw") or 0),
-                float(-1 if c.get("inversion_raw") is None else c.get("inversion_raw")),
-                float(mode_to_id.get(c.get("mode_name"), 0)),
-                float(1 if c.get("borrowed") else 0),
-                float(len(c.get("add_degrees") or [])),
-                float(len(c.get("suspension_degrees") or [])),
-                float(len(c.get("omit_degrees") or [])),
-                float(len(c.get("alteration_tokens") or [])),
+                int(encode_with_value_map(runtime_maps["root_id_map"], chord.get("root_degree_raw"), unknown_id=0)),
+                int(encode_with_value_map(runtime_maps["type_id_map"], chord.get("type_raw"), unknown_id=0)),
+                int(encode_with_value_map(runtime_maps["inversion_id_map"], chord.get("inversion_raw"), unknown_id=0)),
+                int(encode_vocab(vocabs["borrowed_kind"], "mode_name" if borrowed else "none")),
+                int(encode_vocab(vocabs["borrowed_mode_name"], chord.get("mode_name") if borrowed else "<NONE>")),
             ]
-            for c in chords
-        ],
-        dtype=torch.float,
-    ) if chords else torch.empty((0, 11), dtype=torch.float)
+        )
+        adds_vec = _multi_hot(chord.get("add_degrees"), chord_set_spec["adds"]["allowed_values"])
+        omits_vec = _multi_hot(chord.get("omit_degrees"), chord_set_spec["omits"]["allowed_values"])
+        suspensions_vec = _multi_hot(chord.get("suspension_degrees"), chord_set_spec["suspensions"]["allowed_values"])
+        alterations_vec = _multi_hot(chord.get("alteration_tokens"), chord_set_spec["alterations"]["allowed_values"])
+        borrowed_pcset = theory_ctx["mode_to_pcset"].get(chord.get("mode_name"), []) if borrowed else []
+        borrowed_pcset_vec = _fixed_range_multi_hot(borrowed_pcset, chord_set_spec["borrowed_pcset"]["size"])
+        beat = float(chord.get("beat") or 0.0)
+        chord_num_rows.append(
+            [
+                *adds_vec,
+                *omits_vec,
+                *suspensions_vec,
+                *alterations_vec,
+                *borrowed_pcset_vec,
+                beat,
+                float(chord.get("duration_beats") or 0.0),
+                float(-1 if chord.get("beat") is None else int((beat // num_beats))),
+                float(0.0 if chord.get("beat") is None else (beat % num_beats)),
+            ]
+        )
+    chord_cat = torch.tensor(chord_cat_rows, dtype=torch.long) if chord_cat_rows else torch.empty((0, 5), dtype=torch.long)
+    chord_num = torch.tensor(chord_num_rows, dtype=torch.float) if chord_num_rows else torch.empty(
+        (0, sum(CHORD_COMPONENT_SIZES.values()) + 4), dtype=torch.float
+    )
+    graph["chord"].x_cat = chord_cat
+    graph["chord"].x_num = chord_num
+    graph["chord"].x = torch.cat([chord_cat.float(), chord_num], dim=1)
 
     onset_idx = {t: idx for idx, t in enumerate(onset_times)}
 
@@ -432,7 +546,9 @@ def build_observer_graph(record: dict[str, Any]) -> HeteroData:
         )
 
     _edge([(0, i) for i in range(len(bars))], ("song", "contains_bar", "bar"))
+    _edge([(i, i + 1) for i in range(max(0, len(bars) - 1))], ("bar", "next_bar", "bar"))
     _edge([(i, j) for i in range(len(bars)) for j, o in enumerate(onsets) if o.get("bar_index") == i], ("bar", "contains_onset", "onset"))
+    _edge([(i, i + 1) for i in range(max(0, len(onsets) - 1))], ("onset", "next_onset", "onset"))
     _edge(
         [(onset_idx[o], i) for i, n in enumerate(notes) for o in onset_times if abs(n["onset_time"] - o) <= ONSET_EPSILON],
         ("onset", "starts_note", "note"),
@@ -442,21 +558,23 @@ def build_observer_graph(record: dict[str, Any]) -> HeteroData:
         ("onset", "starts_chord", "chord"),
     )
     _edge(
-        [
-            (i, j)
-            for i, bar in enumerate(bars)
-            for j, n in enumerate(notes)
-            if n.get("beat") is not None and bar["start_beat"] <= n["beat"] < bar["end_beat"]
-        ],
-        ("bar", "contains_note", "note"),
+        [(i, i + 1) for i in range(max(0, len(notes) - 1))],
+        ("note", "next_note", "note"),
     )
+    _edge([(i, i + 1) for i in range(max(0, len(chords) - 1))], ("chord", "next_chord", "chord"))
     _edge(
         [
-            (i, j)
-            for i, bar in enumerate(bars)
-            for j, c in enumerate(chords)
-            if c.get("beat") is not None and bar["start_beat"] <= c["beat"] < bar["end_beat"]
+            (chord_idx, note_idx)
+            for chord_idx, chord in enumerate(chords)
+            for note_idx, note in enumerate(notes)
+            if chord.get("beat") is not None
+            and note.get("beat") is not None
+            and chord["beat"] <= note["beat"] < (chord["beat"] + float(chord.get("duration_beats") or 0.0))
         ],
-        ("bar", "contains_chord", "chord"),
+        ("chord", "covers_note", "note"),
     )
+    for edge_type in OBSERVER_EDGE_TYPES:
+        _ = graph[edge_type].edge_index
+    for node_type in ("song", "bar", "onset", "note", "chord"):
+        graph[node_type].num_nodes = int(graph[node_type].x.size(0))
     return graph
