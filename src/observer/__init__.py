@@ -25,6 +25,15 @@ from .chord_parser import (
     score_candidate,
     select_best_candidates,
 )
+from .model import ObserverGNN
+from .schema import (
+    OBSERVER_CAT_FIELDS,
+    OBSERVER_EDGE_TYPES,
+    OBSERVER_NODE_DIMS,
+    OBSERVER_NODE_TYPES,
+    OBSERVER_NUM_FIELDS,
+    build_observer_vocab_sizes,
+)
 
 __all__ = [
     "ONSET_EPSILON",
@@ -47,4 +56,11 @@ __all__ = [
     "predict_chords_for_midi",
     "score_candidate",
     "select_best_candidates",
+    "ObserverGNN",
+    "OBSERVER_NODE_TYPES",
+    "OBSERVER_EDGE_TYPES",
+    "OBSERVER_CAT_FIELDS",
+    "OBSERVER_NUM_FIELDS",
+    "OBSERVER_NODE_DIMS",
+    "build_observer_vocab_sizes",
 ]

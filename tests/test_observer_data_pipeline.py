@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -23,9 +25,19 @@ from src.observer.data_pipeline import (
     extract_observer_note_events,
     load_observer_input_jsonl,
 )
+from src.observer.schema import OBSERVER_CAT_FIELDS, OBSERVER_EDGE_TYPES, OBSERVER_NUM_FIELDS
 
 
 class ObserverDataPipelineTests(unittest.TestCase):
+    def setUp(self):
+        specs_dir = REPO_ROOT / "metadata" / "specs"
+        vocabs_dir = REPO_ROOT / "metadata" / "vocabs"
+        self.spec_global = json.loads((specs_dir / "spec_global.json").read_text(encoding="utf-8"))
+        self.vocab_scale = json.loads((vocabs_dir / "vocab_key_scale.json").read_text(encoding="utf-8"))
+        self.vocab_sd = json.loads((vocabs_dir / "vocab_melody_sd.json").read_text(encoding="utf-8"))
+        self.vocab_borrowed_kind = json.loads((vocabs_dir / "vocab_borrowed_kind.json").read_text(encoding="utf-8"))
+        self.vocab_borrowed_mode = json.loads((vocabs_dir / "vocab_borrowed_mode_name.json").read_text(encoding="utf-8"))
+
     def _fake_pm(self, with_tempo: bool = True, with_meter: bool = True):
         def note(pitch: int, start: float, end: float):
             return SimpleNamespace(pitch=pitch, start=start, end=end)
@@ -208,10 +220,137 @@ class ObserverDataPipelineTests(unittest.TestCase):
 
         graph = build_observer_graph(record)
         self.assertEqual(graph["song"].x.shape[0], 1)
-        self.assertEqual(graph["note"].x.shape[1], 5)
-        self.assertEqual(graph["chord"].x.shape[1], 11)
-        self.assertEqual(graph["song"].x[0, 1].item(), 3.0)  # "minor" scale_id in teacher vocab
+        self.assertEqual(graph["note"].x_cat.shape[1], 2)
+        self.assertEqual(graph["note"].x_num.shape[1], 4)
+        self.assertEqual(graph["chord"].x_cat.shape[1], 5)
+        self.assertEqual(graph["song"].x_cat[0, 1].item(), 3)  # "minor" scale_id in teacher vocab
         self.assertIn(("onset", "starts_note", "note"), graph.edge_types)
+        self.assertIn(("chord", "covers_note", "note"), graph.edge_types)
+
+    def test_teacher_allowed_value_mapping_ids(self):
+        record = {
+            "meta": {"tonic_pc": 11, "mode_name": "major", "num_beats": 4, "beat_unit": 1, "bpm": 120.0, "end_beat": 4.0},
+            "bars": [{"bar_index": 0, "start_beat": 0.0, "end_beat": 4.0}],
+            "onsets": [{"onset_time": 0.0, "beat": 0.0, "bar_index": 0, "pos_in_bar": 0.0}],
+            "notes": [{"onset_time": 0.0, "beat": 0.0, "duration_beats": 1.0, "sd_id": 4, "octave_id": 6, "is_rest": False}],
+            "chords": [{
+                "onset_time": 0.0,
+                "beat": 0.0,
+                "duration_beats": 1.0,
+                "root_degree_raw": 7,
+                "type_raw": 13,
+                "inversion_raw": 3,
+                "mode_name": "major",
+                "borrowed": False,
+                "add_degrees": [],
+                "suspension_degrees": [],
+                "omit_degrees": [],
+                "alteration_tokens": [],
+            }],
+        }
+        graph = build_observer_graph(record)
+        self.assertEqual(graph["song"].x_cat[0, 0].item(), 12)  # tonic 11 -> idx+1
+        self.assertEqual(graph["song"].x_cat[0, 2].item(), 3)   # num_beats=4 -> idx+1 in [2,3,4,6]
+        self.assertEqual(graph["song"].x_cat[0, 3].item(), 1)   # beat_unit=1 -> idx+1
+        self.assertEqual(graph["chord"].x_cat[0, 0].item(), 8)  # root_raw 7 -> idx+1
+        self.assertEqual(graph["chord"].x_cat[0, 1].item(), 5)  # type 13 -> idx+1 among [5,7,9,11,13]
+        self.assertEqual(graph["chord"].x_cat[0, 2].item(), 4)  # inversion 3 -> idx+1
+
+    def test_unknown_allowed_value_maps_to_zero(self):
+        record = {
+            "meta": {"tonic_pc": 99, "mode_name": "major", "num_beats": 99, "beat_unit": 99, "bpm": 120.0, "end_beat": 4.0},
+            "bars": [],
+            "onsets": [],
+            "notes": [],
+            "chords": [{
+                "onset_time": 0.0,
+                "beat": 0.0,
+                "duration_beats": 1.0,
+                "root_degree_raw": 99,
+                "type_raw": 99,
+                "inversion_raw": 99,
+                "mode_name": "major",
+                "borrowed": False,
+                "add_degrees": [],
+                "suspension_degrees": [],
+                "omit_degrees": [],
+                "alteration_tokens": [],
+            }],
+        }
+        graph = build_observer_graph(record)
+        self.assertEqual(graph["song"].x_cat[0, 0].item(), 0)
+        self.assertEqual(graph["song"].x_cat[0, 2].item(), 0)
+        self.assertEqual(graph["song"].x_cat[0, 3].item(), 0)
+        self.assertTrue((graph["chord"].x_cat[0, :3] == 0).all().item())
+
+    def test_vocab_coded_fields_use_teacher_vocab_space(self):
+        record = {
+            "meta": {"tonic_pc": 0, "mode_name": "minor", "num_beats": 4, "beat_unit": 1, "bpm": 120.0, "end_beat": 4.0},
+            "bars": [{"bar_index": 0, "start_beat": 0.0, "end_beat": 4.0}],
+            "onsets": [{"onset_time": 0.0, "beat": 0.0, "bar_index": 0, "pos_in_bar": 0.0}],
+            "notes": [{"onset_time": 0.0, "beat": 0.0, "duration_beats": 1.0, "sd_id": self.vocab_sd["1"], "octave_id": 6, "is_rest": False}],
+            "chords": [{
+                "onset_time": 0.0,
+                "beat": 0.0,
+                "duration_beats": 1.0,
+                "root_degree_raw": 0,
+                "type_raw": 5,
+                "inversion_raw": 0,
+                "mode_name": "dorian",
+                "borrowed": True,
+                "add_degrees": [],
+                "suspension_degrees": [],
+                "omit_degrees": [],
+                "alteration_tokens": [],
+            }],
+        }
+        graph = build_observer_graph(record)
+        self.assertEqual(graph["song"].x_cat[0, 1].item(), self.vocab_scale["minor"])
+        self.assertEqual(graph["note"].x_cat[0, 0].item(), self.vocab_sd["1"])
+        self.assertEqual(graph["chord"].x_cat[0, 3].item(), self.vocab_borrowed_kind["mode_name"])
+        self.assertEqual(graph["chord"].x_cat[0, 4].item(), self.vocab_borrowed_mode["dorian"])
+
+    def test_borrowed_pcset_vec_behavior(self):
+        record = {
+            "meta": {"tonic_pc": 0, "mode_name": "major", "num_beats": 4, "beat_unit": 1, "bpm": 120.0, "end_beat": 4.0},
+            "bars": [{"bar_index": 0, "start_beat": 0.0, "end_beat": 4.0}],
+            "onsets": [{"onset_time": 0.0, "beat": 0.0, "bar_index": 0, "pos_in_bar": 0.0}],
+            "notes": [],
+            "chords": [
+                {"onset_time": 0.0, "beat": 0.0, "duration_beats": 1.0, "root_degree_raw": 0, "type_raw": 5, "inversion_raw": 0, "mode_name": "major", "borrowed": False, "add_degrees": [], "suspension_degrees": [], "omit_degrees": [], "alteration_tokens": []},
+                {"onset_time": 1.0, "beat": 1.0, "duration_beats": 1.0, "root_degree_raw": 1, "type_raw": 7, "inversion_raw": 1, "mode_name": "dorian", "borrowed": True, "add_degrees": [], "suspension_degrees": [], "omit_degrees": [], "alteration_tokens": []},
+            ],
+        }
+        graph = build_observer_graph(record)
+        borrowed_slice_start = 6 + 2 + 2 + 6
+        borrowed_slice_end = borrowed_slice_start + 12
+        non_borrowed_vec = graph["chord"].x_num[0, borrowed_slice_start:borrowed_slice_end]
+        borrowed_vec = graph["chord"].x_num[1, borrowed_slice_start:borrowed_slice_end]
+        self.assertTrue(torch.equal(non_borrowed_vec, torch.zeros_like(non_borrowed_vec)))
+        self.assertGreater(float(borrowed_vec.sum().item()), 0.0)
+
+    def test_graph_contract_and_reverse_edges_policy(self):
+        record = {
+            "meta": {"tonic_pc": 0, "mode_name": "minor", "num_beats": 4, "beat_unit": 1, "bpm": 120.0, "end_beat": 4.0},
+            "bars": [{"bar_index": 0, "start_beat": 0.0, "end_beat": 4.0}],
+            "onsets": [{"onset_time": 0.0, "beat": 0.0, "bar_index": 0, "pos_in_bar": 0.0}],
+            "notes": [{"onset_time": 0.0, "beat": 0.0, "duration_beats": 1.0, "sd_id": 4, "octave_id": 6}],
+            "chords": [{"onset_time": 0.0, "beat": 0.0, "duration_beats": 1.0, "root_degree_raw": 0, "type_raw": 5, "inversion_raw": 0, "mode_name": "minor", "borrowed": False, "add_degrees": [], "suspension_degrees": [], "omit_degrees": [], "alteration_tokens": []}],
+        }
+        graph = build_observer_graph(record)
+        for node_type in ("song", "bar", "onset", "note", "chord"):
+            self.assertEqual(graph[node_type].x_cat.dtype, torch.long)
+            self.assertEqual(graph[node_type].x_num.dtype, torch.float)
+            self.assertEqual(graph[node_type].x_cat.shape[1], len(OBSERVER_CAT_FIELDS[node_type]))
+            self.assertEqual(graph[node_type].x_num.shape[1], len(OBSERVER_NUM_FIELDS[node_type]))
+            self.assertTrue(torch.equal(graph[node_type].x, torch.cat([graph[node_type].x_cat.float(), graph[node_type].x_num], dim=1)))
+        self.assertTrue((graph["note"].x_cat >= 0).all().item())
+        self.assertTrue((graph["chord"].x_cat >= 0).all().item())
+        self.assertEqual(set(graph.edge_types), set(OBSERVER_EDGE_TYPES))
+        self.assertNotIn(("bar", "rev_contains_bar", "song"), graph.edge_types)
+        self.assertNotIn("applied_id", OBSERVER_CAT_FIELDS["chord"])
+        self.assertNotIn("is_rest", OBSERVER_CAT_FIELDS["note"])
+        self.assertNotIn("is_rest", OBSERVER_CAT_FIELDS["chord"])
 
 
 if __name__ == "__main__":
