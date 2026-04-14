@@ -6,3 +6,4 @@ outputs/
 multirun/
 __pycache__
 teacher_encoded.json
+data/HTCanon/encoded_full/teacher_encoded.json
