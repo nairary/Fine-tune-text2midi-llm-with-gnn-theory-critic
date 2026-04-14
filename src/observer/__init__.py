@@ -1,5 +1,17 @@
 """Observer utilities."""
 
+from .data_pipeline import (
+    ONSET_EPSILON,
+    build_bar_events,
+    build_observer_chord_events,
+    build_observer_graph,
+    build_observer_song_record,
+    build_onset_events,
+    extract_observer_meta,
+    extract_observer_note_events,
+    load_observer_input_jsonl,
+)
+
 from .chord_parser import (
     ChordCandidate,
     build_body_from_tertian_row,
@@ -15,6 +27,15 @@ from .chord_parser import (
 )
 
 __all__ = [
+    "ONSET_EPSILON",
+    "build_bar_events",
+    "build_observer_chord_events",
+    "build_observer_graph",
+    "build_observer_song_record",
+    "build_onset_events",
+    "extract_observer_meta",
+    "extract_observer_note_events",
+    "load_observer_input_jsonl",
     "ChordCandidate",
     "build_body_from_tertian_row",
     "build_sounding_sonority",
