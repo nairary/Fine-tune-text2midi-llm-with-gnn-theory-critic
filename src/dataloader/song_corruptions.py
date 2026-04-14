@@ -20,16 +20,36 @@ from .theory_helpers import (
     try_parse_float,
 )
 
+MIDI_MIN_PITCH = 0
+MIDI_MAX_PITCH = 127
+DEFAULT_EPSILON = 1e-4
+
+STRICT_BENIGN_CORRUPTIONS = [
+    "transpose_with_tonic_shift",
+    "merge_repeated_melody_notes",
+    "split_long_melody_note",
+]
+
+NEAR_BENIGN_CORRUPTIONS = [
+    "melody_octave_shift",
+    "drop_tonic_seventh_on_strong_beat",
+]
+
 
 def _identity_metadata(mode: str) -> dict:
     return {
         "mode": mode,
         "mode_family": "theory_aware",
         "applied": False,
+        "corruption_name": mode,
+        "corruption_params": {},
+        "reason_skipped": None,
         "topology_changed": False,
         "note_corrupted_indices": [],
         "chord_corrupted_indices": [],
         "onset_corrupted_indices": [],
+        "n_notes_modified": 0,
+        "n_chords_modified": 0,
         "details": {},
     }
 
@@ -83,6 +103,338 @@ def _pick_sd_id_for_pc(
             candidates.append(int(sd_id))
     return int(rng.choice(candidates)) if candidates else None
 
+
+def _extract_tonic_pc(meta: dict) -> tuple[str | None, int | None]:
+    for key in ("main_key_tonic_pc", "tonic_pc"):
+        raw = meta.get(key)
+        if raw is None:
+            continue
+        try:
+            return key, int(raw) % 12
+        except (TypeError, ValueError):
+            continue
+    return None, None
+
+
+def _tonic_pc_to_id(tonic_pc: int) -> int:
+    return (int(tonic_pc) % 12) + 1
+
+
+def _transpose_tonic_fields(song_obj: dict, semitones: int) -> tuple[bool, dict]:
+    meta = song_obj.get("meta", {})
+    changed = False
+    details: dict[str, int] = {}
+
+    tonic_key, tonic_pc = _extract_tonic_pc(meta)
+    if tonic_key is not None and tonic_pc is not None:
+        new_pc = (int(tonic_pc) + int(semitones)) % 12
+        meta[tonic_key] = new_pc
+        details["original_tonic_pc"] = int(tonic_pc)
+        details["new_tonic_pc"] = int(new_pc)
+        changed = True
+
+    if "main_key_tonic_pc_id" in meta and meta.get("main_key_tonic_pc_id") is not None:
+        try:
+            old_id = int(meta.get("main_key_tonic_pc_id"))
+            old_pc = (old_id - 1) % 12
+            new_pc = (old_pc + int(semitones)) % 12
+            meta["main_key_tonic_pc_id"] = _tonic_pc_to_id(new_pc)
+            if "original_tonic_pc" not in details:
+                details["original_tonic_pc"] = old_pc
+                details["new_tonic_pc"] = new_pc
+            changed = True
+        except (TypeError, ValueError):
+            pass
+
+    for region_key in ("key_regions", "keys", "key_changes"):
+        regions = song_obj.get(region_key)
+        if not isinstance(regions, list):
+            continue
+        for region in regions:
+            if not isinstance(region, dict):
+                continue
+            if region.get("tonic_pc") is not None:
+                try:
+                    region["tonic_pc"] = (int(region["tonic_pc"]) + int(semitones)) % 12
+                    changed = True
+                except (TypeError, ValueError):
+                    pass
+            if region.get("tonic_pc_id") is not None:
+                try:
+                    old_id = int(region["tonic_pc_id"])
+                    old_pc = (old_id - 1) % 12
+                    region["tonic_pc_id"] = _tonic_pc_to_id(old_pc + int(semitones))
+                    changed = True
+                except (TypeError, ValueError):
+                    pass
+    return changed, details
+
+
+def _melody_events(song_obj: dict) -> tuple[str | None, list[dict]]:
+    melody = song_obj.get("melody")
+    if isinstance(melody, list):
+        return "melody", melody
+    notes = song_obj.get("notes")
+    if isinstance(notes, list):
+        return "notes", notes
+    return None, []
+
+
+def _note_interval(note: dict) -> tuple[float | None, float | None]:
+    start = try_parse_float(note.get("beat"))
+    duration = try_parse_float(note.get("duration"))
+    if duration is None:
+        duration = try_parse_float(note.get("duration_beats"))
+    if start is not None and duration is not None:
+        return start, start + duration
+    onset = try_parse_float(note.get("onset_time"))
+    offset = try_parse_float(note.get("offset_time"))
+    return onset, offset
+
+
+def _set_note_interval(note: dict, start: float, end: float):
+    if "beat" in note:
+        note["beat"] = start
+    duration = max(0.0, end - start)
+    if "duration" in note:
+        note["duration"] = duration
+    if "duration_beats" in note:
+        note["duration_beats"] = duration
+    if "onset_time" in note:
+        note["onset_time"] = start
+    if "offset_time" in note:
+        note["offset_time"] = end
+
+
+def _has_pitch_in_midi_range(events: list[dict], shift: int) -> bool:
+    for event in events:
+        if "pitch" not in event:
+            continue
+        try:
+            new_pitch = int(event["pitch"]) + int(shift)
+        except (TypeError, ValueError):
+            return False
+        if new_pitch < MIDI_MIN_PITCH or new_pitch > MIDI_MAX_PITCH:
+            return False
+    return True
+
+
+def _corrupt_transpose_with_tonic_shift(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("transpose_with_tonic_shift")
+    semitones = list(corruption_cfg.get("transpose_semitones", [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]))
+    if not semitones:
+        metadata["reason_skipped"] = "empty_semitone_candidates"
+        return song_obj, metadata, False
+    k = int(rng.choice(semitones))
+
+    tracks = []
+    for key in ("melody", "notes", "chords", "bass"):
+        events = song_obj.get(key)
+        if isinstance(events, list):
+            tracks.extend(events)
+    tracks = [event for event in tracks if isinstance(event, dict)]
+    pitch_events = [event for event in tracks if "pitch" in event]
+    if pitch_events and not _has_pitch_in_midi_range(pitch_events, k):
+        metadata["reason_skipped"] = "pitch_out_of_midi_range_after_shift"
+        return song_obj, metadata, False
+
+    changed_tonic, tonic_details = _transpose_tonic_fields(song_obj, semitones=k)
+    if not changed_tonic and not pitch_events:
+        metadata["reason_skipped"] = "missing_tonic_pc"
+        return song_obj, metadata, False
+
+    for event in pitch_events:
+        event["pitch"] = int(event["pitch"]) + k
+    metadata.update({
+        "applied": True,
+        "n_notes_modified": len(pitch_events),
+        "corruption_params": {"k": k},
+        "details": {
+            **tonic_details,
+            "tonic_shift_applied": bool(changed_tonic),
+            "n_pitch_events_modified": len(pitch_events),
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_melody_octave_shift(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("melody_octave_shift")
+    melody_key, melody = _melody_events(song_obj)
+    if not melody_key:
+        metadata["reason_skipped"] = "melody_track_not_found"
+        return song_obj, metadata, False
+    non_rest_notes = [note for note in melody if int(note.get("is_rest", 0)) == 0]
+    if not non_rest_notes:
+        metadata["reason_skipped"] = "no_non_rest_melody_notes"
+        return song_obj, metadata, False
+
+    options = list(corruption_cfg.get("melody_octave_shifts", [-12, 12]))
+    rng.shuffle(options)
+    for shift in options:
+        if not _has_pitch_in_midi_range(non_rest_notes, int(shift)):
+            continue
+        for note in non_rest_notes:
+            if "pitch" in note:
+                note["pitch"] = int(note["pitch"]) + int(shift)
+            if "octave_id" in note:
+                note["octave_id"] = int(note["octave_id"]) + (int(shift) // 12)
+        metadata.update({
+            "applied": True,
+            "n_notes_modified": len(non_rest_notes),
+            "corruption_params": {"octave_shift": int(shift)},
+            "details": {"melody_key": melody_key},
+        })
+        return song_obj, metadata, True
+
+    metadata["reason_skipped"] = "pitch_out_of_midi_range_after_shift"
+    return song_obj, metadata, False
+
+
+def _corrupt_merge_repeated_melody_notes(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("merge_repeated_melody_notes")
+    _, melody = _melody_events(song_obj)
+    if not melody:
+        metadata["reason_skipped"] = "melody_track_not_found"
+        return song_obj, metadata, False
+    eps = safe_float(corruption_cfg.get("merge_notes_eps", DEFAULT_EPSILON), DEFAULT_EPSILON)
+    merged_indices = []
+    i = 0
+    while i < len(melody) - 1:
+        curr, nxt = melody[i], melody[i + 1]
+        if int(curr.get("is_rest", 0)) == 1 or int(nxt.get("is_rest", 0)) == 1:
+            i += 1
+            continue
+        curr_pitch_sig = (curr.get("pitch"), curr.get("sd_id"), curr.get("octave_id"))
+        next_pitch_sig = (nxt.get("pitch"), nxt.get("sd_id"), nxt.get("octave_id"))
+        if curr_pitch_sig != next_pitch_sig:
+            i += 1
+            continue
+        curr_start, curr_end = _note_interval(curr)
+        next_start, next_end = _note_interval(nxt)
+        if None in (curr_start, curr_end, next_start, next_end):
+            i += 1
+            continue
+        if abs(next_start - curr_end) > eps:
+            i += 1
+            continue
+        _set_note_interval(curr, float(curr_start), float(next_end))
+        del melody[i + 1]
+        merged_indices.append(i)
+        continue
+    if not merged_indices:
+        metadata["reason_skipped"] = "no_mergeable_repeated_notes"
+        return song_obj, metadata, False
+    metadata.update({
+        "applied": True,
+        "n_notes_modified": len(merged_indices) + 1,
+        "note_corrupted_indices": sorted(set(merged_indices)),
+        "corruption_params": {"eps": eps},
+        "details": {"merged_groups_count": len(merged_indices)},
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_split_long_melody_note(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("split_long_melody_note")
+    _, melody = _melody_events(song_obj)
+    if not melody:
+        metadata["reason_skipped"] = "melody_track_not_found"
+        return song_obj, metadata, False
+    min_duration = safe_float(corruption_cfg.get("split_min_duration_beats", 1.0), 1.0)
+    eps = safe_float(corruption_cfg.get("split_notes_eps", DEFAULT_EPSILON), DEFAULT_EPSILON)
+    candidate_indices = list(range(len(melody)))
+    rng.shuffle(candidate_indices)
+    for idx in candidate_indices:
+        note = melody[idx]
+        if int(note.get("is_rest", 0)) == 1:
+            continue
+        start, end = _note_interval(note)
+        if start is None or end is None:
+            continue
+        duration = end - start
+        if duration < min_duration:
+            continue
+        split_point = start + duration / 2.0
+        if split_point - start <= eps or end - split_point <= eps:
+            continue
+        if idx + 1 < len(melody):
+            next_start, _ = _note_interval(melody[idx + 1])
+            if next_start is not None and split_point > next_start + eps:
+                continue
+        left = copy.deepcopy(note)
+        right = copy.deepcopy(note)
+        _set_note_interval(left, float(start), float(split_point))
+        _set_note_interval(right, float(split_point), float(end))
+        melody[idx] = left
+        melody.insert(idx + 1, right)
+        metadata.update({
+            "applied": True,
+            "n_notes_modified": 2,
+            "note_corrupted_indices": [idx, idx + 1],
+            "corruption_params": {"min_duration_beats": min_duration, "split_mode": "half"},
+            "details": {"split_point": split_point},
+        })
+        return song_obj, metadata, True
+    metadata["reason_skipped"] = "no_splittable_melody_note"
+    return song_obj, metadata, False
+
+
+def _corrupt_drop_tonic_seventh_on_strong_beat(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("drop_tonic_seventh_on_strong_beat")
+    chords = song_obj.get("chords", [])
+    if not chords:
+        metadata["reason_skipped"] = "no_chords_found"
+        return song_obj, metadata, False
+    strong_positions = {float(x) for x in corruption_cfg.get("strong_positions", [0.0])}
+
+    chord_indices = list(range(len(chords)))
+    rng.shuffle(chord_indices)
+    for idx in chord_indices:
+        chord = chords[idx]
+        pos_in_bar = try_parse_float(chord.get("pos_in_bar"))
+        if pos_in_bar is None:
+            beat = try_parse_float(chord.get("beat"))
+            if beat is None:
+                continue
+            num_beats = safe_float(song_obj.get("meta", {}).get("num_beats", 4.0), 4.0)
+            pos_in_bar = (beat % num_beats + num_beats) % num_beats
+        if all(abs(pos_in_bar - strong) > DEFAULT_EPSILON for strong in strong_positions):
+            continue
+        root_degree_raw = chord.get("root_degree_raw")
+        type_raw = chord.get("type_raw")
+        if root_degree_raw is None and chord.get("root_id") is not None and isinstance(theory_ctx, dict):
+            try:
+                root_degree_raw = theory_ctx.get("root_id_to_raw", {}).get(int(chord.get("root_id")))
+            except (TypeError, ValueError):
+                root_degree_raw = None
+        if type_raw is None and chord.get("type_id") is not None and isinstance(theory_ctx, dict):
+            try:
+                type_raw = theory_ctx.get("type_id_to_raw", {}).get(int(chord.get("type_id")))
+            except (TypeError, ValueError):
+                type_raw = None
+        if root_degree_raw is None or type_raw is None:
+            continue
+        if int(root_degree_raw) != 0 or int(type_raw) not in {7, 9, 11, 13}:
+            continue
+        chord["type_raw"] = 5
+        if chord.get("type_id") is not None and isinstance(theory_ctx, dict):
+            raw_to_type_id = {int(raw): int(type_id) for type_id, raw in theory_ctx.get("type_id_to_raw", {}).items()}
+            triad_id = raw_to_type_id.get(5)
+            if triad_id is not None:
+                chord["type_id"] = int(triad_id)
+        if isinstance(chord.get("add_degrees"), list):
+            chord["add_degrees"] = [int(x) for x in chord["add_degrees"] if int(x) != 7]
+        metadata.update({
+            "applied": True,
+            "n_chords_modified": 1,
+            "chord_corrupted_indices": [idx],
+            "corruption_params": {"strong_positions": sorted(strong_positions)},
+            "details": {"type_raw_before": int(type_raw), "type_raw_after": 5},
+        })
+        return song_obj, metadata, True
+    metadata["reason_skipped"] = "no_matching_tonic_seventh_on_strong_beat"
+    return song_obj, metadata, False
 
 def _corrupt_strongbeat_nonchord_note(song_obj, theory_ctx, rng, corruption_cfg):
     metadata = _identity_metadata("strongbeat_nonchord_note")
@@ -641,6 +993,11 @@ def _not_implemented_mode(song_obj, theory_ctx, rng, corruption_cfg, mode_name: 
 
 
 _CORRUPTION_REGISTRY: dict[str, Callable] = {
+    "transpose_with_tonic_shift": _corrupt_transpose_with_tonic_shift,
+    "melody_octave_shift": _corrupt_melody_octave_shift,
+    "merge_repeated_melody_notes": _corrupt_merge_repeated_melody_notes,
+    "split_long_melody_note": _corrupt_split_long_melody_note,
+    "drop_tonic_seventh_on_strong_beat": _corrupt_drop_tonic_seventh_on_strong_beat,
     "strongbeat_nonchord_note": _corrupt_strongbeat_nonchord_note,
     "borrowed_melody_conflict": _corrupt_borrowed_melody_conflict,
     "borrowed_kind_toggle_without_melody_change": _corrupt_borrowed_kind_toggle,
@@ -682,6 +1039,15 @@ def corrupt_song_obj(song_obj, corruption_modes, corruption_cfg, theory_ctx, rng
         song_candidate = copy.deepcopy(song_corrupted)
         _, metadata, applied = _CORRUPTION_REGISTRY[mode](song_candidate, theory_ctx, rng, corruption_cfg)
         if applied:
+            metadata["corruption_name"] = mode
+            metadata["reason_skipped"] = None
             return song_candidate, metadata
+        metadata["corruption_name"] = mode
+        metadata["applied"] = False
+        if not metadata.get("reason_skipped"):
+            metadata["reason_skipped"] = "not_applicable"
 
-    return song_corrupted, _identity_metadata("identity")
+    identity = _identity_metadata("identity")
+    identity["corruption_name"] = "identity"
+    identity["reason_skipped"] = "no_applicable_corruption_found"
+    return song_corrupted, identity
