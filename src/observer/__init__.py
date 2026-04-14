@@ -26,6 +26,7 @@ from .chord_parser import (
     select_best_candidates,
 )
 from .model import ObserverGNN
+from .dataset import ObserverDataset
 from .schema import (
     OBSERVER_CAT_FIELDS,
     OBSERVER_EDGE_TYPES,
@@ -57,6 +58,7 @@ __all__ = [
     "score_candidate",
     "select_best_candidates",
     "ObserverGNN",
+    "ObserverDataset",
     "OBSERVER_NODE_TYPES",
     "OBSERVER_EDGE_TYPES",
     "OBSERVER_CAT_FIELDS",
