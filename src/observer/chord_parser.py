@@ -446,25 +446,65 @@ def _serialize_candidate(
     return payload
 
 
-def predict_chords_for_midi(
-    midi_path: str,
+def _observer_event_from_candidate(
+    candidate: ChordCandidate,
+    onset_time: float,
+    offset_time: float,
+    score_source: str,
+) -> dict[str, Any]:
+    return {
+        "onset_time": float(onset_time),
+        "offset_time": float(offset_time),
+        "root_degree_raw": int(candidate.root_degree_raw),
+        "type_raw": int(candidate.type_raw),
+        "inversion_raw": None if candidate.inversion_raw is None else int(candidate.inversion_raw),
+        "mode_name": candidate.mode_name,
+        "borrowed": bool(candidate.borrowed),
+        "add_degrees": [int(v) for v in candidate.add_degrees],
+        "suspension_degrees": [int(v) for v in candidate.suspension_degrees],
+        "omit_degrees": [int(v) for v in candidate.omit_degrees],
+        "alteration_tokens": list(candidate.alteration_tokens),
+        "score": float(candidate.score),
+        "score_source": score_source,
+    }
+
+
+def _merge_signature(event: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        event["root_degree_raw"],
+        event["type_raw"],
+        event["inversion_raw"],
+        event["mode_name"],
+        event["borrowed"],
+        tuple(event["add_degrees"]),
+        tuple(event["suspension_degrees"]),
+        tuple(event["omit_degrees"]),
+        tuple(event["alteration_tokens"]),
+    )
+
+
+def merge_consecutive_observer_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not events:
+        return []
+    merged = [dict(events[0])]
+    for current in events[1:]:
+        if _merge_signature(merged[-1]) == _merge_signature(current):
+            # Keep the first event score/score_source for stable, deterministic merges.
+            merged[-1]["offset_time"] = float(current["offset_time"])
+        else:
+            merged.append(dict(current))
+    return merged
+
+
+def _predict_debug_onsets(
+    target_instrument: Any,
     tonic_pc: int,
     main_mode: str,
-    instrument_name: str = "chords",
-    include_all_candidates: bool = False,
-    include_score_breakdown: bool = False,
-    weights_yaml: str | None = None,
+    theory_ctx: dict[str, Any],
+    include_all_candidates: bool,
+    include_score_breakdown: bool,
+    learned_weights: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    if not 0 <= int(tonic_pc) <= 11:
-        raise ValueError("tonic_pc must be in [0, 11]")
-
-    import pretty_midi
-
-    pm = pretty_midi.PrettyMIDI(str(midi_path))
-    theory_ctx = build_theory_context()
-    learned_weights = load_learned_weights(weights_yaml)
-
-    target_instrument = select_target_instrument(pm, instrument_name=instrument_name)
     results: list[dict[str, Any]] = []
     for onset_time in extract_harmonic_onsets(target_instrument):
         sonority = build_sounding_sonority(target_instrument, onset_time)
@@ -511,56 +551,165 @@ def predict_chords_for_midi(
                 ],
             }
         )
-
     return results
 
 
+def _predict_observer_events(
+    target_instrument: Any,
+    tonic_pc: int,
+    main_mode: str,
+    theory_ctx: dict[str, Any],
+    learned_weights: dict[str, Any] | None,
+    merge_consecutive: bool,
+) -> list[dict[str, Any]]:
+    # Observer events are emitted only on note onsets; each onset is evaluated with
+    # the full sounding sonority at that moment. Harmonic changes caused only by
+    # note releases (without a new onset) do not create additional events.
+    onsets = extract_harmonic_onsets(target_instrument)
+    provisional_events: list[tuple[float, ChordCandidate, str]] = []
+    for onset_time in onsets:
+        sonority = build_sounding_sonority(target_instrument, onset_time)
+        observed_pcs = sonority["observed_pcs"]
+        if len(observed_pcs) < 3:
+            continue
+
+        rel_observed_pcs = sorted({(pc - tonic_pc) % 12 for pc in observed_pcs})
+        bass_pc = sonority["bass_pc"]
+        rel_bass_pc = None if bass_pc is None else (bass_pc - tonic_pc) % 12
+
+        candidates = generate_all_candidates(rel_observed_pcs, rel_bass_pc, main_mode, theory_ctx)
+        sorted_candidates, _, score_source = rerank_candidates_with_learned_weights(
+            candidates,
+            observed_pcs=rel_observed_pcs,
+            bass_pc=rel_bass_pc,
+            main_mode=main_mode,
+            theory_ctx=theory_ctx,
+            learned_weights=learned_weights,
+        )
+        if not sorted_candidates:
+            continue
+        top1 = sorted_candidates[0]
+        provisional_events.append((float(onset_time), top1, score_source))
+
+    events: list[dict[str, Any]] = []
+    if provisional_events:
+        max_end = max((float(note.end) for note in target_instrument.notes), default=float(provisional_events[-1][0]))
+        for idx, (onset_time, candidate, score_source) in enumerate(provisional_events):
+            if idx + 1 < len(provisional_events):
+                offset_time = float(provisional_events[idx + 1][0])
+            else:
+                offset_time = max_end
+            events.append(
+                _observer_event_from_candidate(
+                    candidate=candidate,
+                    onset_time=onset_time,
+                    offset_time=offset_time,
+                    score_source=score_source,
+                )
+            )
+    if merge_consecutive:
+        return merge_consecutive_observer_events(events)
+    return events
+
+
+def predict_observer_chords_for_midi(
+    midi_path: str,
+    tonic_pc: int,
+    main_mode: str,
+    instrument_name: str = "chords",
+    weights_yaml: str | None = None,
+    merge_consecutive: bool = True,
+) -> list[dict[str, Any]]:
+    """
+    Predict observer-level chord events from a target MIDI instrument.
+
+    Events are considered only at note onset times of the target instrument, and
+    each onset is analyzed using the sounding sonority (all currently sounding
+    notes). This means harmony changes caused only by note releases are not
+    emitted as separate events until a subsequent onset appears.
+    """
+    if not 0 <= int(tonic_pc) <= 11:
+        raise ValueError("tonic_pc must be in [0, 11]")
+
+    import pretty_midi
+
+    pm = pretty_midi.PrettyMIDI(str(midi_path))
+    theory_ctx = build_theory_context()
+    if main_mode not in theory_ctx["mode_to_pcset"]:
+        raise ValueError(f"Unknown main_mode: {main_mode}")
+    learned_weights = load_learned_weights(weights_yaml)
+    target_instrument = select_target_instrument(pm, instrument_name=instrument_name)
+    return _predict_observer_events(
+        target_instrument=target_instrument,
+        tonic_pc=tonic_pc,
+        main_mode=main_mode,
+        theory_ctx=theory_ctx,
+        learned_weights=learned_weights,
+        merge_consecutive=merge_consecutive,
+    )
+
+
+def predict_chords_for_midi(
+    midi_path: str,
+    tonic_pc: int,
+    main_mode: str,
+    instrument_name: str = "chords",
+    include_all_candidates: bool = False,
+    include_score_breakdown: bool = False,
+    weights_yaml: str | None = None,
+) -> list[dict[str, Any]]:
+    if not 0 <= int(tonic_pc) <= 11:
+        raise ValueError("tonic_pc must be in [0, 11]")
+
+    import pretty_midi
+
+    pm = pretty_midi.PrettyMIDI(str(midi_path))
+    theory_ctx = build_theory_context()
+    if main_mode not in theory_ctx["mode_to_pcset"]:
+        raise ValueError(f"Unknown main_mode: {main_mode}")
+    learned_weights = load_learned_weights(weights_yaml)
+
+    target_instrument = select_target_instrument(pm, instrument_name=instrument_name)
+    return _predict_debug_onsets(
+        target_instrument=target_instrument,
+        tonic_pc=tonic_pc,
+        main_mode=main_mode,
+        theory_ctx=theory_ctx,
+        include_all_candidates=include_all_candidates,
+        include_score_breakdown=include_score_breakdown,
+        learned_weights=learned_weights,
+    )
+
+
 def _cli() -> None:
+    theory_ctx = build_theory_context()
     parser = argparse.ArgumentParser(description="Predict onset-level chord candidates from MIDI.")
     parser.add_argument("--midi-path", required=True)
     parser.add_argument("--tonic-pc", required=True, type=int)
-    parser.add_argument("--mode", required=True, choices=["major", "minor"])
-    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--mode", required=True, choices=sorted(theory_ctx["mode_to_pcset"].keys()))
     parser.add_argument("--pretty", action="store_true")
     parser.add_argument("--json-out", type=str, default=None)
     parser.add_argument("--instrument-name", type=str, default="chords")
-    parser.add_argument("--all-candidates", action="store_true")
-    parser.add_argument("--debug-score", action="store_true")
     parser.add_argument("--weights-yaml", type=str, default=None)
+    parser.add_argument("--no-merge", action="store_true")
     args = parser.parse_args()
 
-    predictions = predict_chords_for_midi(
+    predictions = predict_observer_chords_for_midi(
         args.midi_path,
         args.tonic_pc,
         args.mode,
         instrument_name=args.instrument_name,
-        include_all_candidates=args.all_candidates,
-        include_score_breakdown=args.debug_score,
         weights_yaml=args.weights_yaml,
+        merge_consecutive=not args.no_merge,
     )
 
-    if args.top_k is not None and args.top_k > 0:
-        for onset_payload in predictions:
-            candidate_key = "candidates" if args.all_candidates else "best_candidates"
-            onset_payload[candidate_key] = onset_payload[candidate_key][: args.top_k]
-
     if args.pretty:
-        for onset_payload in predictions:
-            print(f"onset={onset_payload['onset_time']:.3f}s pcs={onset_payload['observed_pcs']}")
-            candidate_key = "candidates" if args.all_candidates else "best_candidates"
-            for idx, candidate in enumerate(onset_payload[candidate_key], start=1):
-                print(
-                    f"  [{idx}] mode={candidate['mode_name']} borrowed={candidate['borrowed']} "
-                    f"root={candidate['root_degree_raw']} type={candidate['type_raw']} inv={candidate['inversion_raw']} "
-                    f"adds={candidate['add_degrees']} sus={candidate['suspension_degrees']} "
-                    f"omits={candidate['omit_degrees']} alt={candidate['alteration_tokens']} score={candidate['score']}"
-                )
-                if args.debug_score:
-                    if "score_breakdown" in candidate:
-                        for term in candidate["score_breakdown"]["human_readable_terms"]:
-                            print(f"      {term}")
-                    if "score_breakdown_weighted" in candidate:
-                        print(f"      weighted_total={candidate['score_breakdown_weighted']['total']}")
+        for idx, event in enumerate(predictions, start=1):
+            print(
+                f"[{idx}] onset={event['onset_time']:.3f}s offset={event['offset_time']:.3f}s "
+                f"mode={event['mode_name']} root={event['root_degree_raw']} type={event['type_raw']} "
+                f"inv={event['inversion_raw']} borrowed={event['borrowed']} score={event['score']} ({event['score_source']})"
+            )
     else:
         print(json.dumps(predictions, ensure_ascii=False, indent=2))
 

@@ -4,6 +4,7 @@ import sys
 import unittest
 import tempfile
 import importlib
+import argparse
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -23,6 +24,8 @@ from src.observer.chord_parser import (
     extract_harmonic_onsets,
     generate_all_candidates,
     load_learned_weights,
+    merge_consecutive_observer_events,
+    predict_observer_chords_for_midi,
     predict_chords_for_midi,
     rerank_candidates_with_learned_weights,
     score_candidate,
@@ -160,6 +163,13 @@ class ChordParserTests(unittest.TestCase):
         self.assertEqual(first["type_raw"], 5)
         self.assertEqual(first["score_source"], "manual")
 
+    def test_predict_observer_without_weights_uses_manual_score_source(self):
+        pm = self._build_synthetic_midi()
+        fake_pretty_midi = SimpleNamespace(PrettyMIDI=lambda _: pm)
+        with patch.dict(sys.modules, {"pretty_midi": fake_pretty_midi}):
+            payload = predict_observer_chords_for_midi("unused.mid", tonic_pc=0, main_mode="major", instrument_name="chords")
+        self.assertEqual(payload[0]["score_source"], "manual")
+
     def test_rerank_with_weights_calls_weighted_helpers_and_changes_order(self):
         c1 = ChordCandidate("major", False, 0, 5, 0, [0, 4, 7], [], [], [], [], [0, 4, 7], [], [], score=0)
         c2 = ChordCandidate("major", False, 4, 5, 0, [7, 11, 2], [], [], [], [], [7, 11, 2], [], [], score=0)
@@ -199,19 +209,44 @@ class ChordParserTests(unittest.TestCase):
             midi_path="song.mid",
             tonic_pc=0,
             mode="major",
-            top_k=None,
             pretty=False,
             json_out=None,
             instrument_name="chords",
-            all_candidates=False,
-            debug_score=False,
             weights_yaml="weights.yaml",
+            no_merge=False,
         )
         with patch("argparse.ArgumentParser.parse_args", return_value=args), patch(
-            "src.observer.chord_parser.predict_chords_for_midi", return_value=[]
+            "src.observer.chord_parser.predict_observer_chords_for_midi", return_value=[]
         ) as predict_mock:
             _cli()
         self.assertEqual(predict_mock.call_args.kwargs["weights_yaml"], "weights.yaml")
+
+    def test_cli_mode_choices_include_context_modes(self):
+        parser = None
+
+        def capture_add_argument(self, *args, **kwargs):
+            nonlocal parser
+            if args and args[0] == "--mode":
+                parser = kwargs
+            return original_add_argument(self, *args, **kwargs)
+
+        original_add_argument = argparse.ArgumentParser.add_argument
+        args = SimpleNamespace(
+            midi_path="song.mid",
+            tonic_pc=0,
+            mode="dorian",
+            pretty=False,
+            json_out=None,
+            instrument_name="chords",
+            weights_yaml=None,
+            no_merge=False,
+        )
+        with patch("argparse.ArgumentParser.parse_args", return_value=args), patch.object(
+            argparse.ArgumentParser, "add_argument", new=capture_add_argument
+        ), patch("src.observer.chord_parser.predict_observer_chords_for_midi", return_value=[]):
+            _cli()
+        self.assertIsNotNone(parser)
+        self.assertEqual(set(parser["choices"]), set(self.ctx["mode_to_pcset"].keys()))
 
     def test_module_import_lazy_for_weighted_helpers(self):
         module = importlib.reload(importlib.import_module("src.observer.chord_parser"))
@@ -254,6 +289,259 @@ class ChordParserTests(unittest.TestCase):
         self.assertEqual(candidates[0]["mode_name"], "minor")
         self.assertEqual(candidates[0]["root_degree_raw"], 1)
         self.assertEqual(candidates[0]["score_source"], "learned_weights")
+
+    def test_predict_observer_output_schema(self):
+        pm = self._build_synthetic_midi()
+        fake_pretty_midi = SimpleNamespace(PrettyMIDI=lambda _: pm)
+        with patch.dict(sys.modules, {"pretty_midi": fake_pretty_midi}):
+            payload = predict_observer_chords_for_midi(
+                "unused.mid",
+                tonic_pc=0,
+                main_mode="major",
+                instrument_name="chords",
+            )
+        self.assertIsInstance(payload, list)
+        self.assertGreaterEqual(len(payload), 1)
+        first = payload[0]
+        self.assertIn("onset_time", first)
+        self.assertIn("offset_time", first)
+        self.assertLess(first["onset_time"], first["offset_time"])
+        self.assertNotIn("root_id", first)
+        self.assertNotIn("meta", first)
+
+    def test_predict_observer_uses_sounding_sonority(self):
+        def note(pitch: int, start: float, end: float):
+            return SimpleNamespace(pitch=pitch, start=start, end=end)
+
+        chords = SimpleNamespace(
+            name="chords",
+            is_drum=False,
+            notes=[
+                note(60, 0.0, 2.0),
+                note(64, 0.0, 2.0),
+                note(67, 0.0, 2.0),
+                # On second onset only one note starts, but sustained notes make sounding sonority valid.
+                note(62, 1.0, 2.0),
+            ],
+        )
+        pm = SimpleNamespace(instruments=[chords])
+        fake_pretty_midi = SimpleNamespace(PrettyMIDI=lambda _: pm)
+        with patch.dict(sys.modules, {"pretty_midi": fake_pretty_midi}):
+            payload = predict_observer_chords_for_midi(
+                "unused.mid",
+                tonic_pc=0,
+                main_mode="major",
+                instrument_name="chords",
+                merge_consecutive=False,
+            )
+        self.assertEqual(len(payload), 2)
+        self.assertEqual(payload[0]["onset_time"], 0.0)
+        self.assertEqual(payload[1]["onset_time"], 1.0)
+
+    def test_observer_offset_uses_next_valid_event_not_next_raw_onset(self):
+        def note(pitch: int, start: float, end: float):
+            return SimpleNamespace(pitch=pitch, start=start, end=end)
+
+        chords = SimpleNamespace(
+            name="chords",
+            is_drum=False,
+            notes=[
+                note(60, 0.0, 0.9),
+                note(64, 0.0, 0.9),
+                note(67, 0.0, 0.9),
+                # Raw onset at 1.0 is invalid (<3 pcs).
+                note(72, 1.0, 1.2),
+                # Next valid event starts at 2.0.
+                note(62, 2.0, 3.0),
+                note(65, 2.0, 3.0),
+                note(69, 2.0, 3.0),
+            ],
+        )
+        pm = SimpleNamespace(instruments=[chords])
+        fake_pretty_midi = SimpleNamespace(PrettyMIDI=lambda _: pm)
+        with patch.dict(sys.modules, {"pretty_midi": fake_pretty_midi}):
+            payload = predict_observer_chords_for_midi(
+                "unused.mid",
+                tonic_pc=0,
+                main_mode="major",
+                instrument_name="chords",
+                merge_consecutive=False,
+            )
+        self.assertEqual(len(payload), 2)
+        self.assertEqual(payload[0]["onset_time"], 0.0)
+        self.assertEqual(payload[0]["offset_time"], 2.0)
+
+    def test_last_event_offset_uses_note_end(self):
+        pm = self._build_synthetic_midi()
+        fake_pretty_midi = SimpleNamespace(PrettyMIDI=lambda _: pm)
+        with patch.dict(sys.modules, {"pretty_midi": fake_pretty_midi}):
+            payload = predict_observer_chords_for_midi(
+                "unused.mid",
+                tonic_pc=0,
+                main_mode="major",
+                instrument_name="chords",
+            )
+        self.assertEqual(payload[-1]["offset_time"], 2.0)
+        self.assertIsInstance(payload[-1]["score"], float)
+
+    def test_predict_observer_returns_empty_when_no_valid_sonorities(self):
+        def note(pitch: int, start: float, end: float):
+            return SimpleNamespace(pitch=pitch, start=start, end=end)
+
+        chords = SimpleNamespace(
+            name="chords",
+            is_drum=False,
+            notes=[
+                note(60, 0.0, 0.5),
+                note(62, 1.0, 1.5),
+                note(64, 2.0, 2.5),
+            ],
+        )
+        pm = SimpleNamespace(instruments=[chords])
+        fake_pretty_midi = SimpleNamespace(PrettyMIDI=lambda _: pm)
+        with patch.dict(sys.modules, {"pretty_midi": fake_pretty_midi}):
+            payload = predict_observer_chords_for_midi(
+                "unused.mid",
+                tonic_pc=0,
+                main_mode="major",
+                instrument_name="chords",
+                merge_consecutive=False,
+            )
+        self.assertEqual(payload, [])
+
+    def test_merge_consecutive_observer_events(self):
+        events = [
+            {
+                "onset_time": 0.0,
+                "offset_time": 1.0,
+                "root_degree_raw": 0,
+                "type_raw": 5,
+                "inversion_raw": 0,
+                "mode_name": "major",
+                "borrowed": False,
+                "add_degrees": [],
+                "suspension_degrees": [],
+                "omit_degrees": [],
+                "alteration_tokens": [],
+                "score": 3,
+                "score_source": "manual",
+            },
+            {
+                "onset_time": 1.0,
+                "offset_time": 2.0,
+                "root_degree_raw": 0,
+                "type_raw": 5,
+                "inversion_raw": 0,
+                "mode_name": "major",
+                "borrowed": False,
+                "add_degrees": [],
+                "suspension_degrees": [],
+                "omit_degrees": [],
+                "alteration_tokens": [],
+                "score": 4,
+                "score_source": "manual",
+            },
+        ]
+        merged = merge_consecutive_observer_events(events)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["onset_time"], 0.0)
+        self.assertEqual(merged[0]["offset_time"], 2.0)
+        self.assertEqual(merged[0]["score"], 3)
+
+    def test_non_equal_consecutive_events_not_merged(self):
+        events = [
+            {
+                "onset_time": 0.0,
+                "offset_time": 1.0,
+                "root_degree_raw": 0,
+                "type_raw": 5,
+                "inversion_raw": 0,
+                "mode_name": "major",
+                "borrowed": False,
+                "add_degrees": [],
+                "suspension_degrees": [],
+                "omit_degrees": [],
+                "alteration_tokens": [],
+                "score": 3,
+                "score_source": "manual",
+            },
+            {
+                "onset_time": 1.0,
+                "offset_time": 2.0,
+                "root_degree_raw": 1,
+                "type_raw": 5,
+                "inversion_raw": 0,
+                "mode_name": "major",
+                "borrowed": False,
+                "add_degrees": [],
+                "suspension_degrees": [],
+                "omit_degrees": [],
+                "alteration_tokens": [],
+                "score": 4,
+                "score_source": "manual",
+            },
+        ]
+        merged = merge_consecutive_observer_events(events)
+        self.assertEqual(len(merged), 2)
+
+    def test_predict_observer_with_weights_uses_learned_score_source(self):
+        pm = self._build_synthetic_midi()
+        fake_pretty_midi = SimpleNamespace(PrettyMIDI=lambda _: pm)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tmp:
+            yaml.safe_dump({"bias": 0.0, "positive": {}, "negative": {}}, tmp)
+            weights_path = tmp.name
+        fitting_module = SimpleNamespace(
+            extract_candidate_feature_dict=lambda *args, **kwargs: {"rank_hint": 1.0},
+            compute_weighted_candidate_score=lambda feature_dict, weights: feature_dict["rank_hint"],
+        )
+        with patch.dict(
+            sys.modules,
+            {"pretty_midi": fake_pretty_midi, "src.observer.chord_score_fitting": fitting_module},
+        ):
+            payload = predict_observer_chords_for_midi(
+                "unused.mid",
+                tonic_pc=0,
+                main_mode="major",
+                instrument_name="chords",
+                weights_yaml=weights_path,
+            )
+        self.assertEqual(payload[0]["score_source"], "learned_weights")
+
+    def test_predict_observer_merge_flag_controls_identical_consecutive_events(self):
+        def note(pitch: int, start: float, end: float):
+            return SimpleNamespace(pitch=pitch, start=start, end=end)
+
+        chords = SimpleNamespace(
+            name="chords",
+            is_drum=False,
+            notes=[
+                note(60, 0.0, 0.9),
+                note(64, 0.0, 0.9),
+                note(67, 0.0, 0.9),
+                note(60, 1.0, 1.9),
+                note(64, 1.0, 1.9),
+                note(67, 1.0, 1.9),
+            ],
+        )
+        pm = SimpleNamespace(instruments=[chords])
+        fake_pretty_midi = SimpleNamespace(PrettyMIDI=lambda _: pm)
+        with patch.dict(sys.modules, {"pretty_midi": fake_pretty_midi}):
+            unmerged = predict_observer_chords_for_midi(
+                "unused.mid",
+                tonic_pc=0,
+                main_mode="major",
+                instrument_name="chords",
+                merge_consecutive=False,
+            )
+            merged = predict_observer_chords_for_midi(
+                "unused.mid",
+                tonic_pc=0,
+                main_mode="major",
+                instrument_name="chords",
+                merge_consecutive=True,
+            )
+        self.assertEqual(len(unmerged), 2)
+        self.assertEqual(len(merged), 1)
 
 
 if __name__ == "__main__":
