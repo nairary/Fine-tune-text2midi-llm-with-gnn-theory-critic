@@ -22,7 +22,11 @@ import torch
 from omegaconf import OmegaConf
 from torch_geometric.data import Batch
 
-from src.dataloader.song_corruptions import corrupt_song_obj
+from src.dataloader.song_corruptions import (
+    NEAR_BENIGN_CORRUPTIONS,
+    STRICT_BENIGN_CORRUPTIONS,
+    corrupt_song_obj,
+)
 from src.dataloader.theory_helpers import build_theory_context
 from src.dataloader.utils_graph import build_graph_from_encoded
 from src.models.teacher_gnn import TeacherGNN
@@ -42,6 +46,7 @@ DEFAULT_MODES = [
   "strong_weak_beat_flip",
   "functional_progression_violation_strict"
 ]
+BENIGN_ALL_MODES = STRICT_BENIGN_CORRUPTIONS + NEAR_BENIGN_CORRUPTIONS
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,8 +58,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=DEFAULT_MODES,
+        default=None,
         help="Corruption modes to evaluate independently.",
+    )
+    parser.add_argument(
+        "--mode-set",
+        choices=["default", "ood", "strict_benign", "near_benign", "benign_all"],
+        default="default",
+        help="Predefined mode set; used only when --modes is not provided.",
     )
     parser.add_argument("--device", default="cpu", help="Inference device, e.g. cpu or cuda.")
     parser.add_argument("--seed", type=int, default=123, help="Base RNG seed for reproducible corruption sampling.")
@@ -66,6 +77,20 @@ def parse_args() -> argparse.Namespace:
         help="Directory for CSV/XLSX outputs.",
     )
     return parser.parse_args()
+
+
+def resolve_modes(args: argparse.Namespace) -> list[str]:
+    if args.modes:
+        return list(args.modes)
+    if args.mode_set == "ood":
+        return list(OOD_MODES)
+    if args.mode_set == "strict_benign":
+        return list(STRICT_BENIGN_CORRUPTIONS)
+    if args.mode_set == "near_benign":
+        return list(NEAR_BENIGN_CORRUPTIONS)
+    if args.mode_set == "benign_all":
+        return list(BENIGN_ALL_MODES)
+    return list(DEFAULT_MODES)
 
 
 def load_dataset_json(path: Path) -> list[tuple[str, dict[str, Any]]]:
@@ -306,11 +331,12 @@ def run_eval(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
         device=device,
     )
     theory_ctx = build_theory_context()
+    modes = resolve_modes(args)
 
     rows: list[dict[str, Any]] = []
     for song_idx, (song_id, song_obj) in enumerate(split_songs):
         score_real = score_song(model, song_obj, device)
-        for mode_idx, mode in enumerate(args.modes):
+        for mode_idx, mode in enumerate(modes):
             rng = random.Random(args.seed + song_idx * 1000 + mode_idx)
             corrupted_song_obj, metadata = apply_single_mode_corruption(song_obj, mode, theory_ctx, rng)
             applied = bool(metadata.get("applied", False))
@@ -339,6 +365,24 @@ def run_eval(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                 "rank_success": rank_success,
                 "metadata_json": json.dumps(details, ensure_ascii=False, sort_keys=True),
                 "mode_family": metadata.get("mode_family"),
+                "corruption_name": metadata.get("corruption_name", mode),
+                "corruption_params_json": json.dumps(metadata.get("corruption_params", {}), ensure_ascii=False, sort_keys=True),
+                "reason_skipped": metadata.get("reason_skipped"),
+                "n_notes_modified": (
+                    int(metadata.get("n_notes_modified", 0) or 0)
+                    if mode in BENIGN_ALL_MODES or int(metadata.get("n_notes_modified", 0) or 0) > 0
+                    else None
+                ),
+                "n_chords_modified": (
+                    int(metadata.get("n_chords_modified", 0) or 0)
+                    if mode in BENIGN_ALL_MODES or int(metadata.get("n_chords_modified", 0) or 0) > 0
+                    else None
+                ),
+                "mode_group": (
+                    "strict_benign"
+                    if mode in STRICT_BENIGN_CORRUPTIONS
+                    else "near_benign" if mode in NEAR_BENIGN_CORRUPTIONS else "other"
+                ),
             }
             if "reference_role" in details:
                 row["reference_role"] = details.get("reference_role")
