@@ -5,3 +5,4 @@
 outputs/
 multirun/
 __pycache__
+teacher_encoded.json
