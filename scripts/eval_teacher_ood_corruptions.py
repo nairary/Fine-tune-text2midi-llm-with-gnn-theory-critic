@@ -27,11 +27,20 @@ from src.dataloader.theory_helpers import build_theory_context
 from src.dataloader.utils_graph import build_graph_from_encoded
 from src.models.teacher_gnn import TeacherGNN
 
-DEFAULT_MODES = [
+OOD_MODES = [
     "out_of_key_note",
     "local_semitone_fragment_shift",
     "octave_leap_violation",
     "semitone_from_bass_or_chord_tone",
+]
+
+DEFAULT_MODES = [
+  "strongbeat_nonchord_note",
+  "borrowed_melody_conflict",
+  "borrowed_kind_toggle_without_melody_change",
+  "note_onset_shift",
+  "strong_weak_beat_flip",
+  "functional_progression_violation_strict"
 ]
 
 

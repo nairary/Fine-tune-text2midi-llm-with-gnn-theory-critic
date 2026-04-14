@@ -245,7 +245,7 @@ def extract_observer_note_events(pm: Any, tonic_pc: int, bpm: float | None) -> l
             duration_beats = max(0.0, (offset_time - onset_time) * float(bpm) / 60.0)
 
         midi_octave = pitch // 12 - 1
-        octave_value = midi_octave - 5
+        octave_value = midi_octave
         octave_id = _octave_value_to_teacher_octave_id(octave_value, runtime_maps["octave_id_map"])
         sd_id = encode_vocab(vocabs["melody_sd"], theory_ctx["sd_id_to_token"].get(relpc_to_sd_id.get(rel_pc, 0), "<UNK>"))
 
