@@ -23,7 +23,7 @@ ONSET_EPSILON = 1e-4
 
 
 _REQUIRED_SAMPLE_FIELDS = ("song_id", "midi_path", "tonic_pc", "mode_name")
-_OPTIONAL_SAMPLE_FIELDS = ("bpm", "num_beats", "beat_unit")
+_OPTIONAL_SAMPLE_FIELDS = ("bpm", "num_beats", "beat_unit", "sample_id", "pair_group_id", "is_corrupted", "corruption_name", "source_song_id", "encoded_song_path", "tonal_group", "corruption_group", "beat_origin")
 
 
 class ObserverInputValidationError(ValueError):

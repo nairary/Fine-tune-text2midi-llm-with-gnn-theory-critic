@@ -1,0 +1,11 @@
+name: observer_training_default
+epochs: 10
+seed: 42
+device: cpu
+teacher_checkpoint: models/best_rank_acc.pt
+teacher_config: configs/config.yaml
+chord_weights_yaml: null
+chord_instrument_name: chords
+use_fallback_44: true
+
+resume: false

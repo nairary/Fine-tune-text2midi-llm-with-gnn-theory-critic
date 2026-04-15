@@ -148,7 +148,7 @@ def build_teacher_targets(
         }
         if split is not None:
             row_out["split"] = split
-        for passthrough_key in ("midi_path", "tonic_pc", "mode_name", "is_corrupted", "corruption_name", "pair_group_id", "source_song_id"):
+        for passthrough_key in ("sample_id", "midi_path", "tonic_pc", "mode_name", "is_corrupted", "corruption_name", "pair_group_id", "source_song_id", "tonal_group", "corruption_group", "is_valid_pair_for_rank"):
             if passthrough_key in sample:
                 row_out[passthrough_key] = sample[passthrough_key]
         out_rows.append(row_out)

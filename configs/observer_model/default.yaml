@@ -1,0 +1,4 @@
+name: observer_gnn_default
+hidden_dim: 128
+num_layers: 3
+dropout: 0.1
