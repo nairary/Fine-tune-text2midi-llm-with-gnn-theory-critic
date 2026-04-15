@@ -1,0 +1,15 @@
+defaults:
+  - data: teacher_encoded_full
+  - dataloader: observer_pairs_song_theory
+  - observer_pipeline: default
+  - observer_model: default
+  - observer_training: default
+  - optimizer: adamw
+  - scheduler: none
+  - losses: observer_distill
+  - hydra: default
+  - _self_
+
+project:
+  name: Fine-tune-text2midi-llm-with-gnn-theory-critic
+  task: observer_pair_distill

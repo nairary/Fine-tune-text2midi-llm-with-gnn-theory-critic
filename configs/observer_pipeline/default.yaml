@@ -1,0 +1,13 @@
+output_root: outputs/observer_pipeline
+build_pairs: true
+build_targets: true
+build_graph_cache: true
+train: true
+overwrite: false
+skip_render_failures: true
+skip_graph_build_failures: true
+encoded_output_dir: pairs/encoded
+midi_output_dir: pairs/midi
+manifest_output_dir: pairs/manifests
+targets_output_dir: targets
+cache_output_dir: cache

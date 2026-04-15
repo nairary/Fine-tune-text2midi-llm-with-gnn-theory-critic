@@ -1,0 +1,4 @@
+lambda_reg: 1.0
+lambda_rank: 0.5
+min_teacher_gap_for_rank: 0.25
+use_pair_rank: true
