@@ -9,6 +9,10 @@ from typing import Callable
 from .function_rules import STRICT_TRIPLET_PATTERNS_V1
 from .theory_helpers import (
     chord_bass_and_top_pcs,
+    chord_body_pcs_ordered,
+    chord_implied_bass_pc,
+    decode_chord_components,
+    decode_inversion_raw,
     decode_root_raw,
     decode_sd_to_chromatic,
     chord_pitch_classes_tertian,
@@ -204,6 +208,162 @@ def _set_note_interval(note: dict, start: float, end: float):
         note["onset_time"] = start
     if "offset_time" in note:
         note["offset_time"] = end
+
+
+def _intervals_overlap(start_a: float | None, end_a: float | None, start_b: float | None, end_b: float | None, eps: float = DEFAULT_EPSILON) -> bool:
+    if None in (start_a, end_a, start_b, end_b):
+        return False
+    return float(start_a) < float(end_b) - eps and float(start_b) < float(end_a) - eps
+
+
+def _collect_overlapping_melody_indices(song_obj: dict, chord: dict) -> list[int]:
+    _, melody = _melody_events(song_obj)
+    if not melody:
+        return []
+    chord_start, chord_end = _note_interval(chord)
+    overlapping = []
+    for note_idx, note in enumerate(melody):
+        if int(note.get("is_rest", 0)) == 1:
+            continue
+        note_start, note_end = _note_interval(note)
+        if _intervals_overlap(chord_start, chord_end, note_start, note_end):
+            overlapping.append(note_idx)
+    return overlapping
+
+
+def _decode_total_chord_pcs(song_obj: dict, chord: dict, theory_ctx: dict) -> set[int]:
+    decoded = decode_chord_components(song_obj, chord, theory_ctx)
+    if decoded is None:
+        return set()
+    return {int(pc) % 12 for pc in decoded["body_pcs"] + decoded["add_pcs"]}
+
+
+def _total_pcs_from_decoded(decoded: dict | None) -> set[int]:
+    if decoded is None:
+        return set()
+    return {int(pc) % 12 for pc in decoded.get("body_pcs", []) + decoded.get("add_pcs", [])}
+
+
+def _pad_bitvec(values: list[int] | None, size: int) -> list[int]:
+    vec = list(values or [])
+    if len(vec) < size:
+        vec.extend([0] * (size - len(vec)))
+    return [int(v) for v in vec[:size]]
+
+
+def _iter_chord_melody_contexts(song_obj: dict, chord: dict, melody: list[dict], theory_ctx: dict) -> list[dict]:
+    chord_start = try_parse_float(chord.get("beat"))
+    overlapping_note_indices = _collect_overlapping_melody_indices(song_obj, chord)
+    if not overlapping_note_indices:
+        return []
+    same_onset_indices = [
+        note_idx
+        for note_idx in overlapping_note_indices
+        if abs(safe_float(melody[note_idx].get("beat"), -999.0) - safe_float(chord_start, -999.0)) <= DEFAULT_EPSILON
+    ]
+    note_indices = same_onset_indices or overlapping_note_indices
+    contexts = []
+    for note_idx in note_indices:
+        note = melody[note_idx]
+        if int(note.get("is_rest", 0)) == 1:
+            continue
+        melody_pc = decode_sd_to_chromatic(int(note.get("sd_id", 0)), theory_ctx)
+        if melody_pc is None:
+            continue
+        contexts.append({
+            "note_idx": note_idx,
+            "melody_pc": int(melody_pc) % 12,
+            "same_onset": abs(safe_float(note.get("beat"), -999.0) - safe_float(chord_start, -999.0)) <= DEFAULT_EPSILON,
+            "is_strong": is_strong_note_position(note, song_obj),
+        })
+    return contexts
+
+
+def _base_context_score(context: dict) -> float:
+    score = 0.0
+    if context.get("same_onset"):
+        score += 4.0
+    if context.get("is_strong"):
+        score += 2.0
+    return score
+
+
+def _pc_distance(a: int | None, b: int | None) -> int:
+    if a is None or b is None:
+        return 0
+    delta = abs(int(a) - int(b)) % 12
+    return min(delta, 12 - delta)
+
+
+def _chord_pos_in_bar(chord: dict, song_obj: dict) -> float | None:
+    pos = try_parse_float(chord.get("pos_in_bar"))
+    if pos is not None:
+        return pos
+    beat = try_parse_float(chord.get("beat"))
+    if beat is None:
+        return None
+    num_beats = safe_float(song_obj.get("meta", {}).get("main_num_beats", 4.0), 4.0)
+    bar_idx = int((beat - 1.0) // num_beats)
+    bar_start = 1.0 + bar_idx * num_beats
+    return beat - bar_start
+
+
+def _is_strong_chord_position(chord: dict, song_obj: dict) -> bool:
+    pos = _chord_pos_in_bar(chord, song_obj)
+    if pos is None:
+        return False
+    num_beats = safe_float(song_obj.get("meta", {}).get("main_num_beats", 4.0), 4.0)
+    if abs(pos) < 1e-6:
+        return True
+    if abs(num_beats - 4.0) < 1e-6 and abs(pos - 2.0) < 1e-6:
+        return True
+    return False
+
+
+def _neighbor_implied_bass(song_obj: dict, chords: list[dict], start_idx: int, step: int, theory_ctx: dict) -> int | None:
+    idx = start_idx + step
+    while 0 <= idx < len(chords):
+        chord = chords[idx]
+        if int(chord.get("is_rest", 0)) == 0:
+            bass_pc = chord_implied_bass_pc(song_obj, chord, theory_ctx)
+            if bass_pc is not None:
+                return bass_pc
+        idx += step
+    return None
+
+
+def _inversion_instability_penalty(inversion_raw: int, body_len: int) -> float:
+    max_inv = min(3, max(0, body_len - 1))
+    inversion_raw = max(0, min(int(inversion_raw), max_inv))
+    if max_inv <= 2:
+        penalty_map = {0: 0.0, 1: 1.0, 2: 3.0}
+    else:
+        penalty_map = {0: 0.0, 1: 1.0, 2: 2.0, 3: 3.0}
+    return float(penalty_map.get(inversion_raw, 0.0))
+
+
+def _strongbeat_inversion_penalty(inversion_raw: int, strong_position: bool) -> float:
+    if not strong_position:
+        penalty_map = {0: 0.0, 1: 0.5, 2: 1.5, 3: 2.5}
+    else:
+        penalty_map = {0: 0.0, 1: 1.0, 2: 3.0, 3: 4.0}
+    return float(penalty_map.get(int(inversion_raw), penalty_map[max(penalty_map)]))
+
+
+def _bass_continuity_badness(
+    candidate_bass_pc: int,
+    inversion_raw: int,
+    body_len: int,
+    prev_bass_pc: int | None,
+    next_bass_pc: int | None,
+    strong_position: bool,
+) -> float:
+    continuity_penalty = float(_pc_distance(prev_bass_pc, candidate_bass_pc) + _pc_distance(candidate_bass_pc, next_bass_pc))
+    return (
+        2.0 * _inversion_instability_penalty(inversion_raw, body_len)
+        + 2.5 * _strongbeat_inversion_penalty(inversion_raw, strong_position)
+        + 1.5 * continuity_penalty
+    )
 
 
 def _has_pitch_in_midi_range(events: list[dict], shift: int) -> bool:
@@ -541,6 +701,10 @@ def _mode_to_pcset_vec(mode_name: str | None, theory_ctx: dict) -> list[int]:
 
 def _corrupt_borrowed_kind_toggle(song_obj, theory_ctx, rng, corruption_cfg):
     metadata = _identity_metadata("borrowed_kind_toggle_without_melody_change")
+    melody_key, melody = _melody_events(song_obj)
+    if not melody_key or not any(int(note.get("is_rest", 0)) == 0 for note in melody):
+        metadata["reason_skipped"] = "no_non_rest_melody_notes"
+        return song_obj, metadata, False
     chord_indices = list(range(len(song_obj.get("chords", []))))
     rng.shuffle(chord_indices)
 
@@ -558,12 +722,21 @@ def _corrupt_borrowed_kind_toggle(song_obj, theory_ctx, rng, corruption_cfg):
     if none_kind_id is None or mode_name_kind_id is None or none_mode_id is None:
         return song_obj, metadata, False
 
+    candidates: list[dict] = []
     for chord_idx in chord_indices:
         chord = song_obj["chords"][chord_idx]
+        if int(chord.get("is_rest", 0)) == 1:
+            continue
+        overlapping_melody_indices = _collect_overlapping_melody_indices(song_obj, chord)
+        if not overlapping_melody_indices:
+            continue
         old_kind_id = int(chord.get("borrowed_kind_id", 2))
         old_mode_id = int(chord.get("borrowed_mode_name_id", 2))
         old_kind = theory_ctx["borrowed_id_to_kind"].get(old_kind_id, "none")
         old_mode = theory_ctx["borrowed_mode_id_to_name"].get(old_mode_id)
+        before_pcs = _decode_total_chord_pcs(song_obj, chord, theory_ctx)
+        if not before_pcs:
+            continue
 
         options: list[tuple[int, int]] = [(none_kind_id, none_mode_id)]
         options.extend((mode_name_kind_id, mode_id) for mode_id in valid_mode_ids)
@@ -574,23 +747,582 @@ def _corrupt_borrowed_kind_toggle(song_obj, theory_ctx, rng, corruption_cfg):
                 continue
             new_kind = theory_ctx["borrowed_id_to_kind"].get(new_kind_id)
             new_mode = theory_ctx["borrowed_mode_id_to_name"].get(new_mode_id)
-            chord["borrowed_kind_id"] = new_kind_id
-            chord["borrowed_mode_name_id"] = new_mode_id
-            chord["borrowed_pcset_vec"] = _mode_to_pcset_vec(new_mode if new_kind == "mode_name" else None, theory_ctx)
-
-            metadata.update({
-                "applied": True,
-                "chord_corrupted_indices": [chord_idx],
-                "details": {
-                    "borrowed_kind_before": old_kind,
-                    "borrowed_kind_after": new_kind,
-                    "borrowed_mode_before": old_mode,
-                    "borrowed_mode_after": new_mode,
-                },
+            chord_candidate = copy.deepcopy(chord)
+            chord_candidate["borrowed_kind_id"] = new_kind_id
+            chord_candidate["borrowed_mode_name_id"] = new_mode_id
+            chord_candidate["borrowed_pcset_vec"] = _mode_to_pcset_vec(new_mode if new_kind == "mode_name" else None, theory_ctx)
+            after_pcs = _decode_total_chord_pcs(song_obj, chord_candidate, theory_ctx)
+            if not after_pcs or after_pcs == before_pcs:
+                continue
+            candidates.append({
+                "chord_idx": chord_idx,
+                "new_kind_id": new_kind_id,
+                "new_mode_id": new_mode_id,
+                "new_kind": new_kind,
+                "new_mode": new_mode,
+                "before_pcs": before_pcs,
+                "after_pcs": after_pcs,
+                "overlapping_melody_indices": overlapping_melody_indices,
+                "score": len(before_pcs.symmetric_difference(after_pcs)),
+                "old_kind": old_kind,
+                "old_mode": old_mode,
             })
-            return song_obj, metadata, True
 
-    return song_obj, metadata, False
+    if not candidates:
+        metadata["reason_skipped"] = "no_chord_with_overlapping_melody_and_changed_pcset"
+        return song_obj, metadata, False
+
+    max_score = max(candidate["score"] for candidate in candidates)
+    best_candidates = [candidate for candidate in candidates if candidate["score"] == max_score]
+    chosen = rng.choice(best_candidates)
+    chord = song_obj["chords"][chosen["chord_idx"]]
+    chord["borrowed_kind_id"] = chosen["new_kind_id"]
+    chord["borrowed_mode_name_id"] = chosen["new_mode_id"]
+    chord["borrowed_pcset_vec"] = _mode_to_pcset_vec(chosen["new_mode"] if chosen["new_kind"] == "mode_name" else None, theory_ctx)
+
+    metadata.update({
+        "applied": True,
+        "n_chords_modified": 1,
+        "chord_corrupted_indices": [chosen["chord_idx"]],
+        "details": {
+            "borrowed_kind_before": chosen["old_kind"],
+            "borrowed_kind_after": chosen["new_kind"],
+            "borrowed_mode_before": chosen["old_mode"],
+            "borrowed_mode_after": chosen["new_mode"],
+            "overlapping_melody_indices": chosen["overlapping_melody_indices"],
+            "chord_pcs_before": sorted(chosen["before_pcs"]),
+            "chord_pcs_after": sorted(chosen["after_pcs"]),
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_melody_semitone_add_clash(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("melody_semitone_add_clash")
+    melody_key, melody = _melody_events(song_obj)
+    if not melody_key or not melody:
+        metadata["reason_skipped"] = "melody_track_not_found"
+        return song_obj, metadata, False
+    chords = song_obj.get("chords", [])
+    if not chords:
+        metadata["reason_skipped"] = "no_chords_found"
+        return song_obj, metadata, False
+
+    add_allowed_values = [int(v) for v in theory_ctx.get("chord_add_allowed_values", [])]
+    if not add_allowed_values:
+        metadata["reason_skipped"] = "no_add_degrees_available"
+        return song_obj, metadata, False
+
+    chord_candidates = list(range(len(chords)))
+    rng.shuffle(chord_candidates)
+    all_candidates: list[dict] = []
+    for chord_idx in chord_candidates:
+        chord = chords[chord_idx]
+        if int(chord.get("is_rest", 0)) == 1:
+            continue
+        chord_start = try_parse_float(chord.get("beat"))
+        overlapping_note_indices = _collect_overlapping_melody_indices(song_obj, chord)
+        if not overlapping_note_indices:
+            continue
+        same_onset_indices = [
+            note_idx
+            for note_idx in overlapping_note_indices
+            if abs(safe_float(melody[note_idx].get("beat"), -999.0) - safe_float(chord_start, -999.0)) <= DEFAULT_EPSILON
+        ]
+        note_indices = same_onset_indices or overlapping_note_indices
+        current_total_pcs = _decode_total_chord_pcs(song_obj, chord, theory_ctx)
+        if not current_total_pcs:
+            continue
+        current_adds = list(chord.get("adds_vec") or [0] * len(add_allowed_values))
+        if len(current_adds) < len(add_allowed_values):
+            current_adds.extend([0] * (len(add_allowed_values) - len(current_adds)))
+
+        for note_idx in note_indices:
+            note = melody[note_idx]
+            if int(note.get("is_rest", 0)) == 1:
+                continue
+            melody_pc = decode_sd_to_chromatic(int(note.get("sd_id", 0)), theory_ctx)
+            if melody_pc is None:
+                continue
+            is_same_onset = abs(safe_float(note.get("beat"), -999.0) - safe_float(chord_start, -999.0)) <= DEFAULT_EPSILON
+            is_strong = is_strong_note_position(note, song_obj)
+
+            for add_idx, add_degree in enumerate(add_allowed_values):
+                if add_idx < len(current_adds) and int(current_adds[add_idx]) == 1:
+                    continue
+                chord_candidate = copy.deepcopy(chord)
+                next_adds = list(current_adds)
+                next_adds[add_idx] = 1
+                chord_candidate["adds_vec"] = next_adds
+                candidate_total_pcs = _decode_total_chord_pcs(song_obj, chord_candidate, theory_ctx)
+                if not candidate_total_pcs or candidate_total_pcs == current_total_pcs:
+                    continue
+                added_pcs = sorted(candidate_total_pcs - current_total_pcs)
+                clash_pcs = [pc for pc in added_pcs if (pc - melody_pc) % 12 in {1, 11}]
+                if not clash_pcs:
+                    continue
+                score = 0.01 * float(add_degree)
+                if is_strong:
+                    score += 2.0
+                if is_same_onset:
+                    score += 4.0
+                all_candidates.append({
+                    "score": score,
+                    "chord_idx": chord_idx,
+                    "note_idx": note_idx,
+                    "add_idx": add_idx,
+                    "add_degree": add_degree,
+                    "new_adds_vec": next_adds,
+                    "melody_pc": melody_pc,
+                    "added_pcs": added_pcs,
+                    "clash_pcs": clash_pcs,
+                    "same_onset": is_same_onset,
+                    "is_strong": is_strong,
+                })
+
+    if not all_candidates:
+        metadata["reason_skipped"] = "no_add_candidate_with_melody_semitone_clash"
+        return song_obj, metadata, False
+
+    max_score = max(candidate["score"] for candidate in all_candidates)
+    best_candidates = [candidate for candidate in all_candidates if abs(candidate["score"] - max_score) <= 1e-9]
+    chosen = rng.choice(best_candidates)
+    chord = chords[chosen["chord_idx"]]
+    chord["adds_vec"] = chosen["new_adds_vec"]
+
+    metadata.update({
+        "applied": True,
+        "n_chords_modified": 1,
+        "chord_corrupted_indices": [chosen["chord_idx"]],
+        "details": {
+            "target_chord_index": chosen["chord_idx"],
+            "target_note_index": chosen["note_idx"],
+            "add_degree": chosen["add_degree"],
+            "melody_pc": chosen["melody_pc"],
+            "added_pcs": chosen["added_pcs"],
+            "clash_pcs": chosen["clash_pcs"],
+            "same_onset": chosen["same_onset"],
+            "strong_note_position": chosen["is_strong"],
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_melody_suspension_clash(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("melody_suspension_clash")
+    melody_key, melody = _melody_events(song_obj)
+    if not melody_key or not melody:
+        metadata["reason_skipped"] = "melody_track_not_found"
+        return song_obj, metadata, False
+    chords = song_obj.get("chords", [])
+    if not chords:
+        metadata["reason_skipped"] = "no_chords_found"
+        return song_obj, metadata, False
+
+    suspension_allowed_values = [int(v) for v in theory_ctx.get("chord_susp_allowed_values", [])]
+    if not suspension_allowed_values:
+        metadata["reason_skipped"] = "no_suspension_degrees_available"
+        return song_obj, metadata, False
+
+    all_candidates: list[dict] = []
+    chord_indices = list(range(len(chords)))
+    rng.shuffle(chord_indices)
+    for chord_idx in chord_indices:
+        chord = chords[chord_idx]
+        if int(chord.get("is_rest", 0)) == 1:
+            continue
+        decoded = decode_chord_components(song_obj, chord, theory_ctx)
+        if decoded is None:
+            continue
+        if 3 not in set(int(v) for v in decoded.get("body_degrees", [])):
+            continue
+        current_suspensions = set(int(v) for v in decoded.get("suspension_degrees", []))
+        if current_suspensions:
+            continue
+        third_pc = decoded.get("degree_to_pc", {}).get(3)
+        if third_pc is None:
+            continue
+        current_total_pcs = _total_pcs_from_decoded(decoded)
+        contexts = _iter_chord_melody_contexts(song_obj, chord, melody, theory_ctx)
+        if not contexts:
+            continue
+        current_sus_vec = _pad_bitvec(chord.get("suspensions_vec"), len(suspension_allowed_values))
+
+        for context in contexts:
+            for sus_idx, sus_degree in enumerate(suspension_allowed_values):
+                if current_sus_vec[sus_idx] == 1:
+                    continue
+                sus_pc = decoded.get("degree_to_pc", {}).get(int(sus_degree))
+                if sus_pc is None:
+                    continue
+                chord_candidate = copy.deepcopy(chord)
+                next_sus_vec = list(current_sus_vec)
+                next_sus_vec[sus_idx] = 1
+                chord_candidate["suspensions_vec"] = next_sus_vec
+                candidate_decoded = decode_chord_components(song_obj, chord_candidate, theory_ctx)
+                candidate_total_pcs = _total_pcs_from_decoded(candidate_decoded)
+                if not candidate_total_pcs or candidate_total_pcs == current_total_pcs:
+                    continue
+                added_pcs = sorted(candidate_total_pcs - current_total_pcs)
+                removed_pcs = sorted(current_total_pcs - candidate_total_pcs)
+                melody_reasserts_third = int(context["melody_pc"]) == int(third_pc)
+                vertical_clash = any((int(pc) - int(context["melody_pc"])) % 12 in {1, 11} for pc in added_pcs)
+                if not (melody_reasserts_third or vertical_clash):
+                    continue
+                score = _base_context_score(context)
+                if melody_reasserts_third:
+                    score += 3.0
+                if vertical_clash:
+                    score += 2.0
+                if int(sus_degree) == 4:
+                    score += 0.25
+                all_candidates.append({
+                    "score": score,
+                    "chord_idx": chord_idx,
+                    "note_idx": context["note_idx"],
+                    "sus_degree": int(sus_degree),
+                    "new_suspensions_vec": next_sus_vec,
+                    "melody_pc": int(context["melody_pc"]),
+                    "third_pc": int(third_pc),
+                    "added_pcs": added_pcs,
+                    "removed_pcs": removed_pcs,
+                    "same_onset": bool(context["same_onset"]),
+                    "is_strong": bool(context["is_strong"]),
+                })
+
+    if not all_candidates:
+        metadata["reason_skipped"] = "no_suspension_candidate_with_melody_conflict"
+        return song_obj, metadata, False
+
+    max_score = max(candidate["score"] for candidate in all_candidates)
+    best_candidates = [candidate for candidate in all_candidates if abs(candidate["score"] - max_score) <= 1e-9]
+    chosen = rng.choice(best_candidates)
+    chord = chords[chosen["chord_idx"]]
+    chord["suspensions_vec"] = chosen["new_suspensions_vec"]
+
+    metadata.update({
+        "applied": True,
+        "n_chords_modified": 1,
+        "chord_corrupted_indices": [chosen["chord_idx"]],
+        "details": {
+            "target_chord_index": chosen["chord_idx"],
+            "target_note_index": chosen["note_idx"],
+            "suspension_degree": chosen["sus_degree"],
+            "melody_pc": chosen["melody_pc"],
+            "removed_third_pc": chosen["third_pc"],
+            "added_pcs": chosen["added_pcs"],
+            "removed_pcs": chosen["removed_pcs"],
+            "same_onset": chosen["same_onset"],
+            "strong_note_position": chosen["is_strong"],
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_melody_alteration_clash(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("melody_alteration_clash")
+    melody_key, melody = _melody_events(song_obj)
+    if not melody_key or not melody:
+        metadata["reason_skipped"] = "melody_track_not_found"
+        return song_obj, metadata, False
+    chords = song_obj.get("chords", [])
+    if not chords:
+        metadata["reason_skipped"] = "no_chords_found"
+        return song_obj, metadata, False
+
+    alteration_allowed_values = [str(v) for v in theory_ctx.get("chord_alter_allowed_values", [])]
+    if not alteration_allowed_values:
+        metadata["reason_skipped"] = "no_alteration_tokens_available"
+        return song_obj, metadata, False
+
+    all_candidates: list[dict] = []
+    chord_indices = list(range(len(chords)))
+    rng.shuffle(chord_indices)
+    for chord_idx in chord_indices:
+        chord = chords[chord_idx]
+        if int(chord.get("is_rest", 0)) == 1:
+            continue
+        decoded = decode_chord_components(song_obj, chord, theory_ctx)
+        if decoded is None:
+            continue
+        current_total_pcs = _total_pcs_from_decoded(decoded)
+        current_alterations = set(str(v) for v in decoded.get("alteration_tokens", []))
+        contexts = _iter_chord_melody_contexts(song_obj, chord, melody, theory_ctx)
+        if not contexts:
+            continue
+        current_alt_vec = _pad_bitvec(chord.get("alterations_vec"), len(alteration_allowed_values))
+
+        for context in contexts:
+            for alt_idx, alt_token in enumerate(alteration_allowed_values):
+                if current_alt_vec[alt_idx] == 1 or alt_token in current_alterations:
+                    continue
+                chord_candidate = copy.deepcopy(chord)
+                next_alt_vec = list(current_alt_vec)
+                next_alt_vec[alt_idx] = 1
+                chord_candidate["alterations_vec"] = next_alt_vec
+                candidate_decoded = decode_chord_components(song_obj, chord_candidate, theory_ctx)
+                candidate_total_pcs = _total_pcs_from_decoded(candidate_decoded)
+                if not candidate_total_pcs or candidate_total_pcs == current_total_pcs:
+                    continue
+                added_pcs = sorted(candidate_total_pcs - current_total_pcs)
+                removed_pcs = sorted(current_total_pcs - candidate_total_pcs)
+                clash_pcs = [pc for pc in added_pcs if (int(pc) - int(context["melody_pc"])) % 12 in {1, 11}]
+                if not clash_pcs:
+                    continue
+                score = _base_context_score(context) + 2.0
+                if alt_token in {"b5", "#5"}:
+                    score += 1.0
+                all_candidates.append({
+                    "score": score,
+                    "chord_idx": chord_idx,
+                    "note_idx": context["note_idx"],
+                    "alteration_token": alt_token,
+                    "new_alterations_vec": next_alt_vec,
+                    "melody_pc": int(context["melody_pc"]),
+                    "added_pcs": added_pcs,
+                    "removed_pcs": removed_pcs,
+                    "clash_pcs": clash_pcs,
+                    "same_onset": bool(context["same_onset"]),
+                    "is_strong": bool(context["is_strong"]),
+                })
+
+    if not all_candidates:
+        metadata["reason_skipped"] = "no_alteration_candidate_with_melody_semitone_clash"
+        return song_obj, metadata, False
+
+    max_score = max(candidate["score"] for candidate in all_candidates)
+    best_candidates = [candidate for candidate in all_candidates if abs(candidate["score"] - max_score) <= 1e-9]
+    chosen = rng.choice(best_candidates)
+    chord = chords[chosen["chord_idx"]]
+    chord["alterations_vec"] = chosen["new_alterations_vec"]
+
+    metadata.update({
+        "applied": True,
+        "n_chords_modified": 1,
+        "chord_corrupted_indices": [chosen["chord_idx"]],
+        "details": {
+            "target_chord_index": chosen["chord_idx"],
+            "target_note_index": chosen["note_idx"],
+            "alteration_token": chosen["alteration_token"],
+            "melody_pc": chosen["melody_pc"],
+            "added_pcs": chosen["added_pcs"],
+            "removed_pcs": chosen["removed_pcs"],
+            "clash_pcs": chosen["clash_pcs"],
+            "same_onset": chosen["same_onset"],
+            "strong_note_position": chosen["is_strong"],
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_melody_omit_core_tone_conflict(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("melody_omit_core_tone_conflict")
+    melody_key, melody = _melody_events(song_obj)
+    if not melody_key or not melody:
+        metadata["reason_skipped"] = "melody_track_not_found"
+        return song_obj, metadata, False
+    chords = song_obj.get("chords", [])
+    if not chords:
+        metadata["reason_skipped"] = "no_chords_found"
+        return song_obj, metadata, False
+
+    omit_allowed_values = [int(v) for v in theory_ctx.get("chord_omit_allowed_values", [])]
+    if not omit_allowed_values:
+        metadata["reason_skipped"] = "no_omit_degrees_available"
+        return song_obj, metadata, False
+
+    all_candidates: list[dict] = []
+    chord_indices = list(range(len(chords)))
+    rng.shuffle(chord_indices)
+    for chord_idx in chord_indices:
+        chord = chords[chord_idx]
+        if int(chord.get("is_rest", 0)) == 1:
+            continue
+        decoded = decode_chord_components(song_obj, chord, theory_ctx)
+        if decoded is None:
+            continue
+        current_total_pcs = _total_pcs_from_decoded(decoded)
+        current_omits = set(int(v) for v in decoded.get("omit_degrees", []))
+        current_suspensions = set(int(v) for v in decoded.get("suspension_degrees", []))
+        current_alterations = set(str(v) for v in decoded.get("alteration_tokens", []))
+        body_degrees = set(int(v) for v in decoded.get("body_degrees", []))
+        degree_to_pc = {int(degree): int(pc) % 12 for degree, pc in decoded.get("degree_to_pc", {}).items()}
+        contexts = _iter_chord_melody_contexts(song_obj, chord, melody, theory_ctx)
+        if not contexts:
+            continue
+        current_omit_vec = _pad_bitvec(chord.get("omits_vec"), len(omit_allowed_values))
+
+        for context in contexts:
+            for omit_idx, omit_degree in enumerate(omit_allowed_values):
+                if current_omit_vec[omit_idx] == 1 or omit_degree in current_omits:
+                    continue
+                if omit_degree not in body_degrees:
+                    continue
+                if omit_degree == 3 and current_suspensions:
+                    continue
+                if omit_degree == 5 and any(token.endswith("5") for token in current_alterations):
+                    continue
+                omitted_pc = degree_to_pc.get(int(omit_degree))
+                if omitted_pc is None:
+                    continue
+                melody_supports_removed_tone = int(context["melody_pc"]) == int(omitted_pc)
+                if not melody_supports_removed_tone:
+                    continue
+                chord_candidate = copy.deepcopy(chord)
+                next_omit_vec = list(current_omit_vec)
+                next_omit_vec[omit_idx] = 1
+                chord_candidate["omits_vec"] = next_omit_vec
+                candidate_decoded = decode_chord_components(song_obj, chord_candidate, theory_ctx)
+                candidate_total_pcs = _total_pcs_from_decoded(candidate_decoded)
+                if not candidate_total_pcs or candidate_total_pcs == current_total_pcs:
+                    continue
+                removed_pcs = sorted(current_total_pcs - candidate_total_pcs)
+                if int(omitted_pc) not in {int(pc) for pc in removed_pcs}:
+                    continue
+                score = _base_context_score(context) + 3.0
+                if int(omit_degree) == 3:
+                    score += 1.0
+                all_candidates.append({
+                    "score": score,
+                    "chord_idx": chord_idx,
+                    "note_idx": context["note_idx"],
+                    "omit_degree": int(omit_degree),
+                    "new_omits_vec": next_omit_vec,
+                    "melody_pc": int(context["melody_pc"]),
+                    "removed_pcs": removed_pcs,
+                    "same_onset": bool(context["same_onset"]),
+                    "is_strong": bool(context["is_strong"]),
+                })
+
+    if not all_candidates:
+        metadata["reason_skipped"] = "no_omit_candidate_supported_by_melody"
+        return song_obj, metadata, False
+
+    max_score = max(candidate["score"] for candidate in all_candidates)
+    best_candidates = [candidate for candidate in all_candidates if abs(candidate["score"] - max_score) <= 1e-9]
+    chosen = rng.choice(best_candidates)
+    chord = chords[chosen["chord_idx"]]
+    chord["omits_vec"] = chosen["new_omits_vec"]
+
+    metadata.update({
+        "applied": True,
+        "n_chords_modified": 1,
+        "chord_corrupted_indices": [chosen["chord_idx"]],
+        "details": {
+            "target_chord_index": chosen["chord_idx"],
+            "target_note_index": chosen["note_idx"],
+            "omit_degree": chosen["omit_degree"],
+            "melody_pc": chosen["melody_pc"],
+            "removed_pcs": chosen["removed_pcs"],
+            "same_onset": chosen["same_onset"],
+            "strong_note_position": chosen["is_strong"],
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_inversion_bass_continuity_conflict(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("inversion_bass_continuity_conflict")
+    chords = song_obj.get("chords", [])
+    if len(chords) < 2:
+        metadata["reason_skipped"] = "not_enough_chords"
+        return song_obj, metadata, False
+
+    inversion_raw_to_id = {int(raw): int(inversion_id) for inversion_id, raw in theory_ctx.get("inversion_id_to_raw", {}).items()}
+    min_badness_gain = float(corruption_cfg.get("inversion_min_badness_gain", 0.5))
+    candidates: list[dict] = []
+    chord_indices = list(range(len(chords)))
+    rng.shuffle(chord_indices)
+
+    for chord_idx in chord_indices:
+        chord = chords[chord_idx]
+        if int(chord.get("is_rest", 0)) == 1:
+            continue
+        body_pcs = chord_body_pcs_ordered(song_obj, chord, theory_ctx)
+        if not body_pcs or len(body_pcs) < 2:
+            continue
+        current_inversion_raw = decode_inversion_raw(chord, theory_ctx)
+        if current_inversion_raw is None:
+            current_inversion_raw = 0
+        max_inversion_raw = min(3, len(body_pcs) - 1)
+        current_inversion_raw = max(0, min(int(current_inversion_raw), max_inversion_raw))
+        prev_bass_pc = _neighbor_implied_bass(song_obj, chords, chord_idx, step=-1, theory_ctx=theory_ctx)
+        next_bass_pc = _neighbor_implied_bass(song_obj, chords, chord_idx, step=1, theory_ctx=theory_ctx)
+        if prev_bass_pc is None and next_bass_pc is None:
+            continue
+        strong_position = _is_strong_chord_position(chord, song_obj)
+        current_bass_pc = int(body_pcs[current_inversion_raw]) % 12
+        current_badness = _bass_continuity_badness(
+            candidate_bass_pc=current_bass_pc,
+            inversion_raw=current_inversion_raw,
+            body_len=len(body_pcs),
+            prev_bass_pc=prev_bass_pc,
+            next_bass_pc=next_bass_pc,
+            strong_position=strong_position,
+        )
+
+        for candidate_inversion_raw in range(max_inversion_raw + 1):
+            if candidate_inversion_raw == current_inversion_raw:
+                continue
+            candidate_bass_pc = int(body_pcs[candidate_inversion_raw]) % 12
+            candidate_badness = _bass_continuity_badness(
+                candidate_bass_pc=candidate_bass_pc,
+                inversion_raw=candidate_inversion_raw,
+                body_len=len(body_pcs),
+                prev_bass_pc=prev_bass_pc,
+                next_bass_pc=next_bass_pc,
+                strong_position=strong_position,
+            )
+            badness_gain = candidate_badness - current_badness
+            if badness_gain <= min_badness_gain:
+                continue
+            candidate_inversion_id = inversion_raw_to_id.get(int(candidate_inversion_raw))
+            if candidate_inversion_id is None:
+                continue
+            candidates.append({
+                "chord_idx": chord_idx,
+                "current_inversion_raw": current_inversion_raw,
+                "candidate_inversion_raw": int(candidate_inversion_raw),
+                "candidate_inversion_id": candidate_inversion_id,
+                "current_bass_pc": current_bass_pc,
+                "candidate_bass_pc": candidate_bass_pc,
+                "prev_bass_pc": prev_bass_pc,
+                "next_bass_pc": next_bass_pc,
+                "current_badness": current_badness,
+                "candidate_badness": candidate_badness,
+                "badness_gain": badness_gain,
+                "strong_position": strong_position,
+            })
+
+    if not candidates:
+        metadata["reason_skipped"] = "no_inversion_with_higher_bass_badness"
+        return song_obj, metadata, False
+
+    max_gain = max(candidate["badness_gain"] for candidate in candidates)
+    best_candidates = [candidate for candidate in candidates if abs(candidate["badness_gain"] - max_gain) <= 1e-9]
+    chosen = rng.choice(best_candidates)
+    chord = chords[chosen["chord_idx"]]
+    chord["inversion_id"] = chosen["candidate_inversion_id"]
+
+    metadata.update({
+        "applied": True,
+        "n_chords_modified": 1,
+        "chord_corrupted_indices": [chosen["chord_idx"]],
+        "details": {
+            "target_chord_index": chosen["chord_idx"],
+            "current_inversion_raw": chosen["current_inversion_raw"],
+            "new_inversion_raw": chosen["candidate_inversion_raw"],
+            "current_bass_pc": chosen["current_bass_pc"],
+            "new_bass_pc": chosen["candidate_bass_pc"],
+            "prev_bass_pc": chosen["prev_bass_pc"],
+            "next_bass_pc": chosen["next_bass_pc"],
+            "current_badness": chosen["current_badness"],
+            "new_badness": chosen["candidate_badness"],
+            "badness_gain": chosen["badness_gain"],
+            "strong_position": chosen["strong_position"],
+        },
+    })
+    return song_obj, metadata, True
 
 
 def _corrupt_note_onset_shift(song_obj, theory_ctx, rng, corruption_cfg):
@@ -1001,6 +1733,11 @@ _CORRUPTION_REGISTRY: dict[str, Callable] = {
     "strongbeat_nonchord_note": _corrupt_strongbeat_nonchord_note,
     "borrowed_melody_conflict": _corrupt_borrowed_melody_conflict,
     "borrowed_kind_toggle_without_melody_change": _corrupt_borrowed_kind_toggle,
+    "melody_semitone_add_clash": _corrupt_melody_semitone_add_clash,
+    "melody_suspension_clash": _corrupt_melody_suspension_clash,
+    "melody_alteration_clash": _corrupt_melody_alteration_clash,
+    "melody_omit_core_tone_conflict": _corrupt_melody_omit_core_tone_conflict,
+    "inversion_bass_continuity_conflict": _corrupt_inversion_bass_continuity_conflict,
     "note_onset_shift": _corrupt_note_onset_shift,
     "strong_weak_beat_flip": _corrupt_strong_weak_beat_flip,
     "functional_progression_violation_strict": _corrupt_functional_progression_violation,
@@ -1020,8 +1757,8 @@ _PLACEHOLDER_MODES = {
 }
 
 
-def corrupt_song_obj(song_obj, corruption_modes, corruption_cfg, theory_ctx, rng=None):
-    """Apply a random song-level corruption and return (song, metadata)."""
+def corrupt_song_obj(song_obj, corruption_modes, corruption_cfg, theory_ctx, rng=None, shuffle_modes=True):
+    """Apply a song-level corruption and return (song, metadata)."""
     rng = rng or random
     song_corrupted = copy.deepcopy(song_obj)
     requested_modes = list(corruption_modes or _CORRUPTION_REGISTRY.keys())
@@ -1030,10 +1767,17 @@ def corrupt_song_obj(song_obj, corruption_modes, corruption_cfg, theory_ctx, rng
     if not available_modes:
         return song_corrupted, _identity_metadata("identity")
 
-    rng.shuffle(available_modes)
+    if shuffle_modes:
+        rng.shuffle(available_modes)
+    last_metadata = None
     for mode in available_modes:
         if mode in _PLACEHOLDER_MODES:
             _, metadata, _ = _not_implemented_mode(song_corrupted, theory_ctx, rng, corruption_cfg, mode)
+            metadata["corruption_name"] = mode
+            metadata["applied"] = False
+            if not metadata.get("reason_skipped"):
+                metadata["reason_skipped"] = "registered_but_not_implemented"
+            last_metadata = metadata
             continue
 
         song_candidate = copy.deepcopy(song_corrupted)
@@ -1046,7 +1790,10 @@ def corrupt_song_obj(song_obj, corruption_modes, corruption_cfg, theory_ctx, rng
         metadata["applied"] = False
         if not metadata.get("reason_skipped"):
             metadata["reason_skipped"] = "not_applicable"
+        last_metadata = metadata
 
+    if last_metadata is not None:
+        return song_corrupted, last_metadata
     identity = _identity_metadata("identity")
     identity["corruption_name"] = "identity"
     identity["reason_skipped"] = "no_applicable_corruption_found"

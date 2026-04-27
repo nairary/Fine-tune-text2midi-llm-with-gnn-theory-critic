@@ -13,6 +13,7 @@ corruption_modes:
 theory_aware:
   strongbeat_min_duration: 1.0
   strongbeat_only: true
+  balance_mode_usage: false
   deterministic_per_sample: true
   deterministic_seed: 123
 pairs_per_song: 1

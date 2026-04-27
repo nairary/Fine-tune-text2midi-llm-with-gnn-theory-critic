@@ -12,12 +12,18 @@ theory_aware:
   strongbeat_min_duration: 1.0
   strongbeat_only: true
   rhythm_shift_max_steps: 2
+  balance_mode_usage: false
   deterministic_per_sample: true
   deterministic_seed: 123
 corruption_modes:
   - strongbeat_nonchord_note
   - borrowed_melody_conflict
   - borrowed_kind_toggle_without_melody_change
+  - melody_semitone_add_clash
+  - melody_suspension_clash
+  - melody_alteration_clash
+  - melody_omit_core_tone_conflict
+  - inversion_bass_continuity_conflict
   - note_onset_shift
   - strong_weak_beat_flip
   - functional_progression_violation_strict

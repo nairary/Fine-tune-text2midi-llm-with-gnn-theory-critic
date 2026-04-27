@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch
 
+from .corruption_balancer import CorruptionModeBalancer
 from .song_corruptions import corrupt_song_obj
 from .theory_helpers import build_theory_context
 from .utils_graph import build_graph_from_encoded, corrupt_graph, mask_graph
@@ -31,6 +32,15 @@ class HookTheoryDataset(Dataset):
         self.corruption_modes = tuple(corruption_modes) if corruption_modes is not None else None
         self.corruption_backend = corruption_backend
         self.theory_aware_cfg = theory_aware_cfg or {}
+        self.deterministic_per_sample = bool(self.theory_aware_cfg.get("deterministic_per_sample", False))
+        self.balance_mode_usage = (
+            self.corruption_backend == "song_theory"
+            and bool(self.theory_aware_cfg.get("balance_mode_usage", False))
+            and not self.deterministic_per_sample
+            and self.corruption_modes is not None
+            and len(self.corruption_modes) > 1
+        )
+        self.corruption_mode_balancer = CorruptionModeBalancer(self.corruption_modes or ()) if self.balance_mode_usage else None
         self.theory_ctx = build_theory_context() if self.corruption_backend == "song_theory" else None
 
         with open(self.json_path, "r", encoding="utf-8") as f:
@@ -57,16 +67,24 @@ class HookTheoryDataset(Dataset):
         )
         if self.corruption_backend == "song_theory":
             per_sample_rng = random
-            if bool(self.theory_aware_cfg.get("deterministic_per_sample", False)):
+            if self.deterministic_per_sample:
                 base_seed = int(self.theory_aware_cfg.get("deterministic_seed", 0))
                 per_sample_rng = random.Random(base_seed + int(idx))
+            corruption_modes = self.corruption_modes
+            shuffle_modes = True
+            if self.corruption_mode_balancer is not None:
+                corruption_modes = self.corruption_mode_balancer.ordered_modes(per_sample_rng)
+                shuffle_modes = False
             song_corrupted, corruption_metadata = corrupt_song_obj(
                 song_obj,
-                corruption_modes=self.corruption_modes,
+                corruption_modes=corruption_modes,
                 corruption_cfg=self.theory_aware_cfg,
                 theory_ctx=self.theory_ctx,
                 rng=per_sample_rng,
+                shuffle_modes=shuffle_modes,
             )
+            if self.corruption_mode_balancer is not None and bool((corruption_metadata or {}).get("applied", False)):
+                self.corruption_mode_balancer.record_applied(str(corruption_metadata.get("corruption_name", "")))
             graph_corrupted = build_graph_from_encoded(song_corrupted)
         else:
             graph_corrupted = corrupt_graph(graph_real, corruption_modes=self.corruption_modes)
@@ -80,6 +98,11 @@ class HookTheoryDataset(Dataset):
             "corruption_metadata": corruption_metadata,
             "graph_score_label": 1.0,
         }
+
+    def get_corruption_usage_counts(self) -> dict[str, int]:
+        if self.corruption_mode_balancer is None:
+            return {}
+        return self.corruption_mode_balancer.usage_counts()
 
 
 def collate_fn(batch):

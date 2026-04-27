@@ -14,7 +14,9 @@ from src.dataloader.song_corruptions import corrupt_song_obj
 from src.dataloader.theory_helpers import (
     build_theory_context,
     chord_bass_and_top_pcs,
+    chord_implied_bass_pc,
     decode_chord_components,
+    decode_inversion_raw,
     chord_pitch_classes_tertian,
     decode_sd_to_chromatic,
     find_covering_chord_index,
@@ -220,6 +222,34 @@ class TheorySmokeTests(unittest.TestCase):
         song_bad_meta["meta"]["main_num_beats"] = None
         self.assertTrue(is_strong_note_position({"beat": 1.0}, song_bad_meta))
 
+    def test_borrowed_kind_toggle_requires_melody_and_changes_pcset(self):
+        song = self._song()
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["borrowed_kind_toggle_without_melody_change"],
+            {},
+            self.ctx,
+            rng=random.Random(5),
+        )
+        self.assertTrue(meta["applied"])
+        chord_idx = meta["chord_corrupted_indices"][0]
+        before = chord_pitch_classes_tertian(song, song["chords"][chord_idx], self.ctx)
+        after = chord_pitch_classes_tertian(corrupted_song, corrupted_song["chords"][chord_idx], self.ctx)
+        self.assertNotEqual(before, after)
+        self.assertTrue(meta["details"]["overlapping_melody_indices"])
+
+        song_no_melody = self._song()
+        song_no_melody["melody"] = []
+        _, meta_no_melody = corrupt_song_obj(
+            copy.deepcopy(song_no_melody),
+            ["borrowed_kind_toggle_without_melody_change"],
+            {},
+            self.ctx,
+            rng=random.Random(5),
+        )
+        self.assertFalse(meta_no_melody["applied"])
+        self.assertEqual(meta_no_melody["reason_skipped"], "no_non_rest_melody_notes")
+
     def test_corrupt_song_obj_skips_none_beat_notes_without_crashing(self):
         song = self._song()
         song["melody"][0]["beat"] = None
@@ -283,6 +313,236 @@ class TheorySmokeTests(unittest.TestCase):
             old_pc = decode_sd_to_chromatic(int(before[idx]), self.ctx)
             new_pc = decode_sd_to_chromatic(int(after[idx]), self.ctx)
             self.assertEqual((new_pc - old_pc) % 12, meta["details"]["shift_semitones"] % 12)
+
+    def test_melody_semitone_add_clash_smoke(self):
+        song = self._song()
+        sharp_tonic = self.ctx["sd_token_to_id"].get("#1", self.ctx["sd_token_to_id"]["b2"])
+        song["melody"][0]["sd_id"] = sharp_tonic
+        song["melody"][0]["beat"] = 1.0
+        song["melody"][0]["duration"] = 1.0
+        song["chords"][0]["root_id"] = 1
+        song["chords"][0]["type_id"] = 1
+        song["chords"][0]["adds_vec"] = [0, 0, 0, 0, 0, 0]
+
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["melody_semitone_add_clash"],
+            {},
+            self.ctx,
+            rng=random.Random(6),
+        )
+        self.assertTrue(meta["applied"])
+        chord_idx = meta["details"]["target_chord_index"]
+        note_idx = meta["details"]["target_note_index"]
+
+        before_decoded = decode_chord_components(song, song["chords"][chord_idx], self.ctx)
+        after_decoded = decode_chord_components(corrupted_song, corrupted_song["chords"][chord_idx], self.ctx)
+        self.assertIsNotNone(before_decoded)
+        self.assertIsNotNone(after_decoded)
+
+        before_total = set(before_decoded["body_pcs"] + before_decoded["add_pcs"])
+        after_total = set(after_decoded["body_pcs"] + after_decoded["add_pcs"])
+        added_pcs = after_total - before_total
+        self.assertTrue(added_pcs)
+
+        melody_pc = decode_sd_to_chromatic(int(corrupted_song["melody"][note_idx]["sd_id"]), self.ctx)
+        self.assertIsNotNone(melody_pc)
+        self.assertTrue(any((int(pc) - int(melody_pc)) % 12 in {1, 11} for pc in added_pcs))
+        self.assertNotEqual(song["chords"][chord_idx]["adds_vec"], corrupted_song["chords"][chord_idx]["adds_vec"])
+
+    def test_melody_suspension_clash_smoke(self):
+        song = self._song()
+        song["melody"][0]["sd_id"] = self.ctx["sd_token_to_id"]["3"]
+        song["melody"][0]["beat"] = 1.0
+        song["melody"][0]["duration"] = 1.0
+        song["chords"][0]["root_id"] = 1
+        song["chords"][0]["type_id"] = 1
+        song["chords"][0]["adds_vec"] = [0, 0, 0, 0, 0, 0]
+        song["chords"][0]["suspensions_vec"] = [0, 0]
+        song["chords"][0]["omits_vec"] = [0, 0]
+        song["chords"][0]["alterations_vec"] = [0, 0, 0, 0, 0, 0]
+
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["melody_suspension_clash"],
+            {},
+            self.ctx,
+            rng=random.Random(10),
+        )
+        self.assertTrue(meta["applied"])
+        chord_idx = meta["details"]["target_chord_index"]
+        note_idx = meta["details"]["target_note_index"]
+        before_decoded = decode_chord_components(song, song["chords"][chord_idx], self.ctx)
+        after_decoded = decode_chord_components(corrupted_song, corrupted_song["chords"][chord_idx], self.ctx)
+        self.assertIsNotNone(before_decoded)
+        self.assertIsNotNone(after_decoded)
+
+        before_total = set(before_decoded["body_pcs"] + before_decoded["add_pcs"])
+        after_total = set(after_decoded["body_pcs"] + after_decoded["add_pcs"])
+        removed_pcs = before_total - after_total
+        added_pcs = after_total - before_total
+        melody_pc = decode_sd_to_chromatic(int(corrupted_song["melody"][note_idx]["sd_id"]), self.ctx)
+
+        self.assertTrue(added_pcs)
+        self.assertTrue(removed_pcs)
+        self.assertTrue(meta["details"]["same_onset"])
+        self.assertIn(meta["details"]["suspension_degree"], {2, 4})
+        self.assertIn(before_decoded["degree_to_pc"][3], removed_pcs)
+        self.assertTrue(
+            any((int(pc) - int(melody_pc)) % 12 in {1, 11} for pc in added_pcs)
+            or int(melody_pc) == int(before_decoded["degree_to_pc"][3])
+        )
+
+    def test_melody_alteration_clash_smoke(self):
+        song = self._song()
+        song["melody"][0]["sd_id"] = self.ctx["sd_token_to_id"]["5"]
+        song["melody"][0]["beat"] = 1.0
+        song["melody"][0]["duration"] = 1.0
+        song["chords"][0]["root_id"] = 1
+        song["chords"][0]["type_id"] = 1
+        song["chords"][0]["adds_vec"] = [0, 0, 0, 0, 0, 0]
+        song["chords"][0]["suspensions_vec"] = [0, 0]
+        song["chords"][0]["omits_vec"] = [0, 0]
+        song["chords"][0]["alterations_vec"] = [0, 0, 0, 0, 0, 0]
+
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["melody_alteration_clash"],
+            {},
+            self.ctx,
+            rng=random.Random(11),
+        )
+        self.assertTrue(meta["applied"])
+        chord_idx = meta["details"]["target_chord_index"]
+        note_idx = meta["details"]["target_note_index"]
+        before_decoded = decode_chord_components(song, song["chords"][chord_idx], self.ctx)
+        after_decoded = decode_chord_components(corrupted_song, corrupted_song["chords"][chord_idx], self.ctx)
+        self.assertIsNotNone(before_decoded)
+        self.assertIsNotNone(after_decoded)
+
+        before_total = set(before_decoded["body_pcs"] + before_decoded["add_pcs"])
+        after_total = set(after_decoded["body_pcs"] + after_decoded["add_pcs"])
+        added_pcs = after_total - before_total
+        self.assertTrue(added_pcs)
+        self.assertNotEqual(song["chords"][chord_idx]["alterations_vec"], corrupted_song["chords"][chord_idx]["alterations_vec"])
+        self.assertTrue(meta["details"]["same_onset"])
+        melody_pc = decode_sd_to_chromatic(int(corrupted_song["melody"][note_idx]["sd_id"]), self.ctx)
+        self.assertTrue(any((int(pc) - int(melody_pc)) % 12 in {1, 11} for pc in added_pcs))
+
+    def test_melody_omit_core_tone_conflict_smoke(self):
+        song = self._song()
+        song["melody"][0]["sd_id"] = self.ctx["sd_token_to_id"]["3"]
+        song["melody"][0]["beat"] = 1.0
+        song["melody"][0]["duration"] = 1.0
+        song["chords"][0]["root_id"] = 1
+        song["chords"][0]["type_id"] = 1
+        song["chords"][0]["adds_vec"] = [0, 0, 0, 0, 0, 0]
+        song["chords"][0]["suspensions_vec"] = [0, 0]
+        song["chords"][0]["omits_vec"] = [0, 0]
+        song["chords"][0]["alterations_vec"] = [0, 0, 0, 0, 0, 0]
+
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["melody_omit_core_tone_conflict"],
+            {},
+            self.ctx,
+            rng=random.Random(12),
+        )
+        self.assertTrue(meta["applied"])
+        chord_idx = meta["details"]["target_chord_index"]
+        note_idx = meta["details"]["target_note_index"]
+        before_decoded = decode_chord_components(song, song["chords"][chord_idx], self.ctx)
+        after_decoded = decode_chord_components(corrupted_song, corrupted_song["chords"][chord_idx], self.ctx)
+        self.assertIsNotNone(before_decoded)
+        self.assertIsNotNone(after_decoded)
+
+        before_total = set(before_decoded["body_pcs"] + before_decoded["add_pcs"])
+        after_total = set(after_decoded["body_pcs"] + after_decoded["add_pcs"])
+        removed_pcs = before_total - after_total
+        melody_pc = decode_sd_to_chromatic(int(corrupted_song["melody"][note_idx]["sd_id"]), self.ctx)
+
+        self.assertEqual(meta["details"]["omit_degree"], 3)
+        self.assertTrue(removed_pcs)
+        self.assertTrue(meta["details"]["same_onset"])
+        self.assertEqual(int(melody_pc), int(before_decoded["degree_to_pc"][3]))
+        self.assertIn(int(before_decoded["degree_to_pc"][3]), removed_pcs)
+        self.assertNotEqual(song["chords"][chord_idx]["omits_vec"], corrupted_song["chords"][chord_idx]["omits_vec"])
+
+    def test_inversion_bass_continuity_conflict_smoke(self):
+        song = self._song()
+        song["melody"] = [
+            {"beat": 1.0, "duration": 2.0, "sd_id": self.ctx["sd_token_to_id"]["1"], "octave_id": 5, "is_rest": 0},
+            {"beat": 3.0, "duration": 2.0, "sd_id": self.ctx["sd_token_to_id"]["5"], "octave_id": 5, "is_rest": 0},
+            {"beat": 5.0, "duration": 2.0, "sd_id": self.ctx["sd_token_to_id"]["1"], "octave_id": 5, "is_rest": 0},
+        ]
+        song["chords"] = [
+            {
+                "beat": 1.0,
+                "duration": 2.0,
+                "root_id": 1,
+                "type_id": 1,
+                "inversion_id": 1,
+                "applied_id": 1,
+                "borrowed_kind_id": self.ctx["borrowed_kind_to_id"]["none"],
+                "borrowed_mode_name_id": next(k for k, v in self.ctx["borrowed_mode_id_to_name"].items() if "none" in str(v).lower()),
+                "adds_vec": [0, 0, 0, 0, 0, 0],
+                "borrowed_pcset_vec": [0] * 12,
+                "is_rest": 0,
+                "pos_in_bar": 0.0,
+            },
+            {
+                "beat": 3.0,
+                "duration": 2.0,
+                "root_id": 5,
+                "type_id": 2,
+                "inversion_id": 2,
+                "applied_id": 1,
+                "borrowed_kind_id": self.ctx["borrowed_kind_to_id"]["none"],
+                "borrowed_mode_name_id": next(k for k, v in self.ctx["borrowed_mode_id_to_name"].items() if "none" in str(v).lower()),
+                "adds_vec": [0, 0, 0, 0, 0, 0],
+                "borrowed_pcset_vec": [0] * 12,
+                "is_rest": 0,
+                "pos_in_bar": 2.0,
+            },
+            {
+                "beat": 5.0,
+                "duration": 2.0,
+                "root_id": 1,
+                "type_id": 1,
+                "inversion_id": 1,
+                "applied_id": 1,
+                "borrowed_kind_id": self.ctx["borrowed_kind_to_id"]["none"],
+                "borrowed_mode_name_id": next(k for k, v in self.ctx["borrowed_mode_id_to_name"].items() if "none" in str(v).lower()),
+                "adds_vec": [0, 0, 0, 0, 0, 0],
+                "borrowed_pcset_vec": [0] * 12,
+                "is_rest": 0,
+                "pos_in_bar": 0.0,
+            },
+        ]
+
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["inversion_bass_continuity_conflict"],
+            {},
+            self.ctx,
+            rng=random.Random(8),
+        )
+        self.assertTrue(meta["applied"])
+        chord_idx = meta["details"]["target_chord_index"]
+        self.assertEqual(chord_idx, 1)
+        self.assertEqual(meta["details"]["current_inversion_raw"], 1)
+        self.assertGreater(meta["details"]["badness_gain"], 0.0)
+        self.assertTrue(meta["details"]["strong_position"])
+
+        before_inv = decode_inversion_raw(song["chords"][chord_idx], self.ctx)
+        after_inv = decode_inversion_raw(corrupted_song["chords"][chord_idx], self.ctx)
+        before_bass = chord_implied_bass_pc(song, song["chords"][chord_idx], self.ctx)
+        after_bass = chord_implied_bass_pc(corrupted_song, corrupted_song["chords"][chord_idx], self.ctx)
+        self.assertEqual(before_inv, 1)
+        self.assertNotEqual(before_inv, after_inv)
+        self.assertNotEqual(before_bass, after_bass)
+        self.assertEqual(after_inv, meta["details"]["new_inversion_raw"])
+        self.assertEqual(after_bass, meta["details"]["new_bass_pc"])
 
     def test_octave_leap_violation_smoke(self):
         song = self._song()

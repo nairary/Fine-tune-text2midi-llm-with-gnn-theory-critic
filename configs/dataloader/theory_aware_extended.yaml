@@ -14,6 +14,7 @@ theory_aware:
   strongbeat_min_duration: 1.0
   strongbeat_only: true
   rhythm_shift_max_steps: 2
+  balance_mode_usage: true
 
   # Если true, для каждого idx в датасете коррапшен воспроизводится одинаково между запусками.
   deterministic_per_sample: false
@@ -27,6 +28,16 @@ corruption_modes:
   - borrowed_melody_conflict
   # Переключает borrowed атрибуты аккорда без изменения мелодии.
   - borrowed_kind_toggle_without_melody_change
+  # Добавляет аккордовую надстройку, которая звучит в полутоне от одновременно звучащей мелодии.
+  - melody_semitone_add_clash
+  # Переводит аккорд в sus, когда мелодия продолжает утверждать терцию или конфликтует с новой suspension.
+  - melody_suspension_clash
+  # Добавляет altered-tone в аккорд так, чтобы он был в полутоне от мелодии.
+  - melody_alteration_clash
+  # Убирает терцию или квинту из аккорда, когда мелодия как раз опирается на этот core tone.
+  - melody_omit_core_tone_conflict
+  # Меняет inversion так, чтобы implied bass хуже связывался с соседними аккордами.
+  - inversion_bass_continuity_conflict
   # Сдвигает onset ноты на соседние позиции по ритмической сетке.
   - note_onset_shift
   # Переносит ноту между сильной и слабой долей внутри такта.

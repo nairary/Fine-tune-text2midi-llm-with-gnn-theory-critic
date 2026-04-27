@@ -12,6 +12,7 @@ theory_aware:
   strongbeat_min_duration: 1.0
   strongbeat_only: true
   rhythm_shift_max_steps: 2
+  balance_mode_usage: false
   deterministic_per_sample: false
   deterministic_seed: 123
 corruption_modes:

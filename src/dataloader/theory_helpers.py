@@ -143,6 +143,10 @@ def decode_type_raw(chord: dict, theory_ctx: dict) -> int | None:
     return theory_ctx["type_id_to_raw"].get(int(chord.get("type_id", 0)))
 
 
+def decode_inversion_raw(chord: dict, theory_ctx: dict) -> int | None:
+    return theory_ctx["inversion_id_to_raw"].get(int(chord.get("inversion_id", 0)))
+
+
 def _resolve_root_anchor(root_raw: int, template: list[int]) -> tuple[int, int] | None:
     """
     Return (anchor_degree_idx, root_pc).
@@ -220,6 +224,25 @@ def chord_bass_and_top_pcs(song_obj: dict, chord: dict, theory_ctx: dict) -> tup
     top_degree_idx = (anchor_degree_idx + 2 * (n_tones - 1)) % 7
     top_pc = template[top_degree_idx] % 12
     return root_pc % 12, top_pc
+
+
+def chord_body_pcs_ordered(song_obj: dict, chord: dict, theory_ctx: dict) -> list[int] | None:
+    decoded = decode_chord_components(song_obj, chord, theory_ctx)
+    if decoded is None:
+        return None
+    body_pcs = [int(pc) % 12 for pc in decoded["body_pcs"]]
+    return body_pcs or None
+
+
+def chord_implied_bass_pc(song_obj: dict, chord: dict, theory_ctx: dict) -> int | None:
+    body_pcs = chord_body_pcs_ordered(song_obj, chord, theory_ctx)
+    if not body_pcs:
+        return None
+    inversion_raw = decode_inversion_raw(chord, theory_ctx)
+    if inversion_raw is None:
+        inversion_raw = 0
+    inversion_raw = max(0, min(int(inversion_raw), len(body_pcs) - 1))
+    return int(body_pcs[inversion_raw]) % 12
 
 
 def _bitvec_to_allowed_values(vec: list[int] | None, allowed_values: list) -> list:
@@ -318,6 +341,13 @@ def decode_chord_components(song_obj: dict, chord: dict, theory_ctx: dict) -> di
     return {
         "body_pcs": body_pcs,
         "add_pcs": add_pcs,
+        "body_degrees": body_degrees,
+        "add_degrees": add_degrees,
+        "included_degrees": sorted(int(degree) for degree in included),
+        "degree_to_pc": {int(degree): int(pc) % 12 for degree, pc in degree_to_pc.items()},
+        "suspension_degrees": sorted(int(x) for x in suspensions),
+        "omit_degrees": sorted(int(x) for x in omits),
+        "alteration_tokens": sorted(str(x) for x in alterations),
         "active_mode_name": active_mode_name,
         "root_raw": root_raw,
         "type_raw": type_raw,

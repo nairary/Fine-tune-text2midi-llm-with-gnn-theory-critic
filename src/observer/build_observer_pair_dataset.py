@@ -14,6 +14,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from src.data.render_encoded_song_to_midi import load_octave_id_map, render_song_to_pretty_midi
+from src.dataloader.corruption_balancer import CorruptionModeBalancer
 from src.dataloader.song_corruptions import corrupt_song_obj
 from src.dataloader.theory_helpers import build_theory_context
 from src.observer.pipeline_paths import resolve_observer_pipeline_paths
@@ -279,6 +280,8 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
     stats = BuildStats(total=len(dataset))
     pairs_per_song = max(1, int(cfg.dataloader.get("pairs_per_song", 1)))
     corruption_modes = list(cfg.dataloader.corruption_modes)
+    balance_mode_usage = bool(theory_cfg.get("balance_mode_usage", False)) and not deterministic and len(corruption_modes) > 1
+    mode_balancer = CorruptionModeBalancer(corruption_modes) if balance_mode_usage else None
 
     # validate meta exactly once per row
     valid_rows: list[tuple[dict[str, Any], dict[str, Any], int]] = []
@@ -324,12 +327,18 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
                     seed = int(theory_cfg.get("deterministic_seed", 0)) + stable_song_seed + pair_idx
                     rng = random.Random(seed)
 
+                requested_modes = corruption_modes
+                shuffle_modes = True
+                if mode_balancer is not None:
+                    requested_modes = mode_balancer.ordered_modes(rng)
+                    shuffle_modes = False
                 corrupted_song, corr_meta = corrupt_song_obj(
                     song_obj,
-                    corruption_modes=corruption_modes,
+                    corruption_modes=requested_modes,
                     corruption_cfg=theory_cfg,
                     theory_ctx=theory_ctx,
                     rng=rng,
+                    shuffle_modes=shuffle_modes,
                 )
                 corr_meta = corr_meta or {}
                 corr_name = str(corr_meta.get("corruption_name", "identity"))
@@ -341,6 +350,8 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
                     skip_rows.append({"source_song_id": meta["song_id"], "pair_group_id": pair_group_id, "split": split_key, "reason_skipped": reason_skip})
                     global_skip_counter[reason_skip] += 1
                     continue
+                if mode_balancer is not None:
+                    mode_balancer.record_applied(corr_name)
 
                 candidate_rows: list[dict[str, Any]] = []
                 clean_written = False
