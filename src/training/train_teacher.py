@@ -6,7 +6,7 @@ import random
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Mapping
+from typing import Any, Dict, Mapping
 
 import hydra
 import torch
@@ -155,6 +155,18 @@ def build_scheduler(optimizer: AdamW, scheduler_cfg: DictConfig):
     raise ValueError(f"Unsupported scheduler '{scheduler_cfg.name}'.")
 
 
+def build_stage_scheduler(optimizer: AdamW, scheduler_cfg: DictConfig, stage_epochs: int):
+    if scheduler_cfg.name == "none":
+        return None
+    if scheduler_cfg.name == "cosine":
+        return CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, int(stage_epochs)),
+            eta_min=float(scheduler_cfg.eta_min),
+        )
+    raise ValueError(f"Unsupported scheduler '{scheduler_cfg.name}'.")
+
+
 def build_loaders(cfg: DictConfig):
     json_path = resolve_path(cfg.data.json_path)
     if not json_path.exists():
@@ -219,12 +231,106 @@ def loss_cfg_to_runtime(losses_cfg: DictConfig) -> tuple[dict, dict]:
     return recon_weights, enabled_heads
 
 
+def build_training_stages(training_cfg: DictConfig, losses_cfg: DictConfig, total_epochs: int) -> list[dict[str, Any]]:
+    mlm_ssl_epochs = training_cfg.get("mlm_ssl_epochs")
+    corruption_epochs = training_cfg.get("corruption_epochs")
+    mlm_ssl_epochs = None if mlm_ssl_epochs is None else int(mlm_ssl_epochs)
+    corruption_epochs = None if corruption_epochs is None else int(corruption_epochs)
+
+    if mlm_ssl_epochs is None and corruption_epochs is None:
+        mlm_ssl_epochs = max(1, total_epochs // 2) if total_epochs > 0 else 0
+        corruption_epochs = total_epochs - mlm_ssl_epochs
+    elif mlm_ssl_epochs is None:
+        corruption_epochs = max(0, corruption_epochs)
+        mlm_ssl_epochs = total_epochs - corruption_epochs
+    elif corruption_epochs is None:
+        mlm_ssl_epochs = max(0, mlm_ssl_epochs)
+        corruption_epochs = total_epochs - mlm_ssl_epochs
+
+    if mlm_ssl_epochs < 0 or corruption_epochs < 0:
+        raise ValueError("training.mlm_ssl_epochs and training.corruption_epochs must be non-negative.")
+    if mlm_ssl_epochs + corruption_epochs != total_epochs:
+        raise ValueError(
+            "The staged training plan is inconsistent: "
+            f"mlm_ssl_epochs ({mlm_ssl_epochs}) + corruption_epochs ({corruption_epochs}) "
+            f"must equal total epochs ({total_epochs})."
+        )
+
+    stages: list[dict[str, Any]] = []
+    if mlm_ssl_epochs > 0:
+        stages.append(
+            {
+                "name": "mlm_ssl",
+                "epochs": mlm_ssl_epochs,
+                "enable_recon": True,
+                "enable_graph_rank": False,
+                "enable_note_local": False,
+                "enable_chord_local": False,
+                "enable_onset_local": False,
+                "selection_metric": "recon_loss",
+                "selection_mode": "min",
+                "best_checkpoint_name": "best_recon_loss.pt",
+                "run_local_eval": False,
+            }
+        )
+
+    corruption_objectives_enabled = any(
+        (
+            bool(losses_cfg.enable_graph_rank),
+            bool(losses_cfg.enable_note_local),
+            bool(losses_cfg.enable_chord_local),
+            bool(losses_cfg.enable_onset_local),
+        )
+    )
+    if corruption_epochs > 0:
+        if not corruption_objectives_enabled:
+            raise ValueError(
+                "training.corruption_epochs is positive, but all corruption objectives are disabled in losses config."
+            )
+        selection_metric = "rank_acc" if bool(losses_cfg.enable_graph_rank) else "loss"
+        selection_mode = "max" if selection_metric == "rank_acc" else "min"
+        stages.append(
+            {
+                "name": "corruption",
+                "epochs": corruption_epochs,
+                "enable_recon": False,
+                "enable_graph_rank": bool(losses_cfg.enable_graph_rank),
+                "enable_note_local": bool(losses_cfg.enable_note_local),
+                "enable_chord_local": bool(losses_cfg.enable_chord_local),
+                "enable_onset_local": bool(losses_cfg.enable_onset_local),
+                "selection_metric": selection_metric,
+                "selection_mode": selection_mode,
+                "best_checkpoint_name": "best_rank_acc.pt" if selection_metric == "rank_acc" else "best_corruption_loss.pt",
+                "run_local_eval": any(
+                    (
+                        bool(losses_cfg.enable_note_local),
+                        bool(losses_cfg.enable_chord_local),
+                        bool(losses_cfg.enable_onset_local),
+                    )
+                ),
+            }
+        )
+
+    if not stages:
+        raise ValueError("No training stages were scheduled. Increase training.epochs or stage-specific epoch counts.")
+    return stages
+
+
+def metric_improved(current_value: float, best_value: float, mode: str) -> bool:
+    if mode == "max":
+        return current_value > best_value
+    if mode == "min":
+        return current_value < best_value
+    raise ValueError(f"Unsupported selection mode '{mode}'.")
+
+
 def run_epoch(
     model: TeacherGNN,
     loader: DataLoader,
     device: torch.device,
     losses_cfg: DictConfig,
     training_cfg: DictConfig,
+    stage_cfg: Mapping[str, Any],
     optimizer: AdamW | None = None,
     scaler: torch.cuda.amp.GradScaler | None = None,
     max_batches: int | None = None,
@@ -235,6 +341,12 @@ def run_epoch(
     recon_weights, enabled_heads = loss_cfg_to_runtime(losses_cfg)
     grad_clip = float(training_cfg.grad_clip) if training_cfg.grad_clip is not None else None
     autocast_enabled = bool(training_cfg.use_amp and device.type == "cuda")
+    enable_recon = bool(stage_cfg.get("enable_recon", True))
+    enable_graph_rank = bool(stage_cfg.get("enable_graph_rank", bool(losses_cfg.enable_graph_rank)))
+    enable_note_local = bool(stage_cfg.get("enable_note_local", bool(losses_cfg.enable_note_local)))
+    enable_chord_local = bool(stage_cfg.get("enable_chord_local", bool(losses_cfg.enable_chord_local)))
+    enable_onset_local = bool(stage_cfg.get("enable_onset_local", bool(losses_cfg.enable_onset_local)))
+    require_corrupted_outputs = any((enable_graph_rank, enable_note_local, enable_chord_local, enable_onset_local))
 
     for step_index, batch in enumerate(loader, start=1):
         batch = move_batch_to_device(batch, device)
@@ -242,9 +354,9 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
 
         with torch.cuda.amp.autocast(enabled=autocast_enabled):
-            masked_outputs = model(batch["graph_masked"])
-            real_outputs = model(batch["graph_real"])
-            corrupted_outputs = model(batch["graph_corrupted"])
+            masked_outputs = model(batch["graph_masked"]) if enable_recon else None
+            real_outputs = model(batch["graph_real"]) if enable_graph_rank else None
+            corrupted_outputs = model(batch["graph_corrupted"]) if require_corrupted_outputs else None
             loss_dict, metric_dict = compute_teacher_ssl_losses(
                 masked_outputs=masked_outputs,
                 real_outputs=real_outputs,
@@ -256,10 +368,11 @@ def run_epoch(
                 lambda_note_local=float(losses_cfg.lambda_note_local),
                 lambda_chord_local=float(losses_cfg.lambda_chord_local),
                 lambda_onset_local=float(losses_cfg.lambda_onset_local),
-                enable_graph_rank=bool(losses_cfg.enable_graph_rank),
-                enable_note_local=bool(losses_cfg.enable_note_local),
-                enable_chord_local=bool(losses_cfg.enable_chord_local),
-                enable_onset_local=bool(losses_cfg.enable_onset_local),
+                enable_recon=enable_recon,
+                enable_graph_rank=enable_graph_rank,
+                enable_note_local=enable_note_local,
+                enable_chord_local=enable_chord_local,
+                enable_onset_local=enable_onset_local,
                 recon_weights=recon_weights,
                 enabled_heads=enabled_heads,
                 corruption_metadata=batch["corruption_metadata"],
@@ -301,6 +414,7 @@ def evaluate(
     device: torch.device,
     losses_cfg: DictConfig,
     training_cfg: DictConfig,
+    stage_cfg: Mapping[str, Any],
     max_batches: int | None = None,
 ):
     return run_epoch(
@@ -309,19 +423,31 @@ def evaluate(
         device=device,
         losses_cfg=losses_cfg,
         training_cfg=training_cfg,
+        stage_cfg=stage_cfg,
         optimizer=None,
         scaler=None,
         max_batches=max_batches,
     )
 
 
-def save_checkpoint(path: Path, model: TeacherGNN, optimizer: AdamW, epoch: int, metrics: Mapping[str, float]):
+def save_checkpoint(
+    path: Path,
+    model: TeacherGNN,
+    optimizer: AdamW,
+    epoch: int,
+    metrics: Mapping[str, float],
+    *,
+    stage_name: str,
+    stage_epoch: int,
+):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "epoch": epoch,
+            "stage": stage_name,
+            "stage_epoch": stage_epoch,
             "metrics": dict(metrics),
         },
         path,
@@ -358,10 +484,20 @@ def print_metrics(prefix: str, metrics: Mapping[str, float]):
     LOGGER.info("%s: %s", prefix, ", ".join(rendered))
 
 
-def persist_metrics(output_dir: Path, epoch: int, train_metrics: Mapping[str, float], val_metrics: Mapping[str, float]):
+def persist_metrics(
+    output_dir: Path,
+    epoch: int,
+    train_metrics: Mapping[str, float],
+    val_metrics: Mapping[str, float],
+    *,
+    stage_name: str,
+    stage_epoch: int,
+):
     metrics_path = output_dir / "metrics.jsonl"
     payload = {
         "epoch": epoch,
+        "stage": stage_name,
+        "stage_epoch": stage_epoch,
         "train": dict(train_metrics),
         "val": dict(val_metrics),
     }
@@ -384,15 +520,12 @@ def main(cfg: DictConfig):
     _, train_loader, val_loader = build_loaders(cfg)
     sample = train_loader.dataset[0]
     model = build_model(sample["graph_real"], cfg.model, cfg.losses).to(device)
-    optimizer = build_optimizer(model, cfg.optimizer)
-    scheduler = build_scheduler(optimizer, cfg.scheduler)
-    scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.training.use_amp and device.type == "cuda"))
 
     epochs = effective_epochs(cfg.training, cfg.experiment)
+    stage_plan = build_training_stages(cfg.training, cfg.losses, epochs)
     train_batch_limit = effective_max_batches(cfg.training, cfg.experiment, "train")
     val_batch_limit = effective_max_batches(cfg.training, cfg.experiment, "val")
     checkpoint_dir = output_dir / "checkpoints"
-    best_rank_acc = float("-inf")
 
     metadata = {
         "project": OmegaConf.to_container(cfg.project, resolve=True),
@@ -402,6 +535,15 @@ def main(cfg: DictConfig):
         "metadata_dir": str(resolve_path(cfg.data.metadata_dir)),
         "train_samples": len(train_loader.dataset),
         "val_samples": len(val_loader.dataset),
+        "training_stages": [
+            {
+                "name": stage["name"],
+                "epochs": stage["epochs"],
+                "selection_metric": stage["selection_metric"],
+                "selection_mode": stage["selection_mode"],
+            }
+            for stage in stage_plan
+        ],
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -411,58 +553,123 @@ def main(cfg: DictConfig):
         len(train_loader.dataset),
         len(val_loader.dataset),
     )
+    LOGGER.info("Staged training plan: %s", json.dumps(metadata["training_stages"], sort_keys=True))
 
-    for epoch in range(1, epochs + 1):
-        train_metrics = run_epoch(
-            model=model,
-            loader=train_loader,
-            device=device,
-            losses_cfg=cfg.losses,
-            training_cfg=cfg.training,
-            optimizer=optimizer,
-            scaler=scaler,
-            max_batches=train_batch_limit,
+    global_epoch = 0
+    for stage in stage_plan:
+        LOGGER.info(
+            "Starting stage '%s' for %s epochs (recon=%s, graph_rank=%s, note_local=%s, chord_local=%s, onset_local=%s).",
+            stage["name"],
+            stage["epochs"],
+            stage["enable_recon"],
+            stage["enable_graph_rank"],
+            stage["enable_note_local"],
+            stage["enable_chord_local"],
+            stage["enable_onset_local"],
         )
+        optimizer = build_optimizer(model, cfg.optimizer)
+        scheduler = build_stage_scheduler(optimizer, cfg.scheduler, stage["epochs"])
+        scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.training.use_amp and device.type == "cuda"))
+        stage_best_metric = float("-inf") if stage["selection_mode"] == "max" else float("inf")
+        stage_checkpoint_dir = checkpoint_dir / stage["name"]
 
-        if scheduler is not None:
-            scheduler.step()
-
-        if epoch % int(cfg.training.eval_every) == 0:
-            val_metrics = evaluate(
+        for stage_epoch in range(1, stage["epochs"] + 1):
+            global_epoch += 1
+            train_metrics = run_epoch(
                 model=model,
-                loader=val_loader,
+                loader=train_loader,
                 device=device,
                 losses_cfg=cfg.losses,
                 training_cfg=cfg.training,
-                max_batches=val_batch_limit,
+                stage_cfg=stage,
+                optimizer=optimizer,
+                scaler=scaler,
+                max_batches=train_batch_limit,
             )
-            local_report, local_examples = evaluate_teacher_local_corruption(
-                model=model,
-                loader=val_loader,
-                device=device,
-                max_batches=val_batch_limit,
-                threshold=0.5,
+
+            if scheduler is not None:
+                scheduler.step()
+
+            if stage_epoch % int(cfg.training.eval_every) == 0:
+                val_metrics = evaluate(
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                    losses_cfg=cfg.losses,
+                    training_cfg=cfg.training,
+                    stage_cfg=stage,
+                    max_batches=val_batch_limit,
+                )
+                if stage["run_local_eval"]:
+                    local_report, local_examples = evaluate_teacher_local_corruption(
+                        model=model,
+                        loader=val_loader,
+                        device=device,
+                        max_batches=val_batch_limit,
+                        threshold=0.5,
+                    )
+                    save_local_diagnostic_reports(
+                        output_dir=output_dir,
+                        report=local_report,
+                        examples=local_examples,
+                    )
+            else:
+                val_metrics = {}
+
+            metric_prefix = f"Epoch {global_epoch:03d} [{stage['name']}:{stage_epoch:03d}]"
+            print_metrics(f"{metric_prefix} train", train_metrics)
+            if val_metrics:
+                print_metrics(f"{metric_prefix} val", val_metrics)
+            persist_metrics(
+                output_dir,
+                global_epoch,
+                train_metrics,
+                val_metrics,
+                stage_name=stage["name"],
+                stage_epoch=stage_epoch,
             )
-            save_local_diagnostic_reports(
-                output_dir=output_dir,
-                report=local_report,
-                examples=local_examples,
-            )
-        else:
-            val_metrics = {}
 
-        print_metrics(f"Epoch {epoch:03d} train", train_metrics)
-        if val_metrics:
-            print_metrics(f"Epoch {epoch:03d} val", val_metrics)
-        persist_metrics(output_dir, epoch, train_metrics, val_metrics)
+            if stage_epoch % int(cfg.training.save_every) == 0:
+                save_checkpoint(
+                    stage_checkpoint_dir / "last.pt",
+                    model,
+                    optimizer,
+                    global_epoch,
+                    val_metrics or train_metrics,
+                    stage_name=stage["name"],
+                    stage_epoch=stage_epoch,
+                )
+                save_checkpoint(
+                    checkpoint_dir / "last.pt",
+                    model,
+                    optimizer,
+                    global_epoch,
+                    val_metrics or train_metrics,
+                    stage_name=stage["name"],
+                    stage_epoch=stage_epoch,
+                )
 
-        if epoch % int(cfg.training.save_every) == 0:
-            save_checkpoint(checkpoint_dir / "last.pt", model, optimizer, epoch, val_metrics or train_metrics)
-
-        current_rank_acc = val_metrics.get("rank_acc", float("-inf"))
-        if current_rank_acc > best_rank_acc:
-            best_rank_acc = current_rank_acc
-            save_checkpoint(checkpoint_dir / "best_rank_acc.pt", model, optimizer, epoch, val_metrics)
+            current_metric = val_metrics.get(stage["selection_metric"])
+            if current_metric is not None and metric_improved(float(current_metric), stage_best_metric, stage["selection_mode"]):
+                stage_best_metric = float(current_metric)
+                save_checkpoint(
+                    stage_checkpoint_dir / stage["best_checkpoint_name"],
+                    model,
+                    optimizer,
+                    global_epoch,
+                    val_metrics,
+                    stage_name=stage["name"],
+                    stage_epoch=stage_epoch,
+                )
+                save_checkpoint(
+                    checkpoint_dir / stage["best_checkpoint_name"],
+                    model,
+                    optimizer,
+                    global_epoch,
+                    val_metrics,
+                    stage_name=stage["name"],
+                    stage_epoch=stage_epoch,
+                )
 
 
 if __name__ == "__main__":

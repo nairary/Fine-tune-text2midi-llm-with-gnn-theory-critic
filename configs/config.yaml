@@ -54,6 +54,8 @@ dataloader:
   - functional_progression_violation_strict
 training:
   epochs: 500
+  mlm_ssl_epochs: null
+  corruption_epochs: null
   grad_clip: 1.0
   log_every: 20
   eval_every: 1

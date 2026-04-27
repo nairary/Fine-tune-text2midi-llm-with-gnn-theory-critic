@@ -1,4 +1,6 @@
 epochs: 10
+mlm_ssl_epochs: null
+corruption_epochs: null
 grad_clip: 1.0
 log_every: 10
 eval_every: 1

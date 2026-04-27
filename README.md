@@ -240,6 +240,12 @@ python scripts/fit_chord_score_weights.py \
 ## 4. Обучение GNN Teacher
 
 Teacher обучается на `teacher_encoded.json`. Он сам строит real/masked/corrupted графы, поэтому отдельные labels не нужны.
+По умолчанию обучение теперь идет в 2 последовательных stage:
+
+- `mlm_ssl`: только masked-reconstruction objective;
+- `corruption`: только ranking/local corruption objectives.
+
+Если `training.mlm_ssl_epochs` и `training.corruption_epochs` не заданы, общее число эпох из `training.epochs` автоматически делится между stage примерно пополам. При необходимости разбиение можно задать явно.
 
 ### 4.1 Smoke test
 
@@ -269,6 +275,16 @@ python -m src.training.train_teacher \
   run_name=teacher_full_v1
 ```
 
+Пример явного разбиения stage:
+
+```bash
+python -m src.training.train_teacher \
+  training.epochs=500 \
+  training.mlm_ssl_epochs=300 \
+  training.corruption_epochs=200 \
+  run_name=teacher_two_stage
+```
+
 Полезные варианты:
 
 ```bash
@@ -295,7 +311,14 @@ outputs/YYYY-MM-DD/HH-MM-SS_<run_name>/
   local_eval_examples.json
   checkpoints/
     last.pt
+    best_recon_loss.pt
     best_rank_acc.pt
+    mlm_ssl/
+      last.pt
+      best_recon_loss.pt
+    corruption/
+      last.pt
+      best_rank_acc.pt
 ```
 
 Для observer-а дальше нужны:

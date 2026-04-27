@@ -12,6 +12,19 @@ def _zero_like_reference(reference: torch.Tensor) -> torch.Tensor:
     return reference.sum() * 0.0
 
 
+def _find_reference_tensor(*candidates) -> torch.Tensor:
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if isinstance(candidate, torch.Tensor):
+            return candidate
+        if isinstance(candidate, Mapping):
+            nested = _find_reference_tensor(*candidate.values())
+            if nested is not None:
+                return nested
+    raise ValueError("Could not infer a reference tensor for zero-valued loss construction.")
+
+
 def _filter_and_encode_targets(
     selected_logits: torch.Tensor,
     target_values: torch.Tensor,
@@ -226,18 +239,19 @@ def compute_local_corruption_losses(
 
 
 def compute_teacher_ssl_losses(
-    masked_outputs,
-    real_outputs,
-    corrupted_outputs,
-    masked_batch,
-    corrupted_batch,
-    masked_labels: List[dict],
+    masked_outputs=None,
+    real_outputs=None,
+    corrupted_outputs=None,
+    masked_batch=None,
+    corrupted_batch=None,
+    masked_labels: List[dict] | None = None,
     corruption_metadata: List[dict] | None = None,
     lambda_recon: float = 1.0,
     lambda_graph_rank: float = 0.5,
     lambda_note_local: float = 0.5,
     lambda_chord_local: float = 0.5,
     lambda_onset_local: float = 0.5,
+    enable_recon: bool = True,
     enable_graph_rank: bool = True,
     enable_note_local: bool = True,
     enable_chord_local: bool = True,
@@ -246,27 +260,60 @@ def compute_teacher_ssl_losses(
     enabled_heads: Mapping[str, bool] | None = None,
     local_negatives_per_positive: int = 2,
 ):
-    recon_losses, recon_metrics = compute_reconstruction_losses(
-        masked_outputs=masked_outputs,
-        masked_batch=masked_batch,
-        masked_labels=masked_labels,
-        recon_weights=recon_weights,
-        enabled_heads=enabled_heads,
-    )
-    rank_bundle = compute_ranking_loss(real_outputs=real_outputs, corrupted_outputs=corrupted_outputs)
-    local_losses, local_metrics = compute_local_corruption_losses(
-        corrupted_outputs=corrupted_outputs,
-        corrupted_batch=corrupted_batch,
-        corruption_metadata=corruption_metadata,
-        enabled_levels={
-            "note": enable_note_local,
-            "chord": enable_chord_local,
-            "onset": enable_onset_local,
-        },
-        negatives_per_positive=local_negatives_per_positive,
-    )
+    if not any((enable_recon, enable_graph_rank, enable_note_local, enable_chord_local, enable_onset_local)):
+        raise ValueError("At least one teacher training objective must be enabled.")
 
-    total_loss = lambda_recon * recon_losses["recon_loss"]
+    reference_tensor = _find_reference_tensor(masked_outputs, real_outputs, corrupted_outputs)
+
+    if enable_recon:
+        if masked_outputs is None or masked_batch is None or masked_labels is None:
+            raise ValueError("Reconstruction stage requires masked outputs, masked batch, and masked labels.")
+        recon_losses, recon_metrics = compute_reconstruction_losses(
+            masked_outputs=masked_outputs,
+            masked_batch=masked_batch,
+            masked_labels=masked_labels,
+            recon_weights=recon_weights,
+            enabled_heads=enabled_heads,
+        )
+    else:
+        zero_recon = _zero_like_reference(reference_tensor)
+        recon_losses = {"recon_loss": zero_recon}
+        recon_metrics = {}
+
+    if enable_graph_rank:
+        if real_outputs is None or corrupted_outputs is None:
+            raise ValueError("Graph-ranking stage requires both clean and corrupted outputs.")
+        rank_bundle = compute_ranking_loss(real_outputs=real_outputs, corrupted_outputs=corrupted_outputs)
+    else:
+        zero_rank = _zero_like_reference(reference_tensor)
+        zero_metric = zero_rank.detach()
+        rank_bundle = {
+            "rank_loss": zero_rank,
+            "rank_acc": zero_metric,
+            "mean_margin": zero_metric,
+            "score_real_mean": zero_metric,
+            "score_corrupted_mean": zero_metric,
+        }
+
+    if any((enable_note_local, enable_chord_local, enable_onset_local)):
+        if corrupted_outputs is None or corrupted_batch is None:
+            raise ValueError("Local corruption stage requires corrupted outputs and corrupted batch.")
+        local_losses, local_metrics = compute_local_corruption_losses(
+            corrupted_outputs=corrupted_outputs,
+            corrupted_batch=corrupted_batch,
+            corruption_metadata=corruption_metadata,
+            enabled_levels={
+                "note": enable_note_local,
+                "chord": enable_chord_local,
+                "onset": enable_onset_local,
+            },
+            negatives_per_positive=local_negatives_per_positive,
+        )
+    else:
+        local_losses = {}
+        local_metrics = {}
+
+    total_loss = lambda_recon * recon_losses["recon_loss"] if enable_recon else _zero_like_reference(reference_tensor)
     if enable_graph_rank:
         total_loss = total_loss + lambda_graph_rank * rank_bundle["rank_loss"]
     if enable_note_local and "note_local_loss" in local_losses:
