@@ -1,19 +1,113 @@
-defaults:
-  - model: teacher_gnn_base
-  - data: teacher_encoded_full
-  - dataloader: baseline
-  - training: default
-  - optimizer: adamw
-  - scheduler: none
-  - losses: teacher_ssl
-  - experiment: baseline
-  - hydra: default
-  - _self_
-
+model:
+  name: teacher_gnn_base
+  hidden_dim: 128
+  num_layers: 3
+  dropout: 0.1
+  use_residual: true
+  encoder_hidden_dims:
+  - 128
+  - 128
+  pooling_mode: mean_max
+  pooling_output_dim: 128
+  score_head_hidden_dim: 64
+  reconstruction_head_hidden_dim: 128
+  use_note_score_head: true
+  use_chord_score_head: true
+  use_onset_score_head: true
+  local_score_head_hidden_dim: 64
+  use_hybrid_graph_scorer: true
+  local_summary_use_mean: true
+  local_summary_use_max: true
+  local_summary_use_topk_mean: true
+  local_summary_topk: 5
+data:
+  name: teacher_encoded_full
+  json_path: data/HTCanon/encoded_full/teacher_encoded.json
+  metadata_dir: metadata
+  split:
+    train: train
+    val: val
+  structured_only: false
+dataloader:
+  name: theory_aware_full
+  batch_size: 32
+  num_workers: 0
+  shuffle: true
+  pin_memory: false
+  drop_last: false
+  mask_prob: 0.15
+  mask_min_nodes: 1
+  optional_mask_field_prob: 0.5
+  corruption_backend: song_theory
+  theory_aware:
+    strongbeat_min_duration: 1.0
+    strongbeat_only: true
+    rhythm_shift_max_steps: 2
+    deterministic_per_sample: false
+    deterministic_seed: 123
+  corruption_modes:
+  - strongbeat_nonchord_note
+  - borrowed_melody_conflict
+  - borrowed_kind_toggle_without_melody_change
+  - note_onset_shift
+  - strong_weak_beat_flip
+  - functional_progression_violation_strict
+training:
+  epochs: 500
+  grad_clip: 1.0
+  log_every: 20
+  eval_every: 1
+  save_every: 1
+  use_amp: false
+  device: cpu
+  seed: 42
+  deterministic: false
+  limit_train_batches: null
+  limit_val_batches: null
+  limit_train_samples: null
+  limit_val_samples: null
+optimizer:
+  name: adamw
+  lr: 0.0003
+  weight_decay: 0.0001
+  betas:
+  - 0.9
+  - 0.999
+scheduler:
+  name: cosine
+  t_max: 500
+  eta_min: 1.0e-06
+losses:
+  lambda_recon: 1.0
+  lambda_graph_rank: 0.5
+  lambda_note_local: 0.5
+  lambda_chord_local: 0.5
+  lambda_onset_local: 0.5
+  enable_graph_rank: true
+  enable_note_local: true
+  enable_chord_local: true
+  enable_onset_local: true
+  local_negatives_per_positive: 2
+  enabled_heads:
+    note_sd: true
+    chord_root: true
+    chord_type: true
+    chord_applied: true
+    chord_borrowed_kind: true
+  recon_weights:
+    note_sd: 1.0
+    chord_root: 1.0
+    chord_type: 1.0
+    chord_applied: 0.5
+    chord_borrowed_kind: 0.25
+experiment:
+  name: full_data
+  limit_train_batches: null
+  limit_val_batches: null
+  epochs: 500
 project:
   name: Fine-tune-text2midi-llm-with-gnn-theory-critic
   task: teacher_ssl_training
-
-run_name: ${experiment.name}_${model.name}
-seed: ${training.seed}
-device: ${training.device}
+run_name: full_data_teacher_gnn_base_pool-mean_max_hyb-True_bs-32
+seed: 42
+device: cpu

@@ -48,18 +48,23 @@ class ObserverPairCachedDataset(Dataset):
             graph_path = Path(str(row.get("graph_path", "")))
             if not graph_path.exists():
                 raise ValueError(f"Missing graph file for sample_id='{sample_id}': {graph_path}")
-
+            
     def _validate_pair_rows(self) -> None:
         if not self.pair_rows:
             raise ValueError("Pair target index is empty for pair mode")
+
+        valid_pairs: list[dict[str, Any]] = []
+        skipped = 0
+
         for pair in self.pair_rows:
             pair_group_id = str(pair.get("pair_group_id", "<unknown>"))
             clean_id = str(pair.get("clean_sample_id", ""))
             corr_id = str(pair.get("corrupted_sample_id", ""))
-            if clean_id not in self.graph_by_sample_id:
-                raise ValueError(f"pair_group_id='{pair_group_id}' missing clean_sample_id='{clean_id}' in graph index")
-            if corr_id not in self.graph_by_sample_id:
-                raise ValueError(f"pair_group_id='{pair_group_id}' missing corrupted_sample_id='{corr_id}' in graph index")
+
+            if clean_id not in self.graph_by_sample_id or corr_id not in self.graph_by_sample_id:
+                skipped += 1
+                continue
+
             clean_score = float(pair.get("teacher_score_clean"))
             corr_score = float(pair.get("teacher_score_corrupted"))
             gap = float(pair.get("teacher_score_gap", clean_score - corr_score))
@@ -68,6 +73,13 @@ class ObserverPairCachedDataset(Dataset):
                     f"pair_group_id='{pair_group_id}' has non-finite target values "
                     f"(clean={clean_score}, corrupted={corr_score}, gap={gap})"
                 )
+
+            valid_pairs.append(pair)
+
+        if not valid_pairs:
+            raise ValueError("No valid pairs remain after filtering by graph index")
+
+        self.pair_rows = valid_pairs
 
     def __len__(self) -> int:
         return len(self.graph_rows) if self.mode == "sample" else len(self.pair_rows)
