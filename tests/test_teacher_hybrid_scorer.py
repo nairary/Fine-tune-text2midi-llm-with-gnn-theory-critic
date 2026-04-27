@@ -72,7 +72,9 @@ def _build_graph(note_count: int = 3, chord_count: int = 2, onset_count: int = 2
 def _build_model(
     sample_graph: HeteroData,
     pooling_mode: str = "mean",
+    pooling_type_attention: bool = False,
     use_hybrid_graph_scorer: bool = True,
+    local_context_mode: str = "mean",
     local_summary_use_topk_mean: bool = False,
 ) -> TeacherGNN:
     return TeacherGNN.from_hetero_data(
@@ -82,8 +84,11 @@ def _build_model(
         dropout=0.0,
         residual=True,
         pooling_mode=pooling_mode,
+        pooling_type_attention=pooling_type_attention,
         pooling_output_dim=20,
         score_head_hidden_dim=10,
+        local_context_mode=local_context_mode,
+        local_context_num_heads=4,
         use_hybrid_graph_scorer=use_hybrid_graph_scorer,
         local_summary_use_mean=True,
         local_summary_use_max=True,
@@ -116,6 +121,23 @@ def test_forward_shapes_mean_max_pooling():
     assert outputs["graph_embedding"].shape == (2, model.pooling_output_dim)
 
 
+def test_forward_shapes_attention_pooling_with_type_attention():
+    batch = Batch.from_data_list([_build_graph(), _build_graph()])
+    model = _build_model(
+        batch,
+        pooling_mode="attention",
+        pooling_type_attention=True,
+        use_hybrid_graph_scorer=True,
+    )
+
+    outputs = model(batch)
+
+    assert model.pool.per_type_dim == model.hidden_dim
+    for pooled in outputs["pooled_by_type"].values():
+        assert pooled.shape == (2, model.hidden_dim)
+    assert outputs["graph_embedding"].shape == (2, model.pooling_output_dim)
+
+
 def test_hybrid_off_uses_graph_embedding_only():
     batch = Batch.from_data_list([_build_graph(), _build_graph()])
     model = _build_model(batch, pooling_mode="mean", use_hybrid_graph_scorer=False)
@@ -139,6 +161,26 @@ def test_hybrid_on_expands_graph_score_features():
 
     expected_dim = model.pooling_output_dim + model.local_summary_dim
     assert outputs["graph_score_features"].shape == (2, expected_dim)
+
+
+def test_local_context_attention_emits_local_scores_and_hybrid_features():
+    batch = Batch.from_data_list([_build_graph(), _build_graph()])
+    model = _build_model(
+        batch,
+        pooling_mode="attention",
+        use_hybrid_graph_scorer=True,
+        local_context_mode="attention",
+        local_summary_use_topk_mean=True,
+    )
+
+    outputs = model(batch)
+
+    assert set(outputs["local_scores"]) == {"note", "chord", "onset"}
+    assert outputs["local_scores"]["note"].shape[0] == batch["note"].x.size(0)
+    assert outputs["local_scores"]["chord"].shape[0] == batch["chord"].x.size(0)
+    assert outputs["local_scores"]["onset"].shape[0] == batch["onset"].x.size(0)
+    assert outputs["local_score_summaries"].shape == (2, model.local_summary_dim)
+    assert outputs["graph_score_features"].shape == (2, model.pooling_output_dim + model.local_summary_dim)
 
 
 def test_summary_handles_empty_node_type_per_graph():

@@ -243,9 +243,10 @@ Teacher обучается на `teacher_encoded.json`. Он сам строит
 По умолчанию обучение теперь идет в 2 последовательных stage:
 
 - `mlm_ssl`: только masked-reconstruction objective;
-- `corruption`: только ranking/local corruption objectives.
+- `corruption`: graph-level ranking/calibration + local corruption objectives.
 
 Если `training.mlm_ssl_epochs` и `training.corruption_epochs` не заданы, общее число эпох из `training.epochs` автоматически делится между stage примерно пополам. При необходимости разбиение можно задать явно.
+Во втором stage teacher сравнивает не только clean/corrupted одной и той же песни, но и clean одной песни против corrupted других песен в том же batch. Дополнительно добавлена абсолютная калибровка `clean=1 / corrupted=0`, чтобы шкала score была согласованной между разными треками.
 
 ### 4.1 Smoke test
 

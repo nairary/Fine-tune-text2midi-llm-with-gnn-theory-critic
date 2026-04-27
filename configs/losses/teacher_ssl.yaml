@@ -3,6 +3,10 @@ lambda_graph_rank: 0.5
 lambda_note_local: 0.5
 lambda_chord_local: 0.5
 lambda_onset_local: 0.5
+graph_rank_intra_weight: 1.0
+graph_rank_inter_weight: 1.0
+graph_binary_weight: 1.0
+graph_rank_margin: 0.0
 enable_graph_rank: true
 enable_note_local: true
 enable_chord_local: true

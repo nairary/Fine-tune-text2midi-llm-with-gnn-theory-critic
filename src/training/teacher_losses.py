@@ -12,6 +12,12 @@ def _zero_like_reference(reference: torch.Tensor) -> torch.Tensor:
     return reference.sum() * 0.0
 
 
+def _mean_or_zero(values: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    if values.numel() == 0:
+        return _zero_like_reference(reference)
+    return values.mean()
+
+
 def _find_reference_tensor(*candidates) -> torch.Tensor:
     for candidate in candidates:
         if candidate is None:
@@ -131,20 +137,81 @@ def compute_reconstruction_losses(
     return losses, metrics
 
 
-def compute_ranking_loss(real_outputs, corrupted_outputs):
+def compute_ranking_loss(
+    real_outputs,
+    corrupted_outputs,
+    intra_track_weight: float = 1.0,
+    inter_track_weight: float = 1.0,
+    binary_weight: float = 1.0,
+    margin: float = 0.0,
+):
     score_real = real_outputs["graph_score"].view(-1)
     score_corrupted = corrupted_outputs["graph_score"].view(-1)
-    margin = score_real - score_corrupted
-    rank_loss = -F.logsigmoid(margin).mean()
-    rank_acc = (margin > 0).float().mean()
-    mean_margin = margin.mean()
+    reference = score_real
+
+    intra_margin = score_real - score_corrupted
+    intra_rank_loss = F.softplus(-(intra_margin - float(margin))).mean()
+    intra_rank_acc = (intra_margin > float(margin)).float().mean()
+    intra_mean_margin = intra_margin.mean()
+
+    global_margin = score_real[:, None] - score_corrupted[None, :]
+    global_rank_acc = (global_margin > float(margin)).float().mean()
+    global_mean_margin = global_margin.mean()
+
+    if score_real.numel() > 1:
+        off_diagonal_mask = ~torch.eye(score_real.numel(), dtype=torch.bool, device=score_real.device)
+        inter_margin = global_margin[off_diagonal_mask]
+    else:
+        inter_margin = global_margin.new_empty((0,))
+    inter_rank_loss = _mean_or_zero(F.softplus(-(inter_margin - float(margin))), reference)
+    inter_rank_acc = _mean_or_zero((inter_margin > float(margin)).float(), reference).detach()
+    inter_mean_margin = _mean_or_zero(inter_margin, reference).detach()
+
+    clean_targets = torch.ones_like(score_real)
+    corrupted_targets = torch.zeros_like(score_corrupted)
+    clean_binary_loss = F.binary_cross_entropy_with_logits(score_real, clean_targets)
+    corrupted_binary_loss = F.binary_cross_entropy_with_logits(score_corrupted, corrupted_targets)
+    graph_binary_loss = 0.5 * (clean_binary_loss + corrupted_binary_loss)
+    clean_binary_acc = (torch.sigmoid(score_real) >= 0.5).float().mean()
+    corrupted_binary_acc = (torch.sigmoid(score_corrupted) < 0.5).float().mean()
+    graph_binary_acc = 0.5 * (clean_binary_acc + corrupted_binary_acc)
+
+    weighted_terms = []
+    active_weights = []
+    if float(intra_track_weight) > 0.0:
+        weighted_terms.append(float(intra_track_weight) * intra_rank_loss)
+        active_weights.append(float(intra_track_weight))
+    if float(inter_track_weight) > 0.0 and inter_margin.numel() > 0:
+        weighted_terms.append(float(inter_track_weight) * inter_rank_loss)
+        active_weights.append(float(inter_track_weight))
+    if float(binary_weight) > 0.0:
+        weighted_terms.append(float(binary_weight) * graph_binary_loss)
+        active_weights.append(float(binary_weight))
+
+    if weighted_terms:
+        rank_loss = torch.stack(weighted_terms).sum() / float(sum(active_weights))
+    else:
+        rank_loss = _zero_like_reference(reference)
 
     return {
         "rank_loss": rank_loss,
-        "rank_acc": rank_acc.detach(),
-        "mean_margin": mean_margin.detach(),
+        "intra_rank_loss": intra_rank_loss,
+        "inter_rank_loss": inter_rank_loss,
+        "graph_binary_loss": graph_binary_loss,
+        "rank_acc": global_rank_acc.detach(),
+        "intra_rank_acc": intra_rank_acc.detach(),
+        "inter_rank_acc": inter_rank_acc,
+        "graph_binary_acc": graph_binary_acc.detach(),
+        "graph_binary_clean_acc": clean_binary_acc.detach(),
+        "graph_binary_corrupted_acc": corrupted_binary_acc.detach(),
+        "mean_margin": global_mean_margin.detach(),
+        "intra_mean_margin": intra_mean_margin.detach(),
+        "inter_mean_margin": inter_mean_margin,
         "score_real_mean": score_real.mean().detach(),
         "score_corrupted_mean": score_corrupted.mean().detach(),
+        "score_real_min": score_real.min().detach(),
+        "score_corrupted_max": score_corrupted.max().detach(),
+        "score_gap_minmax": (score_real.min() - score_corrupted.max()).detach(),
     }
 
 
@@ -251,6 +318,10 @@ def compute_teacher_ssl_losses(
     lambda_note_local: float = 0.5,
     lambda_chord_local: float = 0.5,
     lambda_onset_local: float = 0.5,
+    graph_rank_intra_weight: float = 1.0,
+    graph_rank_inter_weight: float = 1.0,
+    graph_binary_weight: float = 1.0,
+    graph_rank_margin: float = 0.0,
     enable_recon: bool = True,
     enable_graph_rank: bool = True,
     enable_note_local: bool = True,
@@ -283,16 +354,36 @@ def compute_teacher_ssl_losses(
     if enable_graph_rank:
         if real_outputs is None or corrupted_outputs is None:
             raise ValueError("Graph-ranking stage requires both clean and corrupted outputs.")
-        rank_bundle = compute_ranking_loss(real_outputs=real_outputs, corrupted_outputs=corrupted_outputs)
+        rank_bundle = compute_ranking_loss(
+            real_outputs=real_outputs,
+            corrupted_outputs=corrupted_outputs,
+            intra_track_weight=graph_rank_intra_weight,
+            inter_track_weight=graph_rank_inter_weight,
+            binary_weight=graph_binary_weight,
+            margin=graph_rank_margin,
+        )
     else:
         zero_rank = _zero_like_reference(reference_tensor)
         zero_metric = zero_rank.detach()
         rank_bundle = {
             "rank_loss": zero_rank,
+            "intra_rank_loss": zero_rank,
+            "inter_rank_loss": zero_rank,
+            "graph_binary_loss": zero_rank,
             "rank_acc": zero_metric,
+            "intra_rank_acc": zero_metric,
+            "inter_rank_acc": zero_metric,
+            "graph_binary_acc": zero_metric,
+            "graph_binary_clean_acc": zero_metric,
+            "graph_binary_corrupted_acc": zero_metric,
             "mean_margin": zero_metric,
+            "intra_mean_margin": zero_metric,
+            "inter_mean_margin": zero_metric,
             "score_real_mean": zero_metric,
             "score_corrupted_mean": zero_metric,
+            "score_real_min": zero_metric,
+            "score_corrupted_max": zero_metric,
+            "score_gap_minmax": zero_metric,
         }
 
     if any((enable_note_local, enable_chord_local, enable_onset_local)):
@@ -328,13 +419,26 @@ def compute_teacher_ssl_losses(
         **recon_losses,
         **local_losses,
         "rank_loss": rank_bundle["rank_loss"] if enable_graph_rank else _zero_like_reference(rank_bundle["rank_loss"]),
+        "intra_rank_loss": rank_bundle["intra_rank_loss"] if enable_graph_rank else _zero_like_reference(rank_bundle["intra_rank_loss"]),
+        "inter_rank_loss": rank_bundle["inter_rank_loss"] if enable_graph_rank else _zero_like_reference(rank_bundle["inter_rank_loss"]),
+        "graph_binary_loss": rank_bundle["graph_binary_loss"] if enable_graph_rank else _zero_like_reference(rank_bundle["graph_binary_loss"]),
     }
     metric_dict = {
         **recon_metrics,
         **local_metrics,
         "rank_acc": rank_bundle["rank_acc"] if enable_graph_rank else rank_bundle["rank_acc"].new_tensor(0.0),
+        "intra_rank_acc": rank_bundle["intra_rank_acc"] if enable_graph_rank else rank_bundle["intra_rank_acc"].new_tensor(0.0),
+        "inter_rank_acc": rank_bundle["inter_rank_acc"] if enable_graph_rank else rank_bundle["inter_rank_acc"].new_tensor(0.0),
+        "graph_binary_acc": rank_bundle["graph_binary_acc"] if enable_graph_rank else rank_bundle["graph_binary_acc"].new_tensor(0.0),
+        "graph_binary_clean_acc": rank_bundle["graph_binary_clean_acc"] if enable_graph_rank else rank_bundle["graph_binary_clean_acc"].new_tensor(0.0),
+        "graph_binary_corrupted_acc": rank_bundle["graph_binary_corrupted_acc"] if enable_graph_rank else rank_bundle["graph_binary_corrupted_acc"].new_tensor(0.0),
         "mean_margin": rank_bundle["mean_margin"] if enable_graph_rank else rank_bundle["mean_margin"].new_tensor(0.0),
+        "intra_mean_margin": rank_bundle["intra_mean_margin"] if enable_graph_rank else rank_bundle["intra_mean_margin"].new_tensor(0.0),
+        "inter_mean_margin": rank_bundle["inter_mean_margin"] if enable_graph_rank else rank_bundle["inter_mean_margin"].new_tensor(0.0),
         "score_real_mean": rank_bundle["score_real_mean"] if enable_graph_rank else rank_bundle["score_real_mean"].new_tensor(0.0),
         "score_corrupted_mean": rank_bundle["score_corrupted_mean"] if enable_graph_rank else rank_bundle["score_corrupted_mean"].new_tensor(0.0),
+        "score_real_min": rank_bundle["score_real_min"] if enable_graph_rank else rank_bundle["score_real_min"].new_tensor(0.0),
+        "score_corrupted_max": rank_bundle["score_corrupted_max"] if enable_graph_rank else rank_bundle["score_corrupted_max"].new_tensor(0.0),
+        "score_gap_minmax": rank_bundle["score_gap_minmax"] if enable_graph_rank else rank_bundle["score_gap_minmax"].new_tensor(0.0),
     }
     return loss_dict, metric_dict

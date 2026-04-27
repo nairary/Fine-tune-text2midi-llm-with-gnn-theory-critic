@@ -8,6 +8,8 @@ model:
   - 128
   - 128
   pooling_mode: mean_max
+  pooling_attention_hidden_dim: null
+  pooling_type_attention: false
   pooling_output_dim: 128
   score_head_hidden_dim: 64
   reconstruction_head_hidden_dim: 128
@@ -15,6 +17,8 @@ model:
   use_chord_score_head: true
   use_onset_score_head: true
   local_score_head_hidden_dim: 64
+  local_context_mode: mean
+  local_context_num_heads: 4
   use_hybrid_graph_scorer: true
   local_summary_use_mean: true
   local_summary_use_max: true
@@ -85,6 +89,10 @@ losses:
   lambda_note_local: 0.5
   lambda_chord_local: 0.5
   lambda_onset_local: 0.5
+  graph_rank_intra_weight: 1.0
+  graph_rank_inter_weight: 1.0
+  graph_binary_weight: 1.0
+  graph_rank_margin: 0.0
   enable_graph_rank: true
   enable_note_local: true
   enable_chord_local: true

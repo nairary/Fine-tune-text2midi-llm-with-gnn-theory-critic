@@ -112,7 +112,7 @@ def test_compute_teacher_ssl_losses_supports_mlm_stage_without_corruption_output
 def test_compute_teacher_ssl_losses_supports_corruption_stage_without_reconstruction_outputs():
     real_outputs = {"graph_score": torch.tensor([1.5], dtype=torch.float)}
     corrupted_outputs = {
-        "graph_score": torch.tensor([0.25], dtype=torch.float),
+        "graph_score": torch.tensor([-0.25], dtype=torch.float),
         "local_scores": {
             "note": torch.tensor([0.0], dtype=torch.float),
             "chord": torch.tensor([0.0], dtype=torch.float),
@@ -134,3 +134,37 @@ def test_compute_teacher_ssl_losses_supports_corruption_stage_without_reconstruc
     assert loss_dict["recon_loss"].item() == pytest.approx(0.0)
     assert loss_dict["rank_loss"].item() > 0.0
     assert metric_dict["rank_acc"].item() == pytest.approx(1.0)
+    assert metric_dict["graph_binary_acc"].item() == pytest.approx(1.0)
+    assert metric_dict["score_gap_minmax"].item() == pytest.approx(1.75)
+
+
+def test_compute_teacher_ssl_losses_penalizes_cross_track_clean_corrupted_inversion():
+    real_outputs = {"graph_score": torch.tensor([1.0, -1.0], dtype=torch.float)}
+    corrupted_outputs = {
+        "graph_score": torch.tensor([0.5, -2.0], dtype=torch.float),
+        "local_scores": {
+            "note": torch.tensor([0.0, 0.0], dtype=torch.float),
+            "chord": torch.tensor([0.0, 0.0], dtype=torch.float),
+            "onset": torch.tensor([0.0, 0.0], dtype=torch.float),
+        },
+    }
+
+    loss_dict, metric_dict = compute_teacher_ssl_losses(
+        real_outputs=real_outputs,
+        corrupted_outputs=corrupted_outputs,
+        enable_recon=False,
+        enable_graph_rank=True,
+        enable_note_local=False,
+        enable_chord_local=False,
+        enable_onset_local=False,
+        graph_rank_intra_weight=1.0,
+        graph_rank_inter_weight=1.0,
+        graph_binary_weight=1.0,
+    )
+
+    assert torch.isfinite(loss_dict["loss"])
+    assert metric_dict["intra_rank_acc"].item() == pytest.approx(1.0)
+    assert metric_dict["inter_rank_acc"].item() == pytest.approx(0.5)
+    assert metric_dict["rank_acc"].item() == pytest.approx(0.75)
+    assert metric_dict["score_gap_minmax"].item() == pytest.approx(-1.5)
+    assert loss_dict["inter_rank_loss"].item() > 0.0

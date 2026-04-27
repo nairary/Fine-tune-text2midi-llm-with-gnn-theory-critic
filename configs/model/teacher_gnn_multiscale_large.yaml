@@ -5,6 +5,8 @@ dropout: 0.1
 use_residual: true
 encoder_hidden_dims: [192, 192]
 pooling_mode: mean
+pooling_attention_hidden_dim: null
+pooling_type_attention: false
 pooling_output_dim: 192
 score_head_hidden_dim: 96
 reconstruction_head_hidden_dim: 192
@@ -12,6 +14,8 @@ use_note_score_head: true
 use_chord_score_head: true
 use_onset_score_head: true
 local_score_head_hidden_dim: 96
+local_context_mode: mean
+local_context_num_heads: 4
 
 use_hybrid_graph_scorer: false
 local_summary_use_mean: true

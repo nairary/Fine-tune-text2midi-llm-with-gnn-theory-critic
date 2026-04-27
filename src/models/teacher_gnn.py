@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch_geometric.nn import HeteroConv, SAGEConv
 
-from src.models.teacher_heads import GraphScoreHead, LocalScoreHead, ReconstructionHeads
+from src.models.teacher_heads import GraphScoreHead, LocalScoreHead, ReconstructionHeads, SlotContextAttention
 from src.utils.teacher_pooling import MultiTypeMeanPooling
 
 
@@ -42,6 +42,8 @@ class TeacherGNN(nn.Module):
         node_types: Iterable[str] | None = None,
         encoder_hidden_dims: Sequence[int] | None = None,
         pooling_mode: str = "mean",
+        pooling_attention_hidden_dim: int | None = None,
+        pooling_type_attention: bool = False,
         pooling_output_dim: int | None = None,
         score_head_hidden_dim: int | None = None,
         reconstruction_head_hidden_dim: int | None = None,
@@ -50,6 +52,8 @@ class TeacherGNN(nn.Module):
         use_chord_score_head: bool = True,
         use_onset_score_head: bool = True,
         local_score_head_hidden_dim: int | None = None,
+        local_context_mode: str = "mean",
+        local_context_num_heads: int = 4,
         use_hybrid_graph_scorer: bool = False,
         local_summary_use_mean: bool = True,
         local_summary_use_max: bool = True,
@@ -70,6 +74,8 @@ class TeacherGNN(nn.Module):
         self.use_note_score_head = bool(use_note_score_head)
         self.use_chord_score_head = bool(use_chord_score_head)
         self.use_onset_score_head = bool(use_onset_score_head)
+        self.local_context_mode = str(local_context_mode)
+        self.local_context_num_heads = int(local_context_num_heads)
         self.use_hybrid_graph_scorer = bool(use_hybrid_graph_scorer)
         self.local_summary_use_mean = bool(local_summary_use_mean)
         self.local_summary_use_max = bool(local_summary_use_max)
@@ -79,6 +85,10 @@ class TeacherGNN(nn.Module):
             raise ValueError("local_summary_topk must be >= 1.")
         if not any([self.local_summary_use_mean, self.local_summary_use_max, self.local_summary_use_topk_mean]):
             raise ValueError("At least one local score summary statistic must be enabled.")
+        if self.local_context_mode not in {"mean", "attention"}:
+            raise ValueError(
+                f"Unsupported local_context_mode='{self.local_context_mode}'. Supported modes are 'mean' and 'attention'."
+            )
 
         self.encoders = nn.ModuleDict(
             {
@@ -108,6 +118,8 @@ class TeacherGNN(nn.Module):
             node_types=self.node_types,
             output_dim=self.pooling_output_dim,
             pooling_mode=pooling_mode,
+            attention_hidden_dim=pooling_attention_hidden_dim,
+            use_type_attention=bool(pooling_type_attention),
         )
         self.reconstruction_heads = ReconstructionHeads(
             hidden_dim=hidden_dim,
@@ -115,6 +127,7 @@ class TeacherGNN(nn.Module):
             enabled_heads=enabled_heads,
         )
         self.local_score_heads = nn.ModuleDict()
+        self.local_context_attn = nn.ModuleDict()
         if self.use_note_score_head:
             self.local_score_heads["note"] = LocalScoreHead(hidden_dim, self.local_score_head_hidden_dim)
         if self.use_chord_score_head:
@@ -122,6 +135,17 @@ class TeacherGNN(nn.Module):
         if self.use_onset_score_head:
             self.local_score_heads["onset"] = LocalScoreHead(hidden_dim, self.local_score_head_hidden_dim)
         self.active_local_head_types = tuple(node_type for node_type in ("note", "chord", "onset") if node_type in self.local_score_heads)
+        if self.local_context_mode == "attention":
+            self.local_context_attn = nn.ModuleDict(
+                {
+                    node_type: SlotContextAttention(
+                        hidden_dim=hidden_dim,
+                        num_heads=self.local_context_num_heads,
+                        dropout=self.dropout,
+                    )
+                    for node_type in self.active_local_head_types
+                }
+            )
         self.local_summary_stats_count = sum(
             [self.local_summary_use_mean, self.local_summary_use_max, self.local_summary_use_topk_mean]
         )
@@ -188,6 +212,11 @@ class TeacherGNN(nn.Module):
         index_tensor = torch.tensor(indices, dtype=torch.long, device=embeddings.device)
         return embeddings.index_select(0, index_tensor).mean(dim=0)
 
+    def _aggregate_local_context(self, node_type: str, query_embeddings: torch.Tensor, slot_tensor: torch.Tensor) -> torch.Tensor:
+        if self.local_context_mode == "attention":
+            return self.local_context_attn[node_type](query_embeddings, slot_tensor)
+        return slot_tensor.mean(dim=1)
+
     def _prepare_edge_maps(self, batch) -> dict:
         edge_maps = {}
         edge_maps["note_neighbors"] = self._build_neighbor_map(
@@ -244,7 +273,7 @@ class TeacherGNN(nn.Module):
         contextual_scores: Dict[str, torch.Tensor] = {}
 
         if "note" in self.local_score_heads:
-            window_embeddings = []
+            note_slots = []
             for idx in range(node_embeddings["note"].size(0)):
                 note_emb = node_embeddings["note"][idx]
                 note_neighbors = self._gather_mean(node_embeddings["note"], edge_maps["note_neighbors"][idx], zero)
@@ -252,12 +281,14 @@ class TeacherGNN(nn.Module):
                 onset_emb = node_embeddings["onset"][onset_idx] if onset_idx is not None else zero
                 cover_chords = self._gather_mean(node_embeddings["chord"], edge_maps["note_to_chords"][idx], zero)
                 song_context = song_context_for("note", idx)
-                window_embeddings.append(torch.stack([note_emb, note_neighbors, onset_emb, cover_chords, song_context], dim=0).mean(dim=0))
-            if window_embeddings:
-                contextual_scores["note"] = self.local_score_heads["note"](torch.stack(window_embeddings, dim=0))
+                note_slots.append(torch.stack([note_emb, note_neighbors, onset_emb, cover_chords, song_context], dim=0))
+            if note_slots:
+                slot_tensor = torch.stack(note_slots, dim=0)
+                note_context = self._aggregate_local_context("note", node_embeddings["note"], slot_tensor)
+                contextual_scores["note"] = self.local_score_heads["note"](note_context)
 
         if "chord" in self.local_score_heads:
-            window_embeddings = []
+            chord_slots = []
             for idx in range(node_embeddings["chord"].size(0)):
                 chord_emb = node_embeddings["chord"][idx]
                 chord_neighbors = self._gather_mean(node_embeddings["chord"], edge_maps["chord_neighbors"][idx], zero)
@@ -265,21 +296,25 @@ class TeacherGNN(nn.Module):
                 onset_idx = edge_maps["chord_to_onset"][idx]
                 onset_emb = node_embeddings["onset"][onset_idx] if onset_idx is not None else zero
                 song_context = song_context_for("chord", idx)
-                window_embeddings.append(torch.stack([chord_emb, chord_neighbors, covered_notes, onset_emb, song_context], dim=0).mean(dim=0))
-            if window_embeddings:
-                contextual_scores["chord"] = self.local_score_heads["chord"](torch.stack(window_embeddings, dim=0))
+                chord_slots.append(torch.stack([chord_emb, chord_neighbors, covered_notes, onset_emb, song_context], dim=0))
+            if chord_slots:
+                slot_tensor = torch.stack(chord_slots, dim=0)
+                chord_context = self._aggregate_local_context("chord", node_embeddings["chord"], slot_tensor)
+                contextual_scores["chord"] = self.local_score_heads["chord"](chord_context)
 
         if "onset" in self.local_score_heads:
-            window_embeddings = []
+            onset_slots = []
             for idx in range(node_embeddings["onset"].size(0)):
                 onset_emb = node_embeddings["onset"][idx]
                 onset_neighbors = self._gather_mean(node_embeddings["onset"], edge_maps["onset_neighbors"][idx], zero)
                 onset_notes = self._gather_mean(node_embeddings["note"], edge_maps["onset_to_notes"][idx], zero)
                 onset_chords = self._gather_mean(node_embeddings["chord"], edge_maps["onset_to_chords"][idx], zero)
                 song_context = song_context_for("onset", idx)
-                window_embeddings.append(torch.stack([onset_emb, onset_notes, onset_chords, onset_neighbors, song_context], dim=0).mean(dim=0))
-            if window_embeddings:
-                contextual_scores["onset"] = self.local_score_heads["onset"](torch.stack(window_embeddings, dim=0))
+                onset_slots.append(torch.stack([onset_emb, onset_notes, onset_chords, onset_neighbors, song_context], dim=0))
+            if onset_slots:
+                slot_tensor = torch.stack(onset_slots, dim=0)
+                onset_context = self._aggregate_local_context("onset", node_embeddings["onset"], slot_tensor)
+                contextual_scores["onset"] = self.local_score_heads["onset"](onset_context)
 
         return contextual_scores
 
@@ -356,6 +391,8 @@ class TeacherGNN(nn.Module):
         residual: bool = True,
         encoder_hidden_dims: Sequence[int] | None = None,
         pooling_mode: str = "mean",
+        pooling_attention_hidden_dim: int | None = None,
+        pooling_type_attention: bool = False,
         pooling_output_dim: int | None = None,
         score_head_hidden_dim: int | None = None,
         reconstruction_head_hidden_dim: int | None = None,
@@ -364,6 +401,8 @@ class TeacherGNN(nn.Module):
         use_chord_score_head: bool = True,
         use_onset_score_head: bool = True,
         local_score_head_hidden_dim: int | None = None,
+        local_context_mode: str = "mean",
+        local_context_num_heads: int = 4,
         use_hybrid_graph_scorer: bool = False,
         local_summary_use_mean: bool = True,
         local_summary_use_max: bool = True,
@@ -381,6 +420,8 @@ class TeacherGNN(nn.Module):
             node_types=hetero_data.node_types,
             encoder_hidden_dims=encoder_hidden_dims,
             pooling_mode=pooling_mode,
+            pooling_attention_hidden_dim=pooling_attention_hidden_dim,
+            pooling_type_attention=pooling_type_attention,
             pooling_output_dim=pooling_output_dim,
             score_head_hidden_dim=score_head_hidden_dim,
             reconstruction_head_hidden_dim=reconstruction_head_hidden_dim,
@@ -389,6 +430,8 @@ class TeacherGNN(nn.Module):
             use_chord_score_head=use_chord_score_head,
             use_onset_score_head=use_onset_score_head,
             local_score_head_hidden_dim=local_score_head_hidden_dim,
+            local_context_mode=local_context_mode,
+            local_context_num_heads=local_context_num_heads,
             use_hybrid_graph_scorer=use_hybrid_graph_scorer,
             local_summary_use_mean=local_summary_use_mean,
             local_summary_use_max=local_summary_use_max,

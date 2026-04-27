@@ -81,6 +81,19 @@ class LocalScoreHead(nn.Module):
         return self.net(x).squeeze(-1)
 
 
+class SlotContextAttention(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads}) for slot attention.")
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, query: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+        attn_out, _ = self.attn(query.unsqueeze(1), slots, slots, need_weights=False)
+        return self.norm(query + attn_out.squeeze(1))
+
+
 class ReconstructionHeads(nn.Module):
     def __init__(
         self,
