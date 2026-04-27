@@ -8,3 +8,4 @@ __pycache__
 teacher_encoded.json
 data/HTCanon/encoded_full/teacher_encoded.json
 data/HTCanon/encoded_full/teacher_encoded.json
+*.pt
