@@ -379,6 +379,63 @@ def _has_pitch_in_midi_range(events: list[dict], shift: int) -> bool:
     return True
 
 
+def _sync_pos_in_bar_if_present(event: dict, song_obj: dict) -> None:
+    if "pos_in_bar" not in event:
+        return
+    beat = try_parse_float(event.get("beat"))
+    if beat is None:
+        return
+    num_beats = safe_float(song_obj.get("meta", {}).get("main_num_beats", 4.0), 4.0)
+    bar_idx = int((beat - 1.0) // num_beats)
+    bar_start = 1.0 + bar_idx * num_beats
+    event["pos_in_bar"] = beat - bar_start
+
+
+def _restify_note(note: dict) -> None:
+    note["is_rest"] = 1
+    if "sd_id" in note:
+        note["sd_id"] = 0
+    if "octave_id" in note:
+        note["octave_id"] = 0
+
+
+def _restify_chord(chord: dict, *, zero_duration: bool = False) -> None:
+    chord["is_rest"] = 1
+    for field_name in ("root_id", "type_id", "inversion_id", "applied_id", "borrowed_kind_id", "borrowed_mode_name_id"):
+        if field_name in chord:
+            chord[field_name] = 0
+    for field_name in ("adds_vec", "suspensions_vec", "omits_vec", "alterations_vec", "borrowed_pcset_vec"):
+        if isinstance(chord.get(field_name), list):
+            chord[field_name] = [0] * len(chord[field_name])
+    if "root_degree_raw" in chord:
+        chord["root_degree_raw"] = None
+    if "type_raw" in chord:
+        chord["type_raw"] = None
+    if isinstance(chord.get("add_degrees"), list):
+        chord["add_degrees"] = []
+    if zero_duration:
+        start, _ = _note_interval(chord)
+        if start is not None:
+            _set_note_interval(chord, float(start), float(start))
+        elif "duration" in chord:
+            chord["duration"] = 0.0
+        if "duration_beats" in chord:
+            chord["duration_beats"] = 0.0
+
+
+def _duration_scale_factors(corruption_cfg: dict, specific_key: str) -> list[float]:
+    raw_values = corruption_cfg.get(specific_key)
+    if raw_values is None:
+        raw_values = corruption_cfg.get("duration_scale_factors", [0.5, 1.5])
+    factors: list[float] = []
+    for raw_value in list(raw_values or []):
+        factor = try_parse_float(raw_value)
+        if factor is None or factor <= 0.0:
+            continue
+        factors.append(float(factor))
+    return factors
+
+
 def _corrupt_transpose_with_tonic_shift(song_obj, theory_ctx, rng, corruption_cfg):
     metadata = _identity_metadata("transpose_with_tonic_shift")
     semitones = list(corruption_cfg.get("transpose_semitones", [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]))
@@ -1426,6 +1483,424 @@ def _corrupt_strong_weak_beat_flip(song_obj, theory_ctx, rng, corruption_cfg):
     return song_obj, metadata, False
 
 
+def _corrupt_drop_note_from_onset(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("drop_note_from_onset")
+    melody_key, melody = _melody_events(song_obj)
+    if not melody_key or not melody:
+        metadata["reason_skipped"] = "melody_track_not_found"
+        return song_obj, metadata, False
+
+    candidates: list[dict] = []
+    note_indices = list(range(len(melody)))
+    rng.shuffle(note_indices)
+    for note_idx in note_indices:
+        note = melody[note_idx]
+        if int(note.get("is_rest", 0)) == 1:
+            continue
+        start, end = _note_interval(note)
+        if start is None or end is None:
+            continue
+        duration = max(0.0, float(end - start))
+        if duration <= DEFAULT_EPSILON:
+            continue
+        covering_chord_index = find_covering_chord_index(song_obj, note)
+        same_onset_with_chord = False
+        if covering_chord_index is not None:
+            chord_start = try_parse_float(song_obj["chords"][covering_chord_index].get("beat"))
+            same_onset_with_chord = chord_start is not None and abs(float(chord_start) - float(start)) <= DEFAULT_EPSILON
+        strong_note_position = is_strong_note_position(note, song_obj)
+        score = 0.25 * duration
+        if covering_chord_index is not None:
+            score += 1.0
+        if same_onset_with_chord:
+            score += 3.0
+        if strong_note_position:
+            score += 2.0
+        candidates.append({
+            "note_idx": note_idx,
+            "start": float(start),
+            "duration": duration,
+            "covering_chord_index": covering_chord_index,
+            "same_onset_with_chord": same_onset_with_chord,
+            "strong_note_position": strong_note_position,
+            "score": score,
+            "original_sd_id": note.get("sd_id"),
+            "original_octave_id": note.get("octave_id"),
+        })
+
+    if not candidates:
+        metadata["reason_skipped"] = "no_droppable_non_rest_note"
+        return song_obj, metadata, False
+
+    max_score = max(candidate["score"] for candidate in candidates)
+    best_candidates = [candidate for candidate in candidates if abs(candidate["score"] - max_score) <= 1e-9]
+    chosen = rng.choice(best_candidates)
+    note = melody[chosen["note_idx"]]
+    _restify_note(note)
+
+    metadata.update({
+        "applied": True,
+        "n_notes_modified": 1,
+        "note_corrupted_indices": [chosen["note_idx"]],
+        "corruption_params": {"drop_mode": "restify"},
+        "details": {
+            "melody_key": melody_key,
+            "source_onset_beat": chosen["start"],
+            "duration_before": chosen["duration"],
+            "covering_chord_index": chosen["covering_chord_index"],
+            "same_onset_with_chord": chosen["same_onset_with_chord"],
+            "strong_note_position": chosen["strong_note_position"],
+            "original_sd_id": chosen["original_sd_id"],
+            "original_octave_id": chosen["original_octave_id"],
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_drop_chord_from_onset(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("drop_chord_from_onset")
+    chords = song_obj.get("chords", [])
+    if not chords:
+        metadata["reason_skipped"] = "no_chords_found"
+        return song_obj, metadata, False
+
+    _, melody = _melody_events(song_obj)
+    candidates: list[dict] = []
+    chord_indices = list(range(len(chords)))
+    rng.shuffle(chord_indices)
+    for chord_idx in chord_indices:
+        chord = chords[chord_idx]
+        if int(chord.get("is_rest", 0)) == 1:
+            continue
+        start, end = _note_interval(chord)
+        if start is None or end is None:
+            continue
+        duration = max(0.0, float(end - start))
+        if duration <= DEFAULT_EPSILON:
+            continue
+        overlapping_melody_indices = _collect_overlapping_melody_indices(song_obj, chord)
+        same_onset_melody_indices = [
+            note_idx
+            for note_idx in overlapping_melody_indices
+            if abs(safe_float(melody[note_idx].get("beat"), -999.0) - float(start)) <= DEFAULT_EPSILON
+        ] if melody else []
+        strong_chord_position = _is_strong_chord_position(chord, song_obj)
+        score = 0.25 * duration + min(2.0, float(len(overlapping_melody_indices)))
+        if same_onset_melody_indices:
+            score += 4.0
+        if strong_chord_position:
+            score += 2.0
+        candidates.append({
+            "chord_idx": chord_idx,
+            "start": float(start),
+            "duration": duration,
+            "overlapping_melody_indices": overlapping_melody_indices,
+            "same_onset_melody_indices": same_onset_melody_indices,
+            "strong_chord_position": strong_chord_position,
+            "score": score,
+        })
+
+    if not candidates:
+        metadata["reason_skipped"] = "no_droppable_non_rest_chord"
+        return song_obj, metadata, False
+
+    max_score = max(candidate["score"] for candidate in candidates)
+    best_candidates = [candidate for candidate in candidates if abs(candidate["score"] - max_score) <= 1e-9]
+    chosen = rng.choice(best_candidates)
+    chord = chords[chosen["chord_idx"]]
+    _restify_chord(chord, zero_duration=True)
+    _sync_pos_in_bar_if_present(chord, song_obj)
+
+    metadata.update({
+        "applied": True,
+        "topology_changed": True,
+        "n_chords_modified": 1,
+        "chord_corrupted_indices": [chosen["chord_idx"]],
+        "corruption_params": {"drop_mode": "restify_zero_duration"},
+        "details": {
+            "source_onset_beat": chosen["start"],
+            "duration_before": chosen["duration"],
+            "overlapping_melody_indices": chosen["overlapping_melody_indices"],
+            "same_onset_melody_indices": chosen["same_onset_melody_indices"],
+            "strong_chord_position": chosen["strong_chord_position"],
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_chord_onset_shift(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("chord_onset_shift")
+    chords = song_obj.get("chords", [])
+    if not chords:
+        metadata["reason_skipped"] = "no_chords_found"
+        return song_obj, metadata, False
+
+    max_steps = int(corruption_cfg.get("chord_shift_max_steps", corruption_cfg.get("rhythm_shift_max_steps", 1)))
+    onset_grid = _onset_grid(song_obj)
+    if len(onset_grid) < 2:
+        metadata["reason_skipped"] = "insufficient_onset_grid"
+        return song_obj, metadata, False
+
+    _, melody = _melody_events(song_obj)
+    candidates: list[dict] = []
+    chord_indices = list(range(len(chords)))
+    rng.shuffle(chord_indices)
+    for chord_idx in chord_indices:
+        chord = chords[chord_idx]
+        if int(chord.get("is_rest", 0)) == 1:
+            continue
+        old_beat = try_parse_float(chord.get("beat"))
+        if old_beat is None or old_beat not in onset_grid:
+            continue
+        start, end = _note_interval(chord)
+        if start is None or end is None:
+            continue
+        duration = max(0.0, float(end - start))
+        pos = onset_grid.index(old_beat)
+        original_same_onset_melody_indices = [
+            note_idx
+            for note_idx, note in enumerate(melody or [])
+            if int(note.get("is_rest", 0)) == 0 and abs(safe_float(note.get("beat"), -999.0) - float(old_beat)) <= DEFAULT_EPSILON
+        ]
+        for step in range(1, max(1, max_steps) + 1):
+            for target_pos in (pos - step, pos + step):
+                if target_pos < 0 or target_pos >= len(onset_grid):
+                    continue
+                new_beat = float(onset_grid[target_pos])
+                if abs(new_beat - float(old_beat)) <= DEFAULT_EPSILON:
+                    continue
+                target_same_onset_melody_indices = [
+                    note_idx
+                    for note_idx, note in enumerate(melody or [])
+                    if int(note.get("is_rest", 0)) == 0 and abs(safe_float(note.get("beat"), -999.0) - new_beat) <= DEFAULT_EPSILON
+                ]
+                strong_chord_position = _is_strong_chord_position(chord, song_obj)
+                score = 0.0
+                if strong_chord_position:
+                    score += 2.0
+                if original_same_onset_melody_indices:
+                    score += 4.0
+                if target_same_onset_melody_indices:
+                    score += 1.0
+                score += 0.1 / float(step)
+                candidates.append({
+                    "chord_idx": chord_idx,
+                    "old_beat": float(old_beat),
+                    "new_beat": new_beat,
+                    "duration": duration,
+                    "original_same_onset_melody_indices": original_same_onset_melody_indices,
+                    "target_same_onset_melody_indices": target_same_onset_melody_indices,
+                    "strong_chord_position": strong_chord_position,
+                    "score": score,
+                })
+
+    if not candidates:
+        metadata["reason_skipped"] = "no_shiftable_chord_onset"
+        return song_obj, metadata, False
+
+    max_score = max(candidate["score"] for candidate in candidates)
+    best_candidates = [candidate for candidate in candidates if abs(candidate["score"] - max_score) <= 1e-9]
+    chosen = rng.choice(best_candidates)
+    chord = chords[chosen["chord_idx"]]
+    _set_note_interval(chord, chosen["new_beat"], chosen["new_beat"] + chosen["duration"])
+    _sync_pos_in_bar_if_present(chord, song_obj)
+    post_grid = _onset_grid(song_obj)
+    onset_indices = _collect_post_onset_indices_for_metadata(post_grid, {chosen["old_beat"], chosen["new_beat"]})
+
+    metadata.update({
+        "applied": True,
+        "topology_changed": True,
+        "n_chords_modified": 1,
+        "chord_corrupted_indices": [chosen["chord_idx"]],
+        "onset_corrupted_indices": onset_indices,
+        "corruption_params": {"max_steps": max(1, max_steps)},
+        "details": {
+            "source_onset_beat": chosen["old_beat"],
+            "target_onset_beat": chosen["new_beat"],
+            "duration_before": chosen["duration"],
+            "original_same_onset_melody_indices": chosen["original_same_onset_melody_indices"],
+            "target_same_onset_melody_indices": chosen["target_same_onset_melody_indices"],
+            "strong_chord_position": chosen["strong_chord_position"],
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_duration_stretch_shrink_note(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("duration_stretch_shrink_note")
+    melody_key, melody = _melody_events(song_obj)
+    if not melody_key or not melody:
+        metadata["reason_skipped"] = "melody_track_not_found"
+        return song_obj, metadata, False
+
+    scale_factors = _duration_scale_factors(corruption_cfg, "note_duration_scale_factors")
+    if not scale_factors:
+        metadata["reason_skipped"] = "no_note_duration_scale_factors"
+        return song_obj, metadata, False
+    min_duration = safe_float(corruption_cfg.get("min_note_duration_beats", corruption_cfg.get("duration_min_beats", 0.25)), 0.25)
+
+    candidates: list[dict] = []
+    note_indices = list(range(len(melody)))
+    rng.shuffle(note_indices)
+    for note_idx in note_indices:
+        note = melody[note_idx]
+        if int(note.get("is_rest", 0)) == 1:
+            continue
+        start, end = _note_interval(note)
+        if start is None or end is None:
+            continue
+        old_duration = max(0.0, float(end - start))
+        if old_duration <= DEFAULT_EPSILON:
+            continue
+        next_start = None
+        if note_idx + 1 < len(melody):
+            next_start, _ = _note_interval(melody[note_idx + 1])
+        covering_chord_index = find_covering_chord_index(song_obj, note)
+        same_onset_with_chord = False
+        if covering_chord_index is not None:
+            chord_start = try_parse_float(song_obj["chords"][covering_chord_index].get("beat"))
+            same_onset_with_chord = chord_start is not None and abs(float(chord_start) - float(start)) <= DEFAULT_EPSILON
+        strong_note_position = is_strong_note_position(note, song_obj)
+        for factor in scale_factors:
+            new_duration = old_duration * float(factor)
+            if new_duration < min_duration or abs(new_duration - old_duration) <= DEFAULT_EPSILON:
+                continue
+            new_end = float(start) + new_duration
+            if factor > 1.0 and next_start is not None and new_end > float(next_start) - DEFAULT_EPSILON:
+                continue
+            score = 0.1 * old_duration
+            if strong_note_position:
+                score += 2.0
+            if same_onset_with_chord:
+                score += 1.0
+            if factor < 1.0:
+                score += 0.25
+            candidates.append({
+                "note_idx": note_idx,
+                "start": float(start),
+                "old_duration": old_duration,
+                "new_duration": new_duration,
+                "factor": float(factor),
+                "covering_chord_index": covering_chord_index,
+                "same_onset_with_chord": same_onset_with_chord,
+                "strong_note_position": strong_note_position,
+                "score": score,
+            })
+
+    if not candidates:
+        metadata["reason_skipped"] = "no_note_duration_candidate"
+        return song_obj, metadata, False
+
+    max_score = max(candidate["score"] for candidate in candidates)
+    best_candidates = [candidate for candidate in candidates if abs(candidate["score"] - max_score) <= 1e-9]
+    chosen = rng.choice(best_candidates)
+    note = melody[chosen["note_idx"]]
+    _set_note_interval(note, chosen["start"], chosen["start"] + chosen["new_duration"])
+
+    metadata.update({
+        "applied": True,
+        "n_notes_modified": 1,
+        "note_corrupted_indices": [chosen["note_idx"]],
+        "corruption_params": {"duration_scale_factor": chosen["factor"]},
+        "details": {
+            "melody_key": melody_key,
+            "source_onset_beat": chosen["start"],
+            "original_duration": chosen["old_duration"],
+            "new_duration": chosen["new_duration"],
+            "covering_chord_index": chosen["covering_chord_index"],
+            "same_onset_with_chord": chosen["same_onset_with_chord"],
+            "strong_note_position": chosen["strong_note_position"],
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_duration_stretch_shrink_chord(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("duration_stretch_shrink_chord")
+    chords = song_obj.get("chords", [])
+    if not chords:
+        metadata["reason_skipped"] = "no_chords_found"
+        return song_obj, metadata, False
+
+    scale_factors = _duration_scale_factors(corruption_cfg, "chord_duration_scale_factors")
+    if not scale_factors:
+        metadata["reason_skipped"] = "no_chord_duration_scale_factors"
+        return song_obj, metadata, False
+    min_duration = safe_float(corruption_cfg.get("min_chord_duration_beats", corruption_cfg.get("duration_min_beats", 0.25)), 0.25)
+
+    _, melody = _melody_events(song_obj)
+    candidates: list[dict] = []
+    chord_indices = list(range(len(chords)))
+    rng.shuffle(chord_indices)
+    for chord_idx in chord_indices:
+        chord = chords[chord_idx]
+        if int(chord.get("is_rest", 0)) == 1:
+            continue
+        start, end = _note_interval(chord)
+        if start is None or end is None:
+            continue
+        old_duration = max(0.0, float(end - start))
+        if old_duration <= DEFAULT_EPSILON:
+            continue
+        overlapping_melody_indices = _collect_overlapping_melody_indices(song_obj, chord)
+        same_onset_melody_indices = [
+            note_idx
+            for note_idx in overlapping_melody_indices
+            if melody and abs(safe_float(melody[note_idx].get("beat"), -999.0) - float(start)) <= DEFAULT_EPSILON
+        ]
+        strong_chord_position = _is_strong_chord_position(chord, song_obj)
+        for factor in scale_factors:
+            new_duration = old_duration * float(factor)
+            if new_duration < min_duration or abs(new_duration - old_duration) <= DEFAULT_EPSILON:
+                continue
+            score = 0.1 * old_duration + min(2.0, 0.5 * float(len(overlapping_melody_indices)))
+            if same_onset_melody_indices:
+                score += 2.0
+            if strong_chord_position:
+                score += 2.0
+            if factor > 1.0:
+                score += 0.25
+            candidates.append({
+                "chord_idx": chord_idx,
+                "start": float(start),
+                "old_duration": old_duration,
+                "new_duration": new_duration,
+                "factor": float(factor),
+                "overlapping_melody_indices": overlapping_melody_indices,
+                "same_onset_melody_indices": same_onset_melody_indices,
+                "strong_chord_position": strong_chord_position,
+                "score": score,
+            })
+
+    if not candidates:
+        metadata["reason_skipped"] = "no_chord_duration_candidate"
+        return song_obj, metadata, False
+
+    max_score = max(candidate["score"] for candidate in candidates)
+    best_candidates = [candidate for candidate in candidates if abs(candidate["score"] - max_score) <= 1e-9]
+    chosen = rng.choice(best_candidates)
+    chord = chords[chosen["chord_idx"]]
+    _set_note_interval(chord, chosen["start"], chosen["start"] + chosen["new_duration"])
+    _sync_pos_in_bar_if_present(chord, song_obj)
+
+    metadata.update({
+        "applied": True,
+        "topology_changed": True,
+        "n_chords_modified": 1,
+        "chord_corrupted_indices": [chosen["chord_idx"]],
+        "corruption_params": {"duration_scale_factor": chosen["factor"]},
+        "details": {
+            "source_onset_beat": chosen["start"],
+            "original_duration": chosen["old_duration"],
+            "new_duration": chosen["new_duration"],
+            "overlapping_melody_indices": chosen["overlapping_melody_indices"],
+            "same_onset_melody_indices": chosen["same_onset_melody_indices"],
+            "strong_chord_position": chosen["strong_chord_position"],
+        },
+    })
+    return song_obj, metadata, True
+
+
 def _strict_slot_to_replacement_roots(mode_name: str, current_slot: str, theory_ctx: dict) -> list[int]:
     mode_key = "minor" if mode_name == "minor" else "major"
     rules = theory_ctx["strict_functions_v1"][mode_key]
@@ -1730,6 +2205,8 @@ _CORRUPTION_REGISTRY: dict[str, Callable] = {
     "merge_repeated_melody_notes": _corrupt_merge_repeated_melody_notes,
     "split_long_melody_note": _corrupt_split_long_melody_note,
     "drop_tonic_seventh_on_strong_beat": _corrupt_drop_tonic_seventh_on_strong_beat,
+    "drop_note_from_onset": _corrupt_drop_note_from_onset,
+    "drop_chord_from_onset": _corrupt_drop_chord_from_onset,
     "strongbeat_nonchord_note": _corrupt_strongbeat_nonchord_note,
     "borrowed_melody_conflict": _corrupt_borrowed_melody_conflict,
     "borrowed_kind_toggle_without_melody_change": _corrupt_borrowed_kind_toggle,
@@ -1738,8 +2215,11 @@ _CORRUPTION_REGISTRY: dict[str, Callable] = {
     "melody_alteration_clash": _corrupt_melody_alteration_clash,
     "melody_omit_core_tone_conflict": _corrupt_melody_omit_core_tone_conflict,
     "inversion_bass_continuity_conflict": _corrupt_inversion_bass_continuity_conflict,
+    "chord_onset_shift": _corrupt_chord_onset_shift,
     "note_onset_shift": _corrupt_note_onset_shift,
     "strong_weak_beat_flip": _corrupt_strong_weak_beat_flip,
+    "duration_stretch_shrink_note": _corrupt_duration_stretch_shrink_note,
+    "duration_stretch_shrink_chord": _corrupt_duration_stretch_shrink_chord,
     "functional_progression_violation_strict": _corrupt_functional_progression_violation,
     "out_of_key_note": _corrupt_out_of_key_note,
     "local_semitone_fragment_shift": _corrupt_local_semitone_fragment_shift,
@@ -1748,11 +2228,6 @@ _CORRUPTION_REGISTRY: dict[str, Callable] = {
 }
 
 _PLACEHOLDER_MODES = {
-    "drop_note_from_onset",
-    "drop_chord_from_onset",
-    "chord_onset_shift",
-    "duration_stretch_shrink_note",
-    "duration_stretch_shrink_chord",
     "applied_resolution_violation",
 }
 

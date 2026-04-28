@@ -544,6 +544,93 @@ class TheorySmokeTests(unittest.TestCase):
         self.assertEqual(after_inv, meta["details"]["new_inversion_raw"])
         self.assertEqual(after_bass, meta["details"]["new_bass_pc"])
 
+    def test_drop_note_from_onset_smoke(self):
+        song = self._song()
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["drop_note_from_onset"],
+            {},
+            self.ctx,
+            rng=random.Random(13),
+        )
+        self.assertTrue(meta["applied"])
+        self.assertEqual(meta["note_corrupted_indices"], [0])
+        dropped = corrupted_song["melody"][0]
+        self.assertEqual(int(dropped["is_rest"]), 1)
+        self.assertEqual(int(dropped["sd_id"]), 0)
+        self.assertEqual(int(dropped["octave_id"]), 0)
+        self.assertTrue(meta["details"]["same_onset_with_chord"])
+        self.assertTrue(meta["details"]["strong_note_position"])
+
+    def test_drop_chord_from_onset_smoke(self):
+        song = self._song()
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["drop_chord_from_onset"],
+            {},
+            self.ctx,
+            rng=random.Random(14),
+        )
+        self.assertTrue(meta["applied"])
+        self.assertEqual(meta["chord_corrupted_indices"], [0])
+        dropped = corrupted_song["chords"][0]
+        self.assertEqual(int(dropped["is_rest"]), 1)
+        self.assertAlmostEqual(float(dropped["duration"]), 0.0)
+        self.assertTrue(meta["topology_changed"])
+        self.assertTrue(meta["details"]["same_onset_melody_indices"])
+
+    def test_chord_onset_shift_smoke(self):
+        song = self._song()
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["chord_onset_shift"],
+            {"chord_shift_max_steps": 1},
+            self.ctx,
+            rng=random.Random(15),
+        )
+        self.assertTrue(meta["applied"])
+        self.assertEqual(meta["chord_corrupted_indices"], [0])
+        self.assertNotEqual(float(corrupted_song["chords"][0]["beat"]), float(song["chords"][0]["beat"]))
+        self.assertIn("source_onset_beat", meta["details"])
+        self.assertIn("target_onset_beat", meta["details"])
+        expected = self._expected_post_onset_indices(
+            corrupted_song,
+            float(meta["details"]["source_onset_beat"]),
+            float(meta["details"]["target_onset_beat"]),
+        )
+        self.assertEqual(sorted(meta["onset_corrupted_indices"]), expected)
+
+    def test_duration_stretch_shrink_note_smoke(self):
+        song = self._song()
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["duration_stretch_shrink_note"],
+            {"note_duration_scale_factors": [0.5]},
+            self.ctx,
+            rng=random.Random(16),
+        )
+        self.assertTrue(meta["applied"])
+        self.assertEqual(meta["note_corrupted_indices"], [0])
+        self.assertAlmostEqual(float(corrupted_song["melody"][0]["duration"]), 0.5)
+        self.assertAlmostEqual(float(meta["details"]["original_duration"]), 1.0)
+        self.assertAlmostEqual(float(meta["details"]["new_duration"]), 0.5)
+
+    def test_duration_stretch_shrink_chord_smoke(self):
+        song = self._song()
+        corrupted_song, meta = corrupt_song_obj(
+            copy.deepcopy(song),
+            ["duration_stretch_shrink_chord"],
+            {"chord_duration_scale_factors": [0.5]},
+            self.ctx,
+            rng=random.Random(17),
+        )
+        self.assertTrue(meta["applied"])
+        self.assertEqual(meta["chord_corrupted_indices"], [0])
+        self.assertAlmostEqual(float(corrupted_song["chords"][0]["duration"]), 1.0)
+        self.assertAlmostEqual(float(meta["details"]["original_duration"]), 2.0)
+        self.assertAlmostEqual(float(meta["details"]["new_duration"]), 1.0)
+        self.assertTrue(meta["topology_changed"])
+
     def test_octave_leap_violation_smoke(self):
         song = self._song()
         corrupted_song, meta = corrupt_song_obj(copy.deepcopy(song), ["octave_leap_violation"], {}, self.ctx, rng=random.Random(3))
