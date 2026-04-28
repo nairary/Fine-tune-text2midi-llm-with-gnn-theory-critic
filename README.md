@@ -336,9 +336,14 @@ melody_alteration_clash
 melody_omit_core_tone_conflict
 inversion_bass_continuity_conflict
 note_onset_shift
+chord_onset_shift
 strong_weak_beat_flip
+duration_stretch_shrink_note
+duration_stretch_shrink_chord
 functional_progression_violation_strict
 ```
+
+Этот набор намеренно держит в train in-domain ошибки гармонии, мелодии, onset-ов и длительностей. `drop_note_from_onset` и `drop_chord_from_onset` лучше проверять отдельной ablation, потому что это topology-changing негативы и они могут стать слишком легким shortcut. OOD-набор (`out_of_key_note`, `local_semitone_fragment_shift`, `octave_leap_violation`, `semitone_from_bass_or_chord_tone`) вынесен в `configs/dataloader/theory_aware_ood.yaml`.
 
 Benign / near-benign corruptions (`transpose_with_tonic_shift`, `merge_repeated_melody_notes`, `split_long_melody_note`, `melody_octave_shift`, `drop_tonic_seventh_on_strong_beat`) проверяются тестами из раздела 1 и могут запускаться явно через `dataloader.corruption_modes=[...]` или через `infer_teacher_score --modes ...`.
 
@@ -402,6 +407,57 @@ python -m src.training.train_teacher \
 python -m src.training.train_teacher +dataloader=theory_aware_ood run_name=teacher_ood_modes
 ```
 
+### 5.3 Attention / hybrid scorer ablation
+
+Для ablation нового attention-механизма на полном датасете можно запустить Hydra multirun примерно на 100 эпох. Hybrid scorer фиксируется включенным во всех запусках, потому что это основной scorer; sweep сравнивает два независимых фактора:
+
+- graph pooling: старая версия `mean_max` против `attention`;
+- local context внутри hybrid scorer: старая версия `mean` против `attention`.
+
+На RTX 3090 `batch_size=32` для base-модели должен быть нормальной стартовой точкой; если будет OOM, уменьши до 16 или включи `training.use_amp=true`.
+
+```bash
+python -m src.training.train_teacher -m \
+  +experiment=full_data \
+  +dataloader=theory_aware_ablation \
+  data.json_path=data/HTCanon/encoded_full/teacher_encoded.json \
+  dataloader.batch_size=32 \
+  training.epochs=100 \
+  experiment.epochs=100 \
+  scheduler.t_max=100 \
+  training.mlm_ssl_epochs=50 \
+  training.corruption_epochs=50 \
+  device=cuda \
+  training.device=cuda \
+  model.pooling_mode=mean_max,attention \
+  model.pooling_type_attention=false \
+  model.local_context_mode=mean,attention \
+  model.use_hybrid_graph_scorer=true \
+  run_name='attn_ablation_${dataloader.name}_pool-${model.pooling_mode}_local-${model.local_context_mode}_hyb-${model.use_hybrid_graph_scorer}_bs-${dataloader.batch_size}_ep-${experiment.epochs}'
+```
+
+Это 4 запуска: old/old, pooling-attention only, local-attention only, attention/attention. Если хочешь проверить только graph pooling при старом local context:
+
+```bash
+python -m src.training.train_teacher -m \
+  +experiment=full_data \
+  +dataloader=theory_aware_ablation \
+  data.json_path=data/HTCanon/encoded_full/teacher_encoded.json \
+  dataloader.batch_size=32 \
+  training.epochs=100 \
+  experiment.epochs=100 \
+  scheduler.t_max=100 \
+  training.mlm_ssl_epochs=50 \
+  training.corruption_epochs=50 \
+  device=cuda \
+  training.device=cuda \
+  model.pooling_mode=mean_max,attention \
+  model.pooling_type_attention=false \
+  model.local_context_mode=mean \
+  model.use_hybrid_graph_scorer=true \
+  run_name='attn_pool_ablation_${model.pooling_mode}_bs-${dataloader.batch_size}_ep-${experiment.epochs}'
+```
+
 Hydra создает директорию запуска:
 
 ```text
@@ -428,7 +484,7 @@ outputs/YYYY-MM-DD/HH-MM-SS_<run_name>/
 - teacher checkpoint: обычно `checkpoints/best_rank_acc.pt` или `checkpoints/last.pt`;
 - matching config: `composed_config.yaml` из той же run-директории.
 
-### 5.3 Оценка teacher-а
+### 5.4 Оценка teacher-а
 
 ```bash
 python -m src.training.eval_teacher_ssl \

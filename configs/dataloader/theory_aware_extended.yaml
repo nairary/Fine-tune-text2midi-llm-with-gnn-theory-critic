@@ -40,7 +40,13 @@ corruption_modes:
   - inversion_bass_continuity_conflict
   # Сдвигает onset ноты на соседние позиции по ритмической сетке.
   - note_onset_shift
+  # Сдвигает onset аккорда на соседнюю позицию, ломая синхронизацию гармонии и мелодии.
+  - chord_onset_shift
   # Переносит ноту между сильной и слабой долей внутри такта.
   - strong_weak_beat_flip
+  # Растягивает или сжимает длительность ноты.
+  - duration_stretch_shrink_note
+  # Растягивает или сжимает длительность аккорда.
+  - duration_stretch_shrink_chord
   # Ломает функциональный T/PD/D-паттерн в триплете аккордов.
   - functional_progression_violation_strict

@@ -60,7 +60,10 @@ dataloader:
   - melody_omit_core_tone_conflict
   - inversion_bass_continuity_conflict
   - note_onset_shift
+  - chord_onset_shift
   - strong_weak_beat_flip
+  - duration_stretch_shrink_note
+  - duration_stretch_shrink_chord
   - functional_progression_violation_strict
 training:
   epochs: 500
