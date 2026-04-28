@@ -6,15 +6,42 @@
 - **Chord scorer** восстанавливает аккордовые события из MIDI-сонорностей. Его обучаемые веса нужны observer-части, чтобы из MIDI построить теоретический граф.
 - **ObserverGNN** учится дистиллировать скалярный score teacher-а, но уже по MIDI-derived graph. Это приближает teacher critic к сценарию, где на входе есть MIDI, а не исходный encoded JSON.
 
-Все команды ниже предполагают запуск из корня репозитория.
+Все команды ниже предполагают запуск из корня репозитория. Если запускаешься в полностью новом окружении, иди сверху вниз: сначала окружение и sanity checks, потом подготовка данных, потом chord scorer, teacher, observer pipeline. Долгие GPU-запуски имеет смысл начинать только после коротких проверок из раздела 1.
 
 ## 0. Окружение
 
+### 0.1 Клонирование и venv
+
 ```bash
+git clone <repo-url>
+cd Fine-tune-text2midi-llm-with-gnn-theory-critic
+
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+```
+
+Для локальных тестов дополнительно нужен `pytest`:
+
+```bash
+python -m pip install pytest
+```
+
+Быстрая проверка импортов:
+
+```bash
+python - <<'PY'
+import torch
+import torch_geometric
+import pretty_midi
+import hydra
+
+print("torch", torch.__version__, "cuda", torch.cuda.is_available())
+print("torch_geometric", torch_geometric.__version__)
+print("pretty_midi", getattr(pretty_midi, "__version__", "unknown"))
+print("hydra", hydra.__version__)
+PY
 ```
 
 Если используешь CUDA, проверь, что установленная сборка `torch` подходит под локальный драйвер. В примерах ниже `device=cpu` можно заменить на `device=cuda`, а для teacher лучше задавать оба поля:
@@ -32,7 +59,48 @@ python -m src.observer.run_observer_pipeline
 
 Для data-скриптов и scripts-утилит можно использовать `python -m ...` или прямой запуск файла.
 
-## 1. Ожидаемые входные данные
+## 1. Проверка новых изменений
+
+Перед полной подготовкой и обучением можно быстро проверить, что свежие изменения по corruptions, staged SSL и pairwise MIDI/observer pipeline не сломаны.
+
+```bash
+python -m pytest -q \
+  tests/test_song_corruptions_benign.py \
+  tests/test_corruption_mode_balancer.py \
+  tests/test_train_teacher_stages.py \
+  tests/test_observer_offline_pipeline.py \
+  tests/test_build_teacher_targets.py \
+  tests/test_infer_observer_scores.py
+```
+
+Что покрывает этот набор:
+
+- новые benign / near-benign corruptions и их metadata contract;
+- балансировку corruption modes, чтобы редкие режимы реально доходили до датасета;
+- двухстадийное обучение teacher-а: `mlm_ssl` -> `corruption`;
+- cross-track ranking teacher-а: clean одного трека сравнивается не только со своим corrupted, но и с corrupted других треков в batch;
+- offline observer pipeline: clean/corrupted пары рендерятся в отдельные MIDI, связываются через `*_pairs.jsonl`, получают teacher targets и загружаются как пары графов;
+- batch inference observer-а для сравнения нескольких MIDI-кандидатов между собой.
+
+После подготовки `teacher_encoded.json` из раздела 3 сделай еще короткий тренировочный smoke-run:
+
+```bash
+python -m src.training.train_teacher \
+  +experiment=debug \
+  data.json_path=data/HTCanon/encoded_full/teacher_encoded.json \
+  dataloader.batch_size=2 \
+  training.limit_train_samples=32 \
+  training.limit_val_samples=16 \
+  training.epochs=4 \
+  experiment.epochs=4 \
+  training.mlm_ssl_epochs=2 \
+  training.corruption_epochs=2 \
+  run_name=teacher_debug_staged
+```
+
+Успешный smoke-run должен создать `outputs/.../teacher_debug_staged/metrics.jsonl`, где первые строки имеют `stage=mlm_ssl`, а последующие `stage=corruption`. В corruption-stage смотри метрики `intra_rank_acc`, `inter_rank_acc`, `rank_acc`, `graph_binary_acc`: они подтверждают, что включены intra-track, cross-track и абсолютная clean/corrupted калибровка.
+
+## 2. Ожидаемые входные данные
 
 Минимальный набор HookTheory-данных:
 
@@ -66,11 +134,11 @@ metadata/
   vocabs/
 ```
 
-## 2. Работа с данными
+## 3. Работа с данными
 
 Цель блока: получить `teacher_encoded.json`, который читает `HookTheoryDataset` и из которого строятся hetero-графы teacher-а.
 
-### 2.1 Raw JSON -> processed JSON
+### 3.1 Raw JSON -> processed JSON
 
 ```bash
 python -m src.data.preprocess_hooktheory \
@@ -91,7 +159,7 @@ python -m src.data.preprocess_hooktheory \
 
 `valid` split нормализуется в `val`.
 
-### 2.2 Таймлайны исходных песен
+### 3.2 Таймлайны исходных песен
 
 Этот шаг не обязателен для обучения teacher-а, но полезен для анализа section-структуры по `ori_uid`.
 
@@ -108,7 +176,7 @@ python -m src.data.build_preprocess_song_timelines \
 - `original_songs_aggregate.stats.json`;
 - `original_songs_timeline.stats.json`.
 
-### 2.3 Processed JSON -> canonical JSON
+### 3.3 Processed JSON -> canonical JSON
 
 ```bash
 python -m src.data.canonicalize_hooktheory \
@@ -132,7 +200,7 @@ python -m src.data.canonicalize_hooktheory \
 
 Если нужна диагностика исходных сырых значений рядом с нормализованными, добавь `--keep-raw`.
 
-### 2.4 Canonical JSON -> teacher encoded JSON
+### 3.4 Canonical JSON -> teacher encoded JSON
 
 ```bash
 python -m src.data.encode_teacher_features \
@@ -162,11 +230,11 @@ python -m src.data.encode_teacher_features \
 data/HTCanon/encoded_full/teacher_encoded.json
 ```
 
-## 3. Обучение весов аккордового скорера
+## 4. Обучение весов аккордового скорера
 
 Chord scorer используется, когда observer строит аккордовые события из MIDI. Он берет MIDI-инструмент с именем `chords`, строит кандидаты аккордов по сонорностям и ранжирует их. Веса сохраняются в `learned_weights.yaml`.
 
-### 3.1 Сгенерировать MIDI из encoded JSON
+### 4.1 Сгенерировать MIDI из encoded JSON
 
 ```bash
 python -m src.data.render_encoded_song_to_midi \
@@ -198,7 +266,7 @@ python -m src.data.render_encoded_song_to_midi \
   --verbose
 ```
 
-### 3.2 Обучить веса scorer-а
+### 4.2 Обучить веса scorer-а
 
 ```bash
 python scripts/fit_chord_score_weights.py \
@@ -237,7 +305,7 @@ python scripts/fit_chord_score_weights.py \
   --save-val-groups-json
 ```
 
-## 4. Обучение GNN Teacher
+## 5. Обучение GNN Teacher
 
 Teacher обучается на `teacher_encoded.json`. Он сам строит real/masked/corrupted графы, поэтому отдельные labels не нужны.
 По умолчанию обучение теперь идет в 2 последовательных stage:
@@ -248,20 +316,53 @@ Teacher обучается на `teacher_encoded.json`. Он сам строит
 Если `training.mlm_ssl_epochs` и `training.corruption_epochs` не заданы, общее число эпох из `training.epochs` автоматически делится между stage примерно пополам. При необходимости разбиение можно задать явно.
 Во втором stage teacher сравнивает не только clean/corrupted одной и той же песни, но и clean одной песни против corrupted других песен в том же batch. Дополнительно добавлена абсолютная калибровка `clean=1 / corrupted=0`, чтобы шкала score была согласованной между разными треками.
 
-### 4.1 Smoke test
+Практически это задается в `configs/config.yaml`:
+
+- `losses.graph_rank_intra_weight=1.0` - clean_i должен быть выше corrupted_i;
+- `losses.graph_rank_inter_weight=1.0` - clean_i должен быть выше corrupted_j для других песен в batch;
+- `losses.graph_binary_weight=1.0` - clean получает label 1, corrupted получает label 0.
+
+Для cross-track части нужен `dataloader.batch_size>=2`. Если поставить batch size 1, intra-track ranking останется, но inter-track сравнения между разными песнями в batch не будет.
+
+Default full-набор song-level corruptions для teacher-а лежит в `configs/config.yaml` и сейчас включает:
+
+```text
+strongbeat_nonchord_note
+borrowed_melody_conflict
+borrowed_kind_toggle_without_melody_change
+melody_semitone_add_clash
+melody_suspension_clash
+melody_alteration_clash
+melody_omit_core_tone_conflict
+inversion_bass_continuity_conflict
+note_onset_shift
+strong_weak_beat_flip
+functional_progression_violation_strict
+```
+
+Benign / near-benign corruptions (`transpose_with_tonic_shift`, `merge_repeated_melody_notes`, `split_long_melody_note`, `melody_octave_shift`, `drop_tonic_seventh_on_strong_beat`) проверяются тестами из раздела 1 и могут запускаться явно через `dataloader.corruption_modes=[...]` или через `infer_teacher_score --modes ...`.
+
+### 5.1 Smoke test
 
 ```bash
 python -m src.training.train_teacher \
   +experiment=debug \
+  data.json_path=data/HTCanon/encoded_full/teacher_encoded.json \
   dataloader.batch_size=2 \
   training.limit_train_samples=32 \
   training.limit_val_samples=16 \
-  run_name=teacher_debug
+  training.epochs=4 \
+  experiment.epochs=4 \
+  training.mlm_ssl_epochs=2 \
+  training.corruption_epochs=2 \
+  run_name=teacher_debug_staged
 ```
+
+Проверь `outputs/.../teacher_debug_staged/metrics.jsonl`: должны быть строки со `stage=mlm_ssl`, затем со `stage=corruption`. В corruption-stage должны появиться `inter_rank_acc` и `inter_rank_loss`; это проверка сравнения между разными песнями в batch.
 
 В текущей структуре `configs/config.yaml` уже развернут целиком, поэтому Hydra-группы подключаются через `+group=name`, например `+model=teacher_gnn_small`. Простые поля переопределяются обычным `a.b=value`.
 
-### 4.2 Полное обучение
+### 5.2 Полное обучение
 
 ```bash
 python -m src.training.train_teacher \
@@ -327,7 +428,7 @@ outputs/YYYY-MM-DD/HH-MM-SS_<run_name>/
 - teacher checkpoint: обычно `checkpoints/best_rank_acc.pt` или `checkpoints/last.pt`;
 - matching config: `composed_config.yaml` из той же run-директории.
 
-### 4.3 Оценка teacher-а
+### 5.3 Оценка teacher-а
 
 ```bash
 python -m src.training.eval_teacher_ssl \
@@ -350,9 +451,11 @@ python scripts/eval_teacher_ood_corruptions.py \
   --outdir outputs/teacher_ood_eval
 ```
 
-## 5. Кэширование MIDI-пар, teacher targets и graph cache
+## 6. Кэширование MIDI-пар, teacher targets и graph cache
 
 Observer pipeline строит пары `clean/corrupted`, рендерит их в MIDI, прогоняет teacher для получения target-score и кэширует observer-графы.
+
+Здесь важно отличие от старого режима "сравнить только внутри одного encoded-трека": clean и corrupted сохраняются как отдельные MIDI-файлы, затем из каждого MIDI строится отдельный observer graph. Pair-связь хранится в `pairs/index/*_pairs.jsonl` и `targets/*_pairs.jsonl`; обучение observer-а загружает оба MIDI-derived графа и оптимизирует одновременно regression loss по teacher score и pair rank loss между clean/corrupted MIDI-графами.
 
 Рекомендуемый единый запуск:
 
@@ -375,6 +478,12 @@ python -m src.observer.run_observer_pipeline \
 2. `build_targets`: считает teacher score для каждого sample.
 3. `build_graph_cache`: строит и сохраняет observer `HeteroData` графы.
 4. `train`: обучает ObserverGNN на кэше.
+
+Pairwise contract после шага `build_targets`:
+
+- `targets/train.jsonl` и `targets/val.jsonl` - sample-level teacher scores для каждого clean/corrupted MIDI;
+- `targets/train_pairs.jsonl` и `targets/val_pairs.jsonl` - clean/corrupted связи с `teacher_score_clean`, `teacher_score_corrupted`, `teacher_score_gap`;
+- `training/metrics.jsonl` - observer metrics, включая `pair_rank_acc`, `mean_pred_margin`, `mean_teacher_margin`.
 
 Структура выхода:
 
@@ -438,9 +547,11 @@ python -m src.observer.run_observer_pipeline \
 - `dataloader.theory_aware.deterministic_per_sample=true` нужен для воспроизводимых pair ids при `observer_pipeline.overwrite=false`;
 - `observer_pipeline.overwrite=true` полностью пересобирает artifacts;
 - `observer_training.chord_weights_yaml=null` включает ручной scorer вместо обученных весов;
-- `observer_training.chord_instrument_name=chords` задает MIDI-инструмент для гармонического анализа.
+- `observer_training.chord_instrument_name=chords` задает MIDI-инструмент для гармонического анализа;
+- `losses.use_pair_rank=true` включает pair rank loss;
+- `losses.min_teacher_gap_for_rank=0.25` отбрасывает слишком неоднозначные пары из rank loss, но regression loss все равно считается для clean и corrupted.
 
-## 6. Обучение GNN Observer
+## 7. Обучение GNN Observer
 
 Если используешь единый `run_observer_pipeline`, обучение запускается последним шагом автоматически.
 
@@ -486,9 +597,9 @@ python -m src.observer.run_observer_pipeline \
 
 `observer_training.epochs` должен быть больше эпохи в `training/last.pt`.
 
-## 7. Inference
+## 8. Inference
 
-### 7.1 Teacher score для одного encoded song
+### 8.1 Teacher score для одного encoded song
 
 `infer_teacher_score` ожидает один JSON-объект песни, а не весь `{song_id: song}` датасет. Если нужно, сначала сохрани одну песню из `teacher_encoded.json` отдельным файлом.
 
@@ -516,7 +627,7 @@ python -m src.inference.infer_teacher_score \
 
 Выход содержит `original_score`, `corrupted_score` и `score_gap`.
 
-### 7.2 Аккорды из MIDI
+### 8.2 Аккорды из MIDI
 
 ```bash
 python scripts/predict_midi_chords.py \
@@ -533,7 +644,7 @@ python scripts/predict_midi_chords.py \
 
 `--mode`: один из `major`, `minor`, `dorian`, `phrygian`, `lydian`, `mixolydian`, `locrian`, `harmonic_minor`, `phrygian_dominant`.
 
-### 7.3 Batch observer score для GRPO
+### 8.3 Batch observer score для GRPO
 
 Для GRPO reward/scoring есть отдельный batch CLI:
 
@@ -596,10 +707,28 @@ python -m src.inference.infer_observer_scores \
 
 По умолчанию CLI берет `chord_weights_yaml`, `chord_instrument_name` и `use_fallback_44` из config, сохраненного внутри observer checkpoint. Любой из этих параметров можно переопределить CLI-аргументом.
 
-## 8. Быстрый end-to-end чеклист
+## 9. Быстрый end-to-end чеклист
+
+Это минимальный порядок команд для нового окружения. Если GPU нет, замени `device=cuda training.device=cuda observer_training.device=cuda` на `cpu`.
 
 ```bash
-# 1. raw -> processed
+# 0. окружение
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install pytest
+
+# 1. короткие проверки новых corruption / SSL / pairwise observer изменений
+python -m pytest -q \
+  tests/test_song_corruptions_benign.py \
+  tests/test_corruption_mode_balancer.py \
+  tests/test_train_teacher_stages.py \
+  tests/test_observer_offline_pipeline.py \
+  tests/test_build_teacher_targets.py \
+  tests/test_infer_observer_scores.py
+
+# 2. raw -> processed
 python -m src.data.preprocess_hooktheory \
   --raw-json data/HookTheory/Hooktheory_Raw.json/4_merged.json \
   --out-dir data/HTCanon/HK_processed \
@@ -608,7 +737,7 @@ python -m src.data.preprocess_hooktheory \
   --structure-test data/HookTheory/HookTheoryStructure.test.jsonl \
   --compute-stats
 
-# 2. processed -> canonical -> encoded
+# 3. processed -> canonical -> encoded
 python -m src.data.canonicalize_hooktheory \
   --input data/HTCanon/HK_processed/hooktheory_processed.json \
   --out-dir data/HTCanon/canonical_full
@@ -618,7 +747,20 @@ python -m src.data.encode_teacher_features \
   --metadata-dir metadata \
   --out-dir data/HTCanon/encoded_full
 
-# 3. MIDI + chord scorer
+# 4. teacher staged smoke-run
+python -m src.training.train_teacher \
+  +experiment=debug \
+  data.json_path=data/HTCanon/encoded_full/teacher_encoded.json \
+  dataloader.batch_size=2 \
+  training.limit_train_samples=32 \
+  training.limit_val_samples=16 \
+  training.epochs=4 \
+  experiment.epochs=4 \
+  training.mlm_ssl_epochs=2 \
+  training.corruption_epochs=2 \
+  run_name=teacher_debug_staged
+
+# 5. MIDI + chord scorer
 python -m src.data.render_encoded_song_to_midi \
   --encoded-json data/HTCanon/encoded_full/teacher_encoded.json \
   --output-root data/rendered \
@@ -631,9 +773,10 @@ python scripts/fit_chord_score_weights.py \
   --epochs 200 \
   --device cpu
 
-# 4. teacher
+# 6. full teacher
 python -m src.training.train_teacher \
   data.json_path=data/HTCanon/encoded_full/teacher_encoded.json \
+  dataloader.batch_size=32 \
   training.epochs=500 \
   experiment.epochs=500 \
   scheduler.t_max=500 \
@@ -641,16 +784,39 @@ python -m src.training.train_teacher \
   training.device=cuda \
   run_name=teacher_full_v1
 
-# 5. observer cache + train
+# 7. выбери fresh teacher run
+TEACHER_RUN=$(ls -td outputs/*/*teacher_full_v1* | head -n 1)
+echo "$TEACHER_RUN"
+
+# 8. teacher eval
+python -m src.training.eval_teacher_ssl \
+  --checkpoint-path "$TEACHER_RUN/checkpoints/best_rank_acc.pt" \
+  data.json_path=data/HTCanon/encoded_full/teacher_encoded.json \
+  device=cuda \
+  training.device=cuda
+
+# 9. observer MIDI-pair cache + targets + train
 python -m src.observer.run_observer_pipeline \
   data.json_path=data/HTCanon/encoded_full/teacher_encoded.json \
   observer_pipeline.output_root=outputs/observer_pipeline_full \
-  observer_training.teacher_checkpoint=outputs/.../checkpoints/best_rank_acc.pt \
-  observer_training.teacher_config=outputs/.../composed_config.yaml \
+  observer_training.teacher_checkpoint="$TEACHER_RUN/checkpoints/best_rank_acc.pt" \
+  observer_training.teacher_config="$TEACHER_RUN/composed_config.yaml" \
   observer_training.chord_weights_yaml=outputs/chord_score_fit/full/learned_weights.yaml \
   observer_training.device=cuda \
-  observer_training.epochs=20
+  observer_training.epochs=20 \
+  dataloader.batch_size=8 \
+  optimizer.lr=1e-3
 ```
+
+Контроль после полного observer run:
+
+```bash
+tail -n 1 outputs/observer_pipeline_full/training/metrics.jsonl
+wc -l outputs/observer_pipeline_full/targets/train_pairs.jsonl
+wc -l outputs/observer_pipeline_full/targets/val_pairs.jsonl
+```
+
+В последней строке `metrics.jsonl` смотри `val.pair_rank_acc`, `val.mae`, `val.spearman`, `val.mean_pred_margin`. Ненулевые `*_pairs.jsonl` подтверждают, что observer учился на MIDI-парах, а не на одиночных samples.
 
 После этого основные production-артефакты:
 
@@ -659,7 +825,7 @@ python -m src.observer.run_observer_pipeline \
 - Chord scorer weights: `outputs/chord_score_fit/full/learned_weights.yaml`;
 - Observer checkpoint: `outputs/observer_pipeline_full/training/best.pt`.
 
-## 9. Частые проблемы
+## 10. Частые проблемы
 
 **`Instrument 'chords' not found`**
 
