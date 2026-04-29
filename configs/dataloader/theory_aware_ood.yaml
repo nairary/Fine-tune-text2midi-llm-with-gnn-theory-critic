@@ -18,5 +18,9 @@ theory_aware:
 corruption_modes:
   - out_of_key_note
   - local_semitone_fragment_shift
-  - octave_leap_violation
   - semitone_from_bass_or_chord_tone
+  - strong_weak_beat_flip
+  - duration_stretch_shrink_note
+  - duration_stretch_shrink_chord
+  - functional_progression_violation_strict
+
