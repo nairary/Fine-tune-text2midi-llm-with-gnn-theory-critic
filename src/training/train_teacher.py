@@ -520,6 +520,28 @@ def save_checkpoint(
     )
 
 
+def load_model_weights_from_checkpoint(
+    checkpoint_path: Path,
+    model: TeacherGNN,
+    device: torch.device,
+    *,
+    strict: bool = True,
+) -> Mapping[str, Any]:
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"Checkpoint must be a mapping: {checkpoint_path}")
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(f"Checkpoint has no 'model_state_dict': {checkpoint_path}")
+    missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
+    if missing or unexpected:
+        LOGGER.warning(
+            "Loaded checkpoint with missing keys=%s unexpected keys=%s",
+            list(missing),
+            list(unexpected),
+        )
+    return checkpoint
+
+
 def print_metrics(prefix: str, metrics: Mapping[str, float]):
     ordered_keys = [
         "loss",
@@ -600,6 +622,24 @@ def main(cfg: DictConfig):
     sample = train_loader.dataset[0]
     model = build_model(sample["graph_real"], cfg.model, cfg.losses).to(device)
 
+    init_checkpoint = cfg.training.get("init_checkpoint")
+    init_checkpoint_metadata = None
+    if init_checkpoint:
+        init_checkpoint_path = resolve_path(str(init_checkpoint))
+        init_checkpoint_metadata = load_model_weights_from_checkpoint(
+            init_checkpoint_path,
+            model,
+            device,
+            strict=bool(cfg.training.get("init_checkpoint_strict", True)),
+        )
+        LOGGER.info(
+            "Initialized model weights from checkpoint=%s stage=%s stage_epoch=%s epoch=%s",
+            init_checkpoint_path,
+            init_checkpoint_metadata.get("stage"),
+            init_checkpoint_metadata.get("stage_epoch"),
+            init_checkpoint_metadata.get("epoch"),
+        )
+
     epochs = effective_epochs(cfg.training, cfg.experiment)
     stage_plan = build_training_stages(cfg.training, cfg.losses, epochs)
     train_batch_limit = effective_max_batches(cfg.training, cfg.experiment, "train")
@@ -630,6 +670,10 @@ def main(cfg: DictConfig):
             }
             for stage in stage_plan
         ],
+        "init_checkpoint": str(resolve_path(str(init_checkpoint))) if init_checkpoint else None,
+        "init_checkpoint_stage": init_checkpoint_metadata.get("stage") if init_checkpoint_metadata else None,
+        "init_checkpoint_stage_epoch": init_checkpoint_metadata.get("stage_epoch") if init_checkpoint_metadata else None,
+        "init_checkpoint_epoch": init_checkpoint_metadata.get("epoch") if init_checkpoint_metadata else None,
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
