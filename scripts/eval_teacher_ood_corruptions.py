@@ -51,7 +51,23 @@ BENIGN_ALL_MODES = STRICT_BENIGN_CORRUPTIONS + NEAR_BENIGN_CORRUPTIONS
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-json", type=Path, required=True, help="Path to encoded dataset JSON (list or dict).")
+    parser.add_argument(
+        "--dataset-json",
+        type=Path,
+        default=None,
+        help="Path to encoded dataset JSON (list or dict). Required unless --pair-corpus-root is used.",
+    )
+    parser.add_argument(
+        "--pair-corpus-root",
+        type=Path,
+        default=None,
+        help="Optional fixed PairCorpus root produced by src.observer.build_observer_pair_dataset.",
+    )
+    parser.add_argument(
+        "--pair-corpus-split",
+        default=None,
+        help="PairCorpus split file prefix to evaluate. Defaults to --split.",
+    )
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to TeacherGNN checkpoint (.pt).")
     parser.add_argument("--config", type=Path, required=True, help="Path to composed_config.yaml matching checkpoint.")
     parser.add_argument("--split", default="test", help="Dataset split to evaluate (default: test).")
@@ -70,6 +86,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu", help="Inference device, e.g. cpu or cuda.")
     parser.add_argument("--seed", type=int, default=123, help="Base RNG seed for reproducible corruption sampling.")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit on number of split songs to evaluate.")
+    parser.add_argument(
+        "--rank-probe-size",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, build an extra per-mode ranking probe from the first N applied songs: "
+            "N clean versions plus N corrupted versions sorted by TeacherGNN score."
+        ),
+    )
     parser.add_argument(
         "--outdir",
         type=Path,
@@ -118,6 +143,31 @@ def load_dataset_json(path: Path) -> list[tuple[str, dict[str, Any]]]:
     raise ValueError("Dataset JSON must be either a list[song_obj] or dict[song_id, song_obj].")
 
 
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def load_encoded_song(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected encoded song JSON object at {path}")
+    return payload
+
+
+def resolve_manifest_path(raw_path: str | Path) -> Path:
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    return ROOT / path
+
+
 def iter_split_songs(
     songs: list[tuple[str, dict[str, Any]]],
     split: str,
@@ -150,6 +200,8 @@ def load_model_from_config_and_checkpoint(
         residual=cfg.model.use_residual,
         encoder_hidden_dims=list(cfg.model.encoder_hidden_dims),
         pooling_mode=cfg.model.pooling_mode,
+        pooling_attention_hidden_dim=cfg.model.get("pooling_attention_hidden_dim"),
+        pooling_type_attention=bool(cfg.model.get("pooling_type_attention", False)),
         pooling_output_dim=cfg.model.pooling_output_dim,
         score_head_hidden_dim=cfg.model.score_head_hidden_dim,
         reconstruction_head_hidden_dim=cfg.model.reconstruction_head_hidden_dim,
@@ -158,6 +210,8 @@ def load_model_from_config_and_checkpoint(
         use_chord_score_head=bool(cfg.model.use_chord_score_head),
         use_onset_score_head=bool(cfg.model.use_onset_score_head),
         local_score_head_hidden_dim=cfg.model.local_score_head_hidden_dim,
+        local_context_mode=str(cfg.model.get("local_context_mode", "mean")),
+        local_context_num_heads=int(cfg.model.get("local_context_num_heads", 4)),
         use_hybrid_graph_scorer=bool(cfg.model.use_hybrid_graph_scorer),
         local_summary_use_mean=bool(cfg.model.local_summary_use_mean),
         local_summary_use_max=bool(cfg.model.local_summary_use_max),
@@ -300,7 +354,200 @@ def build_summary_dataframe(rows_df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def write_outputs(rows_df: pd.DataFrame, summary_df: pd.DataFrame, outdir: Path) -> None:
+def empty_rank_probe_dataframes() -> tuple[pd.DataFrame, pd.DataFrame]:
+    rank_rows_columns = [
+        "mode",
+        "rank_probe_size",
+        "rank",
+        "variant",
+        "song_id",
+        "score",
+        "paired_score",
+        "pair_gap",
+        "clean_above_own_corrupt",
+        "all_clean_above_all_corrupt",
+        "source_row_index",
+        "song_order",
+    ]
+    rank_summary_columns = [
+        "mode",
+        "requested_probe_size",
+        "n_applied",
+        "n_items",
+        "all_clean_above_all_corrupt",
+        "global_pair_success_count",
+        "global_pair_count",
+        "global_rank_acc",
+        "own_pair_success_count",
+        "own_pair_success_rate",
+        "min_clean_score",
+        "min_clean_song_id",
+        "max_corrupted_score",
+        "max_corrupted_song_id",
+        "minmax_gap",
+        "weakest_clean_rank",
+        "best_corrupted_rank",
+    ]
+    return pd.DataFrame(columns=rank_rows_columns), pd.DataFrame(columns=rank_summary_columns)
+
+
+def build_rank_probe_dataframes(rows_df: pd.DataFrame, probe_size: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if probe_size <= 0:
+        return empty_rank_probe_dataframes()
+    if rows_df.empty:
+        return empty_rank_probe_dataframes()
+
+    rank_rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
+
+    for mode, mode_df in rows_df.groupby("mode", sort=False):
+        applied_df = mode_df[
+            (mode_df["applied"] == True)  # noqa: E712
+            & mode_df["score_real"].notna()
+            & mode_df["score_corrupted"].notna()
+        ].head(probe_size)
+        n_applied = int(len(applied_df))
+
+        if n_applied == 0:
+            summary_rows.append(
+                {
+                    "mode": mode,
+                    "requested_probe_size": int(probe_size),
+                    "n_applied": 0,
+                    "n_items": 0,
+                    "all_clean_above_all_corrupt": False,
+                    "global_pair_success_count": 0,
+                    "global_pair_count": 0,
+                    "global_rank_acc": float("nan"),
+                    "own_pair_success_count": 0,
+                    "own_pair_success_rate": float("nan"),
+                    "min_clean_score": float("nan"),
+                    "min_clean_song_id": None,
+                    "max_corrupted_score": float("nan"),
+                    "max_corrupted_song_id": None,
+                    "minmax_gap": float("nan"),
+                    "weakest_clean_rank": None,
+                    "best_corrupted_rank": None,
+                }
+            )
+            continue
+
+        song_ids: list[str] = []
+        clean_scores: list[float] = []
+        corrupted_scores: list[float] = []
+        items: list[dict[str, Any]] = []
+
+        for song_order, (source_row_index, row) in enumerate(applied_df.iterrows()):
+            song_id = str(row["song_id"])
+            score_real = float(row["score_real"])
+            score_corrupted = float(row["score_corrupted"])
+            pair_gap = score_real - score_corrupted
+            own_pair_success = bool(score_real > score_corrupted)
+
+            song_ids.append(song_id)
+            clean_scores.append(score_real)
+            corrupted_scores.append(score_corrupted)
+
+            items.append(
+                {
+                    "mode": mode,
+                    "rank_probe_size": n_applied,
+                    "variant": "clean",
+                    "song_id": song_id,
+                    "score": score_real,
+                    "paired_score": score_corrupted,
+                    "pair_gap": pair_gap,
+                    "clean_above_own_corrupt": own_pair_success,
+                    "source_row_index": int(source_row_index),
+                    "song_order": song_order,
+                }
+            )
+            items.append(
+                {
+                    "mode": mode,
+                    "rank_probe_size": n_applied,
+                    "variant": "corrupted",
+                    "song_id": song_id,
+                    "score": score_corrupted,
+                    "paired_score": score_real,
+                    "pair_gap": pair_gap,
+                    "clean_above_own_corrupt": own_pair_success,
+                    "source_row_index": int(source_row_index),
+                    "song_order": song_order,
+                }
+            )
+
+        global_pair_success_count = sum(
+            1 for clean_score in clean_scores for corrupted_score in corrupted_scores if clean_score > corrupted_score
+        )
+        global_pair_count = len(clean_scores) * len(corrupted_scores)
+        all_clean_above_all_corrupt = bool(global_pair_count > 0 and global_pair_success_count == global_pair_count)
+        own_pair_success_count = sum(
+            1 for clean_score, corrupted_score in zip(clean_scores, corrupted_scores) if clean_score > corrupted_score
+        )
+
+        ranked_items = sorted(
+            items,
+            key=lambda item: (
+                -float(item["score"]),
+                0 if item["variant"] == "clean" else 1,
+                int(item["song_order"]),
+            ),
+        )
+        for rank, item in enumerate(ranked_items, start=1):
+            item["rank"] = rank
+            item["all_clean_above_all_corrupt"] = all_clean_above_all_corrupt
+            rank_rows.append(item)
+
+        clean_ranks = [int(item["rank"]) for item in ranked_items if item["variant"] == "clean"]
+        corrupted_ranks = [int(item["rank"]) for item in ranked_items if item["variant"] == "corrupted"]
+        min_clean_index = min(range(len(clean_scores)), key=lambda idx: clean_scores[idx])
+        max_corrupted_index = max(range(len(corrupted_scores)), key=lambda idx: corrupted_scores[idx])
+        min_clean_score = clean_scores[min_clean_index]
+        max_corrupted_score = corrupted_scores[max_corrupted_index]
+
+        summary_rows.append(
+            {
+                "mode": mode,
+                "requested_probe_size": int(probe_size),
+                "n_applied": n_applied,
+                "n_items": int(len(ranked_items)),
+                "all_clean_above_all_corrupt": all_clean_above_all_corrupt,
+                "global_pair_success_count": int(global_pair_success_count),
+                "global_pair_count": int(global_pair_count),
+                "global_rank_acc": (
+                    float(global_pair_success_count / global_pair_count) if global_pair_count else float("nan")
+                ),
+                "own_pair_success_count": int(own_pair_success_count),
+                "own_pair_success_rate": float(own_pair_success_count / n_applied) if n_applied else float("nan"),
+                "min_clean_score": min_clean_score,
+                "min_clean_song_id": song_ids[min_clean_index],
+                "max_corrupted_score": max_corrupted_score,
+                "max_corrupted_song_id": song_ids[max_corrupted_index],
+                "minmax_gap": float(min_clean_score - max_corrupted_score),
+                "weakest_clean_rank": max(clean_ranks) if clean_ranks else None,
+                "best_corrupted_rank": min(corrupted_ranks) if corrupted_ranks else None,
+            }
+        )
+
+    rank_rows_df = pd.DataFrame(rank_rows)
+    rank_summary_df = pd.DataFrame(summary_rows)
+    if rank_rows_df.empty or rank_summary_df.empty:
+        return empty_rank_probe_dataframes()
+    empty_rank_rows_df, empty_rank_summary_df = empty_rank_probe_dataframes()
+    return (
+        rank_rows_df.reindex(columns=empty_rank_rows_df.columns).reset_index(drop=True),
+        rank_summary_df.reindex(columns=empty_rank_summary_df.columns).reset_index(drop=True),
+    )
+
+
+def write_outputs(
+    rows_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    outdir: Path,
+    rank_probe_rows_df: pd.DataFrame | None = None,
+    rank_probe_summary_df: pd.DataFrame | None = None,
+) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     rows_path = outdir / "teacher_ood_eval_rows.csv"
     summary_path = outdir / "teacher_ood_eval_summary.csv"
@@ -311,13 +558,28 @@ def write_outputs(rows_df: pd.DataFrame, summary_df: pd.DataFrame, outdir: Path)
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
         summary_df.to_excel(writer, index=False, sheet_name="summary")
         rows_df.to_excel(writer, index=False, sheet_name="rows")
+        if rank_probe_summary_df is not None and rank_probe_rows_df is not None:
+            rank_probe_summary_df.to_excel(writer, index=False, sheet_name="rank_probe_summary")
+            rank_probe_rows_df.to_excel(writer, index=False, sheet_name="rank_probe_rows")
 
     print(f"Saved rows CSV: {rows_path}")
     print(f"Saved summary CSV: {summary_path}")
+    if rank_probe_summary_df is not None and rank_probe_rows_df is not None:
+        rank_probe_rows_path = outdir / "teacher_ood_rank_probe_rows.csv"
+        rank_probe_summary_path = outdir / "teacher_ood_rank_probe_summary.csv"
+        rank_probe_rows_df.to_csv(rank_probe_rows_path, index=False)
+        rank_probe_summary_df.to_csv(rank_probe_summary_path, index=False)
+        print(f"Saved rank probe rows CSV: {rank_probe_rows_path}")
+        print(f"Saved rank probe summary CSV: {rank_probe_summary_path}")
     print(f"Saved Excel workbook: {excel_path}")
 
 
 def run_eval(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if args.pair_corpus_root is not None:
+        return run_pair_corpus_eval(args)
+    if args.dataset_json is None:
+        raise ValueError("--dataset-json is required unless --pair-corpus-root is provided")
+
     device = torch.device(args.device)
     all_songs = load_dataset_json(args.dataset_json)
     split_songs = iter_split_songs(all_songs, split=args.split, limit=args.limit)
@@ -397,10 +659,107 @@ def run_eval(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     return rows_df, summary_df
 
 
+def run_pair_corpus_eval(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
+    device = torch.device(args.device)
+    corpus_root = args.pair_corpus_root
+    if corpus_root is None:
+        raise ValueError("--pair-corpus-root is required for fixed corpus eval")
+    if not corpus_root.is_absolute():
+        corpus_root = ROOT / corpus_root
+    split = str(args.pair_corpus_split or args.split)
+    manifest_path = corpus_root / "pairs" / "manifests" / f"{split}.jsonl"
+    pair_index_path = corpus_root / "pairs" / "index" / f"{split}_pairs.jsonl"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"PairCorpus manifest not found: {manifest_path}")
+    if not pair_index_path.exists():
+        raise FileNotFoundError(f"PairCorpus pair index not found: {pair_index_path}")
+
+    manifest_rows = load_jsonl(manifest_path)
+    manifest_by_sample_id = {str(row["sample_id"]): row for row in manifest_rows}
+    pair_rows = [
+        row
+        for row in load_jsonl(pair_index_path)
+        if bool(row.get("is_valid_pair_for_rank", True))
+        and str(row.get("clean_sample_id", "")) in manifest_by_sample_id
+        and str(row.get("corrupted_sample_id", "")) in manifest_by_sample_id
+    ]
+    if args.limit is not None:
+        pair_rows = pair_rows[: max(0, int(args.limit))]
+    if not pair_rows:
+        raise ValueError(f"No valid pairs found in {pair_index_path}")
+
+    first_clean = manifest_by_sample_id[str(pair_rows[0]["clean_sample_id"])]
+    sample_song_obj = load_encoded_song(resolve_manifest_path(first_clean["encoded_song_path"]))
+    model = load_model_from_config_and_checkpoint(
+        config_path=args.config,
+        checkpoint_path=args.checkpoint,
+        sample_song_obj=sample_song_obj,
+        device=device,
+    )
+    requested_modes = set(resolve_modes(args)) if args.modes else None
+
+    rows: list[dict[str, Any]] = []
+    for row_index, pair in enumerate(pair_rows):
+        clean_row = manifest_by_sample_id[str(pair["clean_sample_id"])]
+        corrupted_row = manifest_by_sample_id[str(pair["corrupted_sample_id"])]
+        mode = str(pair.get("corruption_name") or corrupted_row.get("corruption_name", "identity"))
+        if requested_modes is not None and mode not in requested_modes:
+            continue
+
+        clean_song_obj = load_encoded_song(resolve_manifest_path(clean_row["encoded_song_path"]))
+        corrupted_song_obj = load_encoded_song(resolve_manifest_path(corrupted_row["encoded_song_path"]))
+        score_real = score_song(model, clean_song_obj, device)
+        score_corrupted = score_song(model, corrupted_song_obj, device)
+        score_gap = score_real - score_corrupted
+
+        rows.append(
+            {
+                "song_id": pair.get("source_song_id") or clean_row.get("source_song_id") or pair.get("pair_group_id"),
+                "split": split,
+                "mode": mode,
+                "applied": True,
+                "topology_changed": bool(pair.get("topology_changed", corrupted_row.get("topology_changed", False))),
+                "note_corrupted_indices": corrupted_row.get("note_corrupted_indices", []),
+                "chord_corrupted_indices": corrupted_row.get("chord_corrupted_indices", []),
+                "onset_corrupted_indices": corrupted_row.get("onset_corrupted_indices", []),
+                "score_real": score_real,
+                "score_corrupted": score_corrupted,
+                "score_gap": score_gap,
+                "rank_success": int(score_real > score_corrupted),
+                "metadata_json": json.dumps(
+                    {
+                        "pair_group_id": pair.get("pair_group_id"),
+                        "clean_sample_id": pair.get("clean_sample_id"),
+                        "corrupted_sample_id": pair.get("corrupted_sample_id"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "mode_family": corrupted_row.get("corruption_group"),
+                "corruption_name": mode,
+                "corruption_params_json": json.dumps(corrupted_row.get("corruption_params", {}), ensure_ascii=False, sort_keys=True),
+                "reason_skipped": None,
+                "n_notes_modified": len(corrupted_row.get("note_corrupted_indices", []) or []),
+                "n_chords_modified": len(corrupted_row.get("chord_corrupted_indices", []) or []),
+                "mode_group": corrupted_row.get("corruption_group", "other"),
+                "pair_group_id": pair.get("pair_group_id"),
+                "source_row_index": row_index,
+            }
+        )
+
+    rows_df = build_rows_dataframe(rows)
+    summary_df = build_summary_dataframe(rows_df)
+    return rows_df, summary_df
+
+
 def main() -> None:
     args = parse_args()
     rows_df, summary_df = run_eval(args)
-    write_outputs(rows_df, summary_df, args.outdir)
+    rank_probe_rows_df = None
+    rank_probe_summary_df = None
+    if int(args.rank_probe_size) > 0:
+        rank_probe_rows_df, rank_probe_summary_df = build_rank_probe_dataframes(rows_df, int(args.rank_probe_size))
+    write_outputs(rows_df, summary_df, args.outdir, rank_probe_rows_df, rank_probe_summary_df)
 
 
 if __name__ == "__main__":

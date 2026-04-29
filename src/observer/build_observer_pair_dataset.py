@@ -192,10 +192,22 @@ def _cleanup_artifacts(encoded_path: Path, midi_path: Path) -> None:
     midi_path.unlink(missing_ok=True)
 
 
-def _stable_pair_group_id(song_id: str, pair_idx: int, corruption_modes: list[str], theory_cfg: dict[str, Any]) -> str:
-    cfg_key = json.dumps({"m": sorted(corruption_modes), "t": theory_cfg}, sort_keys=True, ensure_ascii=False)
+def _stable_pair_group_id(
+    song_id: str,
+    pair_idx: int,
+    corruption_modes: list[str],
+    theory_cfg: dict[str, Any],
+    *,
+    forced_mode: str | None = None,
+) -> str:
+    cfg_key = json.dumps(
+        {"m": sorted(corruption_modes), "t": theory_cfg, "forced_mode": forced_mode},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
     cfg_hash = hashlib.sha1(cfg_key.encode("utf-8")).hexdigest()[:10]
-    return f"{song_id}::pair-{pair_idx}::{cfg_hash}"
+    pair_label = f"{forced_mode}-pair-{pair_idx}" if forced_mode is not None else f"pair-{pair_idx}"
+    return f"{song_id}::{pair_label}::{cfg_hash}"
 
 
 def _pair_is_complete(pair_row: dict[str, Any], manifest_by_sample_id: dict[str, dict[str, Any]]) -> bool:
@@ -280,6 +292,14 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
     stats = BuildStats(total=len(dataset))
     pairs_per_song = max(1, int(cfg.dataloader.get("pairs_per_song", 1)))
     corruption_modes = list(cfg.dataloader.corruption_modes)
+    pair_mode_strategy = str(cfg.dataloader.get("pair_mode_strategy", "first_applicable"))
+    if pair_mode_strategy not in {"first_applicable", "all_modes"}:
+        raise PairBuildError("dataloader.pair_mode_strategy must be 'first_applicable' or 'all_modes'")
+    max_pairs_per_split_per_mode_raw = cfg.dataloader.get("max_pairs_per_split_per_mode")
+    max_pairs_per_split_per_mode = (
+        int(max_pairs_per_split_per_mode_raw) if max_pairs_per_split_per_mode_raw is not None else None
+    )
+    max_pairs_per_mode_by_split = dict(cfg.dataloader.get("max_pairs_per_mode_by_split", {}))
     balance_mode_usage = bool(theory_cfg.get("balance_mode_usage", False)) and not deterministic and len(corruption_modes) > 1
     mode_balancer = CorruptionModeBalancer(corruption_modes) if balance_mode_usage else None
 
@@ -301,13 +321,37 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
         split_skip_counter: Counter[str] = Counter()
         manifest_by_sample_id = manifest_by_split[split_key]
         pair_by_group_id = pair_by_split[split_key]
+        split_mode_counter: Counter[str] = Counter(str(row.get("corruption_name", "")) for row in pair_by_group_id.values())
+        split_max_pairs_per_mode = (
+            int(max_pairs_per_mode_by_split[split_key])
+            if split_key in max_pairs_per_mode_by_split and max_pairs_per_mode_by_split[split_key] is not None
+            else max_pairs_per_split_per_mode
+        )
 
         for song_obj, meta, idx in valid_rows:
             if split_lookup.get(meta["split"]) != split_key:
                 continue
 
-            for pair_idx in range(pairs_per_song):
-                pair_group_id = _stable_pair_group_id(meta["song_id"], pair_idx, corruption_modes, theory_cfg)
+            if pair_mode_strategy == "all_modes":
+                pair_tasks = [(mode, pair_idx) for mode in corruption_modes for pair_idx in range(pairs_per_song)]
+            else:
+                pair_tasks = [(None, pair_idx) for pair_idx in range(pairs_per_song)]
+
+            for forced_mode, pair_idx in pair_tasks:
+                if (
+                    forced_mode is not None
+                    and split_max_pairs_per_mode is not None
+                    and split_mode_counter[forced_mode] >= split_max_pairs_per_mode
+                ):
+                    continue
+
+                pair_group_id = _stable_pair_group_id(
+                    meta["song_id"],
+                    pair_idx,
+                    corruption_modes,
+                    theory_cfg,
+                    forced_mode=forced_mode,
+                )
                 existing_pair = pair_by_group_id.get(pair_group_id)
                 if existing_pair is not None and not overwrite:
                     if _pair_is_complete(existing_pair, manifest_by_sample_id):
@@ -327,8 +371,8 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
                     seed = int(theory_cfg.get("deterministic_seed", 0)) + stable_song_seed + pair_idx
                     rng = random.Random(seed)
 
-                requested_modes = corruption_modes
-                shuffle_modes = True
+                requested_modes = [forced_mode] if forced_mode is not None else corruption_modes
+                shuffle_modes = forced_mode is None
                 if mode_balancer is not None:
                     requested_modes = mode_balancer.ordered_modes(rng)
                     shuffle_modes = False
@@ -425,6 +469,8 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
                         "is_valid_pair_for_rank": True,
                     }
                     stats.built_pairs += 1
+                    if forced_mode is not None:
+                        split_mode_counter[forced_mode] += 1
                 else:
                     for row in candidate_rows:
                         _cleanup_artifacts(Path(row["encoded_song_path"]), Path(row["midi_path"]))

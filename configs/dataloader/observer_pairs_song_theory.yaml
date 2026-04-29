@@ -17,3 +17,6 @@ theory_aware:
   deterministic_per_sample: true
   deterministic_seed: 123
 pairs_per_song: 1
+pair_mode_strategy: first_applicable
+max_pairs_per_split_per_mode: null
+max_pairs_per_mode_by_split: {}

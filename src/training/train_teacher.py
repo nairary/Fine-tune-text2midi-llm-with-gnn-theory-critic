@@ -15,13 +15,14 @@ from hydra.utils import get_original_cwd
 from omegaconf import DictConfig, OmegaConf
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.dataloader.hooktheory_dataset import HookTheoryDataset, collate_fn
+from src.dataloader.precomputed_teacher_pairs import PrecomputedTeacherPairDataset
 from src.evaluation.teacher_local_metrics import (
     evaluate_teacher_local_corruption,
     save_local_diagnostic_reports,
@@ -172,6 +173,63 @@ def build_stage_scheduler(optimizer: AdamW, scheduler_cfg: DictConfig, stage_epo
 
 
 def build_loaders(cfg: DictConfig):
+    if str(cfg.dataloader.get("source", "")) == "precomputed_pairs" or str(
+        cfg.dataloader.get("corruption_backend", "")
+    ) == "precomputed_pairs":
+        pair_corpus_root = resolve_path(str(cfg.dataloader.pair_corpus_root))
+        manifest_dir = str(cfg.dataloader.get("manifest_output_dir", "pairs/manifests"))
+        pair_index_dir = str(cfg.dataloader.get("pair_index_output_dir", "pairs/index"))
+        train_split_name = str(cfg.dataloader.get("precomputed_train_split", "train"))
+        val_split_name = str(cfg.dataloader.get("precomputed_val_split", "val"))
+
+        train_dataset = PrecomputedTeacherPairDataset(
+            pair_index_jsonl=pair_corpus_root / pair_index_dir / f"{train_split_name}_pairs.jsonl",
+            manifest_jsonl=pair_corpus_root / manifest_dir / f"{train_split_name}.jsonl",
+            mask_prob=float(cfg.dataloader.mask_prob),
+            mask_min_nodes=int(cfg.dataloader.mask_min_nodes),
+            optional_mask_field_prob=float(cfg.dataloader.optional_mask_field_prob),
+            base_dir=resolve_path("."),
+        )
+        val_dataset = PrecomputedTeacherPairDataset(
+            pair_index_jsonl=pair_corpus_root / pair_index_dir / f"{val_split_name}_pairs.jsonl",
+            manifest_jsonl=pair_corpus_root / manifest_dir / f"{val_split_name}.jsonl",
+            mask_prob=float(cfg.dataloader.mask_prob),
+            mask_min_nodes=int(cfg.dataloader.mask_min_nodes),
+            optional_mask_field_prob=float(cfg.dataloader.optional_mask_field_prob),
+            base_dir=resolve_path("."),
+        )
+
+        if cfg.training.limit_train_samples is not None:
+            train_dataset = Subset(
+                train_dataset,
+                list(range(min(len(train_dataset), int(cfg.training.limit_train_samples)))),
+            )
+        if cfg.training.limit_val_samples is not None:
+            val_dataset = Subset(
+                val_dataset,
+                list(range(min(len(val_dataset), int(cfg.training.limit_val_samples)))),
+            )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(cfg.dataloader.batch_size),
+            shuffle=bool(cfg.dataloader.shuffle),
+            num_workers=int(cfg.dataloader.num_workers),
+            pin_memory=bool(cfg.dataloader.pin_memory),
+            drop_last=bool(cfg.dataloader.drop_last),
+            collate_fn=collate_fn,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=int(cfg.dataloader.batch_size),
+            shuffle=False,
+            num_workers=int(cfg.dataloader.num_workers),
+            pin_memory=bool(cfg.dataloader.pin_memory),
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+        return None, train_loader, val_loader
+
     json_path = resolve_path(cfg.data.json_path)
     if not json_path.exists():
         raise FileNotFoundError(f"Dataset JSON not found: {json_path}")
@@ -553,6 +611,13 @@ def main(cfg: DictConfig):
         "run_name": cfg.run_name,
         "device": str(device),
         "dataset_json": str(resolve_path(cfg.data.json_path)),
+        "dataloader_name": str(cfg.dataloader.get("name", "")),
+        "pair_corpus_root": (
+            str(resolve_path(str(cfg.dataloader.pair_corpus_root)))
+            if str(cfg.dataloader.get("source", "")) == "precomputed_pairs"
+            or str(cfg.dataloader.get("corruption_backend", "")) == "precomputed_pairs"
+            else None
+        ),
         "metadata_dir": str(resolve_path(cfg.data.metadata_dir)),
         "train_samples": len(train_loader.dataset),
         "val_samples": len(val_loader.dataset),

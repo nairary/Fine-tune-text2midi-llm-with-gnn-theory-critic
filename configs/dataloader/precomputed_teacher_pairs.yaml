@@ -1,0 +1,16 @@
+name: precomputed_teacher_pairs
+source: precomputed_pairs
+corruption_backend: precomputed_pairs
+pair_corpus_root: outputs/fixed_corruption_pairs_v1
+manifest_output_dir: pairs/manifests
+pair_index_output_dir: pairs/index
+precomputed_train_split: train
+precomputed_val_split: val
+batch_size: 128
+num_workers: 0
+shuffle: true
+pin_memory: false
+drop_last: false
+mask_prob: 0.15
+mask_min_nodes: 1
+optional_mask_field_prob: 0.5

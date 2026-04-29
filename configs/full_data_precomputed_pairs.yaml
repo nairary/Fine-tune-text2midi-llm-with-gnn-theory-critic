@@ -1,0 +1,43 @@
+defaults:
+  - model: teacher_gnn_base
+  - data: teacher_encoded_full
+  - dataloader: precomputed_teacher_pairs
+  - training: default
+  - optimizer: adamw
+  - scheduler: cosine
+  - losses: teacher_ssl
+  - experiment: full_data
+  - hydra: default
+  - _self_
+
+project:
+  name: Fine-tune-text2midi-llm-with-gnn-theory-critic
+  task: teacher_ssl_training
+
+run_name: ${experiment.name}_${model.name}_precomputed_pairs_pool-${model.pooling_mode}_hyb-${model.use_hybrid_graph_scorer}_bs-${dataloader.batch_size}
+seed: ${training.seed}
+device: ${training.device}
+
+data:
+  split:
+    train: train
+    val: val
+
+training:
+  epochs: ${experiment.epochs}
+  log_every: 20
+  limit_train_batches: null
+  limit_val_batches: null
+
+optimizer:
+  lr: 0.0003
+
+scheduler:
+  t_max: ${experiment.epochs}
+  eta_min: 1.0e-6
+
+model:
+  pooling_mode: mean_max
+  use_hybrid_graph_scorer: true
+  local_summary_use_topk_mean: true
+  local_summary_topk: 5

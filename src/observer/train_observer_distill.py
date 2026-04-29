@@ -48,14 +48,71 @@ def _collate_pairs(batch_items):
     }
 
 
-def _rank_loss(pred_clean, pred_corr, y_clean, y_corr, min_gap: float) -> tuple[torch.Tensor, torch.Tensor]:
-    gap = (y_clean - y_corr).abs()
-    mask = gap >= float(min_gap)
+def _rank_term(
+    pred_margin: torch.Tensor,
+    teacher_margin: torch.Tensor,
+    min_gap: float,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    gap = teacher_margin.abs()
+    sign = torch.sign(teacher_margin)
+    mask = (gap >= float(min_gap)) & (sign != 0)
     if not torch.any(mask):
-        return pred_clean.new_tensor(0.0), mask
-    sign = torch.sign(y_clean - y_corr)
-    logits = (pred_clean - pred_corr) * sign
-    return -F.logsigmoid(logits[mask]).mean(), mask
+        return pred_margin.new_tensor(0.0), mask, 0, 0
+    logits = pred_margin * sign
+    correct = int((logits[mask] > 0).sum().item())
+    valid = int(mask.sum().item())
+    return -F.logsigmoid(logits[mask]).mean(), mask, correct, valid
+
+
+def _rank_loss(pred_clean, pred_corr, y_clean, y_corr, min_gap: float) -> tuple[torch.Tensor, torch.Tensor]:
+    rank, mask, _, _ = _rank_term(pred_clean - pred_corr, y_clean - y_corr, min_gap)
+    return rank, mask
+
+
+def _batch_rank_loss(
+    pred_clean: torch.Tensor,
+    pred_corr: torch.Tensor,
+    y_clean: torch.Tensor,
+    y_corr: torch.Tensor,
+    min_gap: float,
+    intra_weight: float,
+    inter_weight: float,
+) -> tuple[torch.Tensor, dict[str, int]]:
+    intra_loss, _, intra_correct, intra_valid = _rank_term(pred_clean - pred_corr, y_clean - y_corr, min_gap)
+
+    global_pred_margin = pred_clean[:, None] - pred_corr[None, :]
+    global_teacher_margin = y_clean[:, None] - y_corr[None, :]
+    if pred_clean.numel() > 1:
+        off_diagonal = ~torch.eye(pred_clean.numel(), dtype=torch.bool, device=pred_clean.device)
+        inter_pred_margin = global_pred_margin[off_diagonal]
+        inter_teacher_margin = global_teacher_margin[off_diagonal]
+    else:
+        inter_pred_margin = global_pred_margin.new_empty((0,))
+        inter_teacher_margin = global_teacher_margin.new_empty((0,))
+    inter_loss, _, inter_correct, inter_valid = _rank_term(inter_pred_margin, inter_teacher_margin, min_gap)
+
+    weighted_terms = []
+    active_weights = []
+    if float(intra_weight) > 0.0 and intra_valid > 0:
+        weighted_terms.append(float(intra_weight) * intra_loss)
+        active_weights.append(float(intra_weight))
+    if float(inter_weight) > 0.0 and inter_valid > 0:
+        weighted_terms.append(float(inter_weight) * inter_loss)
+        active_weights.append(float(inter_weight))
+    if weighted_terms:
+        rank_loss = torch.stack(weighted_terms).sum() / float(sum(active_weights))
+    else:
+        rank_loss = pred_clean.new_tensor(0.0)
+
+    stats = {
+        "intra_correct": intra_correct,
+        "intra_valid": intra_valid,
+        "inter_correct": inter_correct,
+        "inter_valid": inter_valid,
+        "total_correct": intra_correct + inter_correct,
+        "total_valid": intra_valid + inter_valid,
+    }
+    return rank_loss, stats
 
 
 def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
@@ -88,11 +145,16 @@ def _run_epoch(model, loader, optimizer, device, cfg_losses):
     total_rank_loss = 0.0
     total_valid_rank = 0
     total_rank_correct = 0
+    total_intra_valid = 0
+    total_intra_correct = 0
+    total_inter_valid = 0
+    total_inter_correct = 0
     preds_all: list[float] = []
     targets_all: list[float] = []
     pred_margins: list[float] = []
     teacher_margins: list[float] = []
 
+    use_batch_rank = bool(cfg_losses.get("use_batch_rank", False)) and float(cfg_losses.lambda_rank) > 0.0
     use_pair_rank = bool(cfg_losses.get("use_pair_rank", True)) and float(cfg_losses.lambda_rank) > 0.0
 
     for batch in loader:
@@ -109,11 +171,24 @@ def _run_epoch(model, loader, optimizer, device, cfg_losses):
             s_corr = model(g_corr).view(-1)
             reg = F.smooth_l1_loss(s_clean, y_clean) + F.smooth_l1_loss(s_corr, y_corr)
 
-            if use_pair_rank:
+            if use_batch_rank:
+                rank, rank_stats = _batch_rank_loss(
+                    s_clean,
+                    s_corr,
+                    y_clean,
+                    y_corr,
+                    min_gap=float(cfg_losses.min_teacher_gap_for_rank),
+                    intra_weight=float(cfg_losses.get("rank_intra_weight", 1.0)),
+                    inter_weight=float(cfg_losses.get("rank_inter_weight", 1.0)),
+                )
+                rank_mask = torch.ones_like(y_clean, dtype=torch.bool) if rank_stats["total_valid"] > 0 else torch.zeros_like(y_clean, dtype=torch.bool)
+            elif use_pair_rank:
                 rank, rank_mask = _rank_loss(s_clean, s_corr, y_clean, y_corr, float(cfg_losses.min_teacher_gap_for_rank))
+                rank_stats = {}
             else:
                 rank = reg.new_tensor(0.0)
                 rank_mask = torch.zeros_like(y_clean, dtype=torch.bool)
+                rank_stats = {}
 
             loss = float(cfg_losses.lambda_reg) * reg + float(cfg_losses.lambda_rank) * rank
             if is_train:
@@ -129,13 +204,25 @@ def _run_epoch(model, loader, optimizer, device, cfg_losses):
         preds_all.extend(pred.tolist())
         targets_all.extend(tgt.tolist())
 
-        if torch.any(rank_mask):
+        if use_batch_rank:
+            valid = int(rank_stats.get("total_valid", 0))
+            if valid > 0:
+                total_rank_correct += int(rank_stats["total_correct"])
+                total_valid_rank += valid
+                total_rank_loss += float(rank.detach().cpu()) * valid
+                total_intra_correct += int(rank_stats["intra_correct"])
+                total_intra_valid += int(rank_stats["intra_valid"])
+                total_inter_correct += int(rank_stats["inter_correct"])
+                total_inter_valid += int(rank_stats["inter_valid"])
+        elif torch.any(rank_mask):
             sign = torch.sign((y_clean - y_corr)[rank_mask])
             correct = int((((s_clean - s_corr)[rank_mask] * sign) > 0).sum().item())
             valid = int(rank_mask.sum().item())
             total_rank_correct += correct
             total_valid_rank += valid
             total_rank_loss += float(rank.detach().cpu()) * valid
+            total_intra_correct += correct
+            total_intra_valid += valid
         pred_margins.extend((s_clean - s_corr).detach().cpu().tolist())
         teacher_margins.extend((y_clean - y_corr).detach().cpu().tolist())
 
@@ -153,7 +240,10 @@ def _run_epoch(model, loader, optimizer, device, cfg_losses):
         "rmse": float(np.sqrt(np.mean(err**2))) if err.size else float("nan"),
         "pearson": _safe_corr(p, t),
         "spearman": _safe_corr(_rankdata(p), _rankdata(t)) if p.size else float("nan"),
-        "pair_rank_acc": (float(total_rank_correct) / float(total_valid_rank)) if total_valid_rank > 0 else float("nan"),
+        "pair_rank_acc": (float(total_intra_correct) / float(total_intra_valid)) if total_intra_valid > 0 else float("nan"),
+        "intra_rank_acc": (float(total_intra_correct) / float(total_intra_valid)) if total_intra_valid > 0 else float("nan"),
+        "inter_rank_acc": (float(total_inter_correct) / float(total_inter_valid)) if total_inter_valid > 0 else float("nan"),
+        "batch_rank_acc": (float(total_rank_correct) / float(total_valid_rank)) if total_valid_rank > 0 else float("nan"),
         "mean_pred_margin": float(np.mean(pred_margins)) if pred_margins else float("nan"),
         "mean_teacher_margin": float(np.mean(teacher_margins)) if teacher_margins else float("nan"),
     }
