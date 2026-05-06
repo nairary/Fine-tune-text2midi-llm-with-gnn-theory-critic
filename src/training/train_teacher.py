@@ -243,6 +243,8 @@ def build_model(sample_graph, model_cfg: DictConfig, losses_cfg: DictConfig) -> 
         num_layers=model_cfg.num_layers,
         dropout=model_cfg.dropout,
         residual=model_cfg.use_residual,
+        backbone=str(model_cfg.get("backbone", "sage")),
+        hgt_num_heads=int(model_cfg.get("hgt_num_heads", 4)),
         encoder_hidden_dims=list(model_cfg.encoder_hidden_dims),
         pooling_mode=model_cfg.pooling_mode,
         pooling_attention_hidden_dim=model_cfg.get("pooling_attention_hidden_dim"),

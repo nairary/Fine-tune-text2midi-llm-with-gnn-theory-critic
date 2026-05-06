@@ -188,23 +188,23 @@
   - dynamic weights with and without reconstruction stage
 
 ## 10. HGT Backend
-- [ ] Add an optional HGT backbone alongside the current TeacherGNN baseline.
-- [ ] Keep current backbone as the default, for example:
+- [x] Add an optional HGT backbone alongside the current TeacherGNN baseline.
+- [x] Keep current backbone as the default, for example:
   - `model.backbone: sage`
   - `model.backbone: hgt`
-- [ ] Reuse existing per-node-type encoders and graph outputs:
+- [x] Reuse existing per-node-type encoders and graph outputs:
   - graph score head
   - reconstruction heads
   - local note/chord/onset heads
-- [ ] Implement HGT message passing over current heterogeneous metadata:
+- [x] Implement HGT message passing over current heterogeneous metadata:
   - node types from `HeteroData`
   - edge types including section hierarchy edges
   - configurable `hidden_dim`, `num_layers`, `num_heads`, dropout
-- [ ] Verify HGT works for both graph cases:
+- [x] Verify HGT works for both graph cases:
   - old short clips with one dummy section
   - assembled multi-section songs with real section spans
-- [ ] Keep SAGE and HGT output contracts identical so all existing losses and cached datasets still work.
-- [ ] Add tests:
+- [x] Keep SAGE and HGT output contracts identical so all existing losses and cached datasets still work.
+- [x] Add tests:
   - forward pass on dummy-section graph
   - forward pass on real-section graph
   - output keys/shapes match the current TeacherGNN contract
@@ -246,6 +246,6 @@
 ## 12. Updated Practical Order
 - [ ] Step 7: finish fixed section pair cache and smoke-train teacher from cached graphs.
 - [x] Step 8: implement dynamic loss weights first because it does not require cache rebuild.
-- [ ] Step 9: implement HGT backend with the same output contract.
+- [x] Step 9: implement HGT backend with the same output contract.
 - [ ] Step 10: implement logit fusion after HGT/SAGE baselines are comparable.
 - [ ] Step 11: run ablations from one fixed cache and compare metrics.

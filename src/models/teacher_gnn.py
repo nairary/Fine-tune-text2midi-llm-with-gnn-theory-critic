@@ -5,7 +5,7 @@ from typing import Dict, Iterable, Mapping, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch_geometric.nn import HeteroConv, SAGEConv
+from torch_geometric.nn import HGTConv, HeteroConv, SAGEConv
 
 from src.models.teacher_heads import GraphScoreHead, LocalScoreHead, ReconstructionHeads, SlotContextAttention
 from src.utils.teacher_pooling import MultiTypeMeanPooling
@@ -39,6 +39,8 @@ class TeacherGNN(nn.Module):
         num_layers: int = 3,
         dropout: float = 0.1,
         residual: bool = True,
+        backbone: str = "sage",
+        hgt_num_heads: int = 4,
         node_types: Iterable[str] | None = None,
         encoder_hidden_dims: Sequence[int] | None = None,
         pooling_mode: str = "mean",
@@ -65,6 +67,8 @@ class TeacherGNN(nn.Module):
         self.num_layers = num_layers
         self.dropout = dropout
         self.residual = residual
+        self.backbone_type = str(backbone).lower()
+        self.hgt_num_heads = int(hgt_num_heads)
         self.node_types = tuple(node_types or input_dims.keys())
         self.edge_types = list(edge_types)
         self.pooling_output_dim = pooling_output_dim or hidden_dim
@@ -83,6 +87,13 @@ class TeacherGNN(nn.Module):
         self.local_summary_topk = int(local_summary_topk)
         if self.local_summary_topk < 1:
             raise ValueError("local_summary_topk must be >= 1.")
+        if self.backbone_type not in {"sage", "hgt"}:
+            raise ValueError(f"Unsupported teacher backbone '{backbone}'. Supported values are 'sage' and 'hgt'.")
+        if self.backbone_type == "hgt":
+            if self.hgt_num_heads < 1:
+                raise ValueError("hgt_num_heads must be >= 1.")
+            if hidden_dim % self.hgt_num_heads != 0:
+                raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by hgt_num_heads ({self.hgt_num_heads}).")
         if not any([self.local_summary_use_mean, self.local_summary_use_max, self.local_summary_use_topk_mean]):
             raise ValueError("At least one local score summary statistic must be enabled.")
         if self.local_context_mode not in {"mean", "attention"}:
@@ -105,12 +116,22 @@ class TeacherGNN(nn.Module):
         self.convs = nn.ModuleList()
         self.conv_norms = nn.ModuleList()
         for _ in range(num_layers):
-            self.convs.append(
-                HeteroConv(
-                    {edge_type: SAGEConv((-1, -1), hidden_dim) for edge_type in self.edge_types},
-                    aggr="sum",
+            if self.backbone_type == "sage":
+                self.convs.append(
+                    HeteroConv(
+                        {edge_type: SAGEConv((-1, -1), hidden_dim) for edge_type in self.edge_types},
+                        aggr="sum",
+                    )
                 )
-            )
+            else:
+                self.convs.append(
+                    HGTConv(
+                        in_channels=hidden_dim,
+                        out_channels=hidden_dim,
+                        metadata=(list(self.node_types), list(self.edge_types)),
+                        heads=self.hgt_num_heads,
+                    )
+                )
             self.conv_norms.append(nn.ModuleDict({node_type: nn.LayerNorm(hidden_dim) for node_type in self.node_types}))
 
         self.pool = MultiTypeMeanPooling(
@@ -168,7 +189,9 @@ class TeacherGNN(nn.Module):
             updated = conv(x_dict, edge_index_dict)
             next_x_dict = {}
             for node_type in self.node_types:
-                node_embeddings = updated.get(node_type, x_dict[node_type])
+                node_embeddings = updated.get(node_type)
+                if node_embeddings is None:
+                    node_embeddings = x_dict[node_type]
                 if self.residual and node_embeddings.shape == x_dict[node_type].shape:
                     node_embeddings = node_embeddings + x_dict[node_type]
                 node_embeddings = norms[node_type](node_embeddings)
@@ -389,6 +412,8 @@ class TeacherGNN(nn.Module):
         num_layers: int = 3,
         dropout: float = 0.1,
         residual: bool = True,
+        backbone: str = "sage",
+        hgt_num_heads: int = 4,
         encoder_hidden_dims: Sequence[int] | None = None,
         pooling_mode: str = "mean",
         pooling_attention_hidden_dim: int | None = None,
@@ -417,6 +442,8 @@ class TeacherGNN(nn.Module):
             num_layers=num_layers,
             dropout=dropout,
             residual=residual,
+            backbone=backbone,
+            hgt_num_heads=hgt_num_heads,
             node_types=hetero_data.node_types,
             encoder_hidden_dims=encoder_hidden_dims,
             pooling_mode=pooling_mode,

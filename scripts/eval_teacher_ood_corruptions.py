@@ -198,6 +198,8 @@ def load_model_from_config_and_checkpoint(
         num_layers=cfg.model.num_layers,
         dropout=cfg.model.dropout,
         residual=cfg.model.use_residual,
+        backbone=str(cfg.model.get("backbone", "sage")),
+        hgt_num_heads=int(cfg.model.get("hgt_num_heads", 4)),
         encoder_hidden_dims=list(cfg.model.encoder_hidden_dims),
         pooling_mode=cfg.model.pooling_mode,
         pooling_attention_hidden_dim=cfg.model.get("pooling_attention_hidden_dim"),
@@ -219,7 +221,7 @@ def load_model_from_config_and_checkpoint(
         local_summary_topk=int(cfg.model.local_summary_topk),
     ).to(device)
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model

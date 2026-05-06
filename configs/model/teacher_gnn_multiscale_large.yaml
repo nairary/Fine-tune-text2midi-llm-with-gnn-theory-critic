@@ -3,6 +3,8 @@ hidden_dim: 192
 num_layers: 4
 dropout: 0.1
 use_residual: true
+backbone: sage
+hgt_num_heads: 4
 encoder_hidden_dims: [192, 192]
 pooling_mode: mean
 pooling_attention_hidden_dim: null

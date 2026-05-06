@@ -996,11 +996,25 @@ python scripts/run_section_pair_cache_teacher.py \
 
 Это подходит для повторных запусков:
 
-- current SAGE backbone;
-- будущий HGT backend;
+- current SAGE/HGT backbone;
 - future logit-fusion ablation;
 - разные loss weights / learning rates / batch sizes;
 - сравнение stage-2/3 checkpoints на одном и том же fixed corruption corpus.
+
+HGT включается без пересборки graph cache, если схема графа не менялась:
+
+```bash
+python -m src.training.train_teacher \
+  --config-name full_data_precomputed_pairs \
+  dataloader=section_cache_balanced \
+  dataloader.pair_corpus_root=outputs/section_pair_cache_v1 \
+  model.backbone=hgt \
+  model.hgt_num_heads=4 \
+  device=cuda \
+  training.device=cuda
+```
+
+По умолчанию остается `model.backbone=sage`. Для HGT `model.hidden_dim` должен делиться на `model.hgt_num_heads`.
 
 Кэш нужно пересобирать, если изменилось что-то из этого:
 

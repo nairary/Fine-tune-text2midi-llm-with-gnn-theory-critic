@@ -76,6 +76,7 @@ def _build_model(
     use_hybrid_graph_scorer: bool = True,
     local_context_mode: str = "mean",
     local_summary_use_topk_mean: bool = False,
+    backbone: str = "sage",
 ) -> TeacherGNN:
     return TeacherGNN.from_hetero_data(
         sample_graph,
@@ -83,6 +84,8 @@ def _build_model(
         num_layers=2,
         dropout=0.0,
         residual=True,
+        backbone=backbone,
+        hgt_num_heads=4,
         pooling_mode=pooling_mode,
         pooling_type_attention=pooling_type_attention,
         pooling_output_dim=20,
@@ -107,6 +110,33 @@ def test_forward_shapes_mean_pooling():
     assert outputs["graph_score"].shape == (2,)
     assert outputs["local_score_summaries"].shape == (2, model.local_summary_dim)
     assert outputs["graph_score_features"].shape == (2, model.pooling_output_dim + model.local_summary_dim)
+
+
+def test_hgt_forward_shapes_match_teacher_output_contract():
+    batch = Batch.from_data_list([_build_graph(), _build_graph()])
+    model = _build_model(batch, pooling_mode="mean_max", use_hybrid_graph_scorer=True, backbone="hgt")
+
+    outputs = model(batch)
+
+    assert model.backbone_type == "hgt"
+    assert outputs["graph_embedding"].shape == (2, model.pooling_output_dim)
+    assert outputs["graph_score"].shape == (2,)
+    assert set(outputs["local_scores"]) == {"note", "chord", "onset"}
+    assert outputs["recon_logits"]["note_sd"].shape[0] == batch["note"].x.size(0)
+    assert outputs["recon_logits"]["chord_root"].shape[0] == batch["chord"].x.size(0)
+    assert outputs["local_score_summaries"].shape == (2, model.local_summary_dim)
+    assert outputs["graph_score_features"].shape == (2, model.pooling_output_dim + model.local_summary_dim)
+
+
+def test_hgt_rejects_hidden_dim_not_divisible_by_heads():
+    batch = Batch.from_data_list([_build_graph()])
+
+    try:
+        TeacherGNN.from_hetero_data(batch, hidden_dim=10, backbone="hgt", hgt_num_heads=4)
+    except ValueError as exc:
+        assert "must be divisible by hgt_num_heads" in str(exc)
+    else:
+        raise AssertionError("Expected HGT hidden-dim validation to fail.")
 
 
 def test_forward_shapes_mean_max_pooling():

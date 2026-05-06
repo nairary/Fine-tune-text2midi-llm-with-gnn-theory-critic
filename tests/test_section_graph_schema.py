@@ -11,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.dataloader.graph_layouts import NODE_DIMS, SECTION_LABEL_IDS, SECTION_LAYOUT
 from src.dataloader.utils_graph import MANDATORY_EDGE_TYPES, MANDATORY_NODE_TYPES, build_graph_from_encoded
+from src.models.teacher_gnn import TeacherGNN
 
 
 def _chord(beat: float, duration: float = 4.0) -> dict:
@@ -141,3 +142,27 @@ def test_legacy_clip_gets_one_dummy_section_with_existing_label():
 
     batch = Batch.from_data_list([graph, build_graph_from_encoded(_song_with_section_spans())])
     assert batch["section"].x.size(0) == 3
+
+
+def test_hgt_teacher_forward_supports_dummy_and_real_section_graphs():
+    batch = Batch.from_data_list([build_graph_from_encoded(_legacy_clip_song()), build_graph_from_encoded(_song_with_section_spans())])
+    model = TeacherGNN.from_hetero_data(
+        batch,
+        hidden_dim=16,
+        num_layers=1,
+        dropout=0.0,
+        residual=True,
+        backbone="hgt",
+        hgt_num_heads=4,
+        pooling_output_dim=16,
+        score_head_hidden_dim=8,
+        reconstruction_head_hidden_dim=16,
+        local_score_head_hidden_dim=8,
+    )
+
+    outputs = model(batch)
+
+    assert outputs["graph_score"].shape == (2,)
+    assert outputs["node_embeddings"]["section"].shape[0] == batch["section"].x.size(0)
+    assert outputs["local_scores"]["note"].shape[0] == batch["note"].x.size(0)
+    assert outputs["recon_logits"]["note_sd"].shape[0] == batch["note"].x.size(0)
