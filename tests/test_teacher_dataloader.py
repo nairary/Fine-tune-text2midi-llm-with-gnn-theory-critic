@@ -22,7 +22,7 @@ def main():
     print("node types:", graph.node_types)
     print("edge types:", graph.edge_types)
 
-    for node_type in ["song", "bar", "onset", "note", "chord"]:
+    for node_type in ["song", "section", "bar", "onset", "note", "chord"]:
         print(f"{node_type}.x shape = {tuple(graph[node_type].x.shape)} | expected dim={NODE_DIMS[node_type]}")
 
     for edge_type in graph.edge_types:

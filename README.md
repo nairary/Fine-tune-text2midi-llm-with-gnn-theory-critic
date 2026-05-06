@@ -65,6 +65,10 @@ python -m src.observer.run_observer_pipeline
 
 ```bash
 python -m pytest -q \
+  tests/test_section_graph_schema.py \
+  tests/test_section_song_corruptions.py \
+  tests/test_assemble_timeline_songs.py \
+  tests/test_audit_original_song_timeline.py \
   tests/test_song_corruptions_benign.py \
   tests/test_corruption_mode_balancer.py \
   tests/test_train_teacher_stages.py \
@@ -75,6 +79,9 @@ python -m pytest -q \
 
 Что покрывает этот набор:
 
+- `section`-узлы в teacher-графе, dummy-секции для старых клипов и реальные `meta.section_spans` для assembled songs;
+- section-level corruptions: swap, duplicate, drop, entry/exit chord substitution;
+- audit/assembly пайплайн для `original_songs_timeline.json`;
 - новые benign / near-benign corruptions и их metadata contract;
 - балансировку corruption modes, чтобы редкие режимы реально доходили до датасета;
 - двухстадийное обучение teacher-а: `mlm_ssl` -> `corruption`;
@@ -230,6 +237,66 @@ python -m src.data.encode_teacher_features \
 data/HTCanon/encoded_full/teacher_encoded.json
 ```
 
+### 3.5 Section-aware assembled JSON для структурного fine-tune
+
+Teacher-граф теперь всегда строится с уровнем `section`. Для старого `teacher_encoded.json` это одна dummy-секция на весь клип, поэтому сам файл можно не перегенерировать только из-за изменения graph schema: граф строится на лету. Но для реальных section-level corruptions нужен отдельный assembled dataset, собранный из `original_songs_timeline.json`.
+
+Сначала проверь таймлайны исходных песен:
+
+```bash
+python scripts/audit_original_song_timeline.py \
+  --timeline-json data/HTCanon/HK_processed/original_songs_timeline.json \
+  --encoded-json data/HTCanon/encoded_full/teacher_encoded.json \
+  --outdir outputs/timeline_audit
+```
+
+Важные выходы:
+
+- `outputs/timeline_audit/original_song_audit.jsonl` - подробный audit по `ori_uid`;
+- `outputs/timeline_audit/summary.json` - сколько песен можно собрать;
+- `usable_multisection_compact_gap_ori_uids.txt` - список пригодных original songs для режима с bar-aligned gaps.
+
+Затем собери multi-section encoded songs:
+
+```bash
+python scripts/assemble_timeline_songs.py \
+  --audit-jsonl outputs/timeline_audit/original_song_audit.jsonl \
+  --encoded-json data/HTCanon/encoded_full/teacher_encoded.json \
+  --outdir outputs/assembled_sections \
+  --usable-mode compact_gap \
+  --section-start-policy next_bar_gap \
+  --max-gap-sec 10.0 \
+  --multi-clip-segment-policy skip
+```
+
+Главный файл для section fine-tune:
+
+```text
+outputs/assembled_sections/teacher_encoded_assembled_compact_gap.json
+```
+
+В нем каждая песня имеет `meta.section_spans`; именно эти spans используются графом и section-level corruptions.
+
+MIDI для teacher training не нужен: teacher обучается прямо по encoded JSON. MIDI имеет смысл перегенерировать только для проверки сборки, chord scorer-а или observer pipeline. Быстрый MIDI smoke для assembled songs:
+
+```bash
+python -m src.data.render_encoded_song_to_midi \
+  --encoded-json outputs/assembled_sections/teacher_encoded_assembled_compact_gap.json \
+  --output-root outputs/assembled_sections_midi_smoke \
+  --limit 32 \
+  --overwrite \
+  --verbose
+```
+
+Если хочешь слушать/проверять все assembled MIDI:
+
+```bash
+python -m src.data.render_encoded_song_to_midi \
+  --encoded-json outputs/assembled_sections/teacher_encoded_assembled_compact_gap.json \
+  --output-root outputs/assembled_sections_midi \
+  --overwrite
+```
+
 ## 4. Обучение весов аккордового скорера
 
 Chord scorer используется, когда observer строит аккордовые события из MIDI. Он берет MIDI-инструмент с именем `chords`, строит кандидаты аккордов по сонорностям и ранжирует их. Веса сохраняются в `learned_weights.yaml`.
@@ -307,7 +374,11 @@ python scripts/fit_chord_score_weights.py \
 
 ## 5. Обучение GNN Teacher
 
-Teacher обучается на `teacher_encoded.json`. Он сам строит real/masked/corrupted графы, поэтому отдельные labels не нужны.
+Teacher обучается на encoded JSON. Он сам строит real/masked/corrupted графы, поэтому отдельные labels не нужны. После добавления section-уровня есть два основных источника данных:
+
+- `data/HTCanon/encoded_full/teacher_encoded.json` - старые short clips; граф получает одну dummy-секцию на весь клип;
+- `outputs/assembled_sections/teacher_encoded_assembled_compact_gap.json` - multi-section songs с реальными `meta.section_spans`.
+
 По умолчанию обучение теперь идет в 2 последовательных stage:
 
 - `mlm_ssl`: только masked-reconstruction objective;
@@ -347,7 +418,31 @@ functional_progression_violation_strict
 
 Benign / near-benign corruptions (`transpose_with_tonic_shift`, `merge_repeated_melody_notes`, `split_long_melody_note`, `melody_octave_shift`, `drop_tonic_seventh_on_strong_beat`) проверяются тестами из раздела 1 и могут запускаться явно через `dataloader.corruption_modes=[...]` или через `infer_teacher_score --modes ...`.
 
-### 5.1 Smoke test
+Section-level corruption modes:
+
+```text
+adjacent_section_swap
+non_adjacent_section_swap
+section_duplicate
+section_drop_keep_silence
+section_drop_and_close_gap
+section_entry_non_tonic_substitution
+section_exit_non_dominant_substitution
+```
+
+Они требуют реальных `meta.section_spans`, поэтому на старом short-clip JSON с одной dummy-секцией structural modes в основном будут пропускаться. Для mixed fine-tune это нормально: `corrupt_song_obj` перебирает режимы и, если section-mode неприменим, доходит до local/theory corruption.
+
+### 5.1 Рекомендуемый план с нуля
+
+Практический план:
+
+1. Stage 1: pretrain/base train на `teacher_encoded.json`, только local/theory corruptions.
+2. Stage 2: fine-tune на assembled section dataset, смесь section-level и local/theory corruptions.
+3. Stage 3: optional mixed fine-tune на объединенном JSON, где assembled songs можно oversample-ить.
+
+Не надо перегенерировать старый `teacher_encoded.json` только из-за dummy sections: новая graph schema применяется при загрузке. Нужно заново собрать `outputs/assembled_sections/teacher_encoded_assembled_compact_gap.json`, если изменились `original_songs_timeline.json`, assembly-policy или код assembly.
+
+### 5.2 Smoke test
 
 ```bash
 python -m src.training.train_teacher \
@@ -367,7 +462,7 @@ python -m src.training.train_teacher \
 
 В текущей структуре `configs/config.yaml` уже развернут целиком, поэтому Hydra-группы подключаются через `+group=name`, например `+model=teacher_gnn_small`. Простые поля переопределяются обычным `a.b=value`.
 
-### 5.2 Полное обучение
+### 5.3 Stage 1: short-clip baseline
 
 ```bash
 python -m src.training.train_teacher \
@@ -379,7 +474,7 @@ python -m src.training.train_teacher \
   scheduler.t_max=500 \
   device=cuda \
   training.device=cuda \
-  run_name=teacher_full_v1
+  run_name=teacher_stage1_short_local
 ```
 
 Пример явного разбиения stage:
@@ -391,6 +486,111 @@ python -m src.training.train_teacher \
   training.corruption_epochs=200 \
   run_name=teacher_two_stage
 ```
+
+После запуска сохрани путь к лучшему checkpoint-у:
+
+```bash
+STAGE1_CKPT=outputs/<date>/<time>_teacher_stage1_short_local/checkpoints/best_rank_acc.pt
+```
+
+Если лучший corruption checkpoint не появился из-за слишком короткого smoke-run, используй:
+
+```bash
+STAGE1_CKPT=outputs/<date>/<time>_teacher_stage1_short_local/checkpoints/last.pt
+```
+
+### 5.4 Stage 2: section fine-tune на assembled songs
+
+Этот этап стартует из Stage 1 checkpoint-а и обучает модель видеть реальные переходы секций. Реконструкцию можно выключить и оставить только corruption-stage.
+
+```bash
+python -m src.training.train_teacher \
+  data.json_path=outputs/assembled_sections/teacher_encoded_assembled_compact_gap.json \
+  training.init_checkpoint=$STAGE1_CKPT \
+  training.init_checkpoint_strict=true \
+  dataloader.batch_size=16 \
+  dataloader.corruption_modes='[adjacent_section_swap,non_adjacent_section_swap,section_duplicate,section_drop_keep_silence,section_drop_and_close_gap,section_entry_non_tonic_substitution,section_exit_non_dominant_substitution,strongbeat_nonchord_note,borrowed_melody_conflict,melody_semitone_add_clash,melody_suspension_clash,melody_alteration_clash,melody_omit_core_tone_conflict,inversion_bass_continuity_conflict,note_onset_shift,chord_onset_shift,strong_weak_beat_flip,duration_stretch_shrink_note,duration_stretch_shrink_chord,functional_progression_violation_strict]' \
+  optimizer.lr=1e-4 \
+  training.epochs=120 \
+  experiment.epochs=120 \
+  training.mlm_ssl_epochs=0 \
+  training.corruption_epochs=120 \
+  scheduler.t_max=120 \
+  device=cuda \
+  training.device=cuda \
+  run_name=teacher_stage2_assembled_sections
+```
+
+После запуска:
+
+```bash
+STAGE2_CKPT=outputs/<date>/<time>_teacher_stage2_assembled_sections/checkpoints/best_rank_acc.pt
+```
+
+### 5.5 Stage 3: optional mixed fine-tune
+
+Текущий trainer читает один JSON за запуск. Для mixed fine-tune проще собрать временный JSON, где старые clips и assembled songs лежат вместе. Если хочешь, чтобы assembled songs встречались чаще, увеличь `ASSEMBLED_REPEATS`.
+
+```bash
+python - <<'PY'
+import copy
+import json
+from pathlib import Path
+
+original_path = Path("data/HTCanon/encoded_full/teacher_encoded.json")
+assembled_path = Path("outputs/assembled_sections/teacher_encoded_assembled_compact_gap.json")
+out_path = Path("outputs/section_training/teacher_encoded_mixed_short_assembled.json")
+assembled_repeats = 12
+
+with original_path.open("r", encoding="utf-8") as f:
+    original = json.load(f)
+with assembled_path.open("r", encoding="utf-8") as f:
+    assembled = json.load(f)
+
+mixed = {}
+for song_id, song in original.items():
+    item = copy.deepcopy(song)
+    item["song_id"] = song_id
+    mixed[f"orig_{song_id}"] = item
+
+for repeat_idx in range(assembled_repeats):
+    for song_id, song in assembled.items():
+        new_id = f"assembled_r{repeat_idx}_{song_id}"
+        item = copy.deepcopy(song)
+        item["song_id"] = new_id
+        if isinstance(item.get("meta"), dict):
+            item["meta"]["song_id"] = new_id
+            item["meta"]["mixed_dataset_source"] = "assembled"
+            item["meta"]["mixed_dataset_repeat"] = repeat_idx
+        mixed[new_id] = item
+
+out_path.parent.mkdir(parents=True, exist_ok=True)
+out_path.write_text(json.dumps(mixed, ensure_ascii=False, indent=2), encoding="utf-8")
+print(f"wrote {len(mixed)} songs to {out_path}")
+PY
+```
+
+Затем fine-tune:
+
+```bash
+python -m src.training.train_teacher \
+  data.json_path=outputs/section_training/teacher_encoded_mixed_short_assembled.json \
+  training.init_checkpoint=$STAGE2_CKPT \
+  training.init_checkpoint_strict=true \
+  dataloader.batch_size=16 \
+  dataloader.corruption_modes='[adjacent_section_swap,non_adjacent_section_swap,section_duplicate,section_drop_keep_silence,section_drop_and_close_gap,section_entry_non_tonic_substitution,section_exit_non_dominant_substitution,strongbeat_nonchord_note,borrowed_melody_conflict,borrowed_kind_toggle_without_melody_change,melody_semitone_add_clash,melody_suspension_clash,melody_alteration_clash,melody_omit_core_tone_conflict,inversion_bass_continuity_conflict,note_onset_shift,chord_onset_shift,strong_weak_beat_flip,duration_stretch_shrink_note,duration_stretch_shrink_chord,functional_progression_violation_strict]' \
+  optimizer.lr=5e-5 \
+  training.epochs=60 \
+  experiment.epochs=60 \
+  training.mlm_ssl_epochs=0 \
+  training.corruption_epochs=60 \
+  scheduler.t_max=60 \
+  device=cuda \
+  training.device=cuda \
+  run_name=teacher_stage3_mixed_sections
+```
+
+Для первого эксперимента можно остановиться на Stage 2. Stage 3 нужен, если на старых short-clip evaluation видно forgetting.
 
 Полезные варианты:
 
@@ -407,7 +607,7 @@ python -m src.training.train_teacher \
 python -m src.training.train_teacher +dataloader=theory_aware_ood run_name=teacher_ood_modes
 ```
 
-### 5.3 Attention / hybrid scorer ablation
+### 5.6 Attention / hybrid scorer ablation
 
 Для ablation нового attention-механизма на полном датасете можно запустить Hydra multirun примерно на 100 эпох. Hybrid scorer фиксируется включенным во всех запусках, потому что это основной scorer; sweep сравнивает два независимых фактора:
 
@@ -484,7 +684,7 @@ outputs/YYYY-MM-DD/HH-MM-SS_<run_name>/
 - teacher checkpoint: обычно `checkpoints/best_rank_acc.pt` или `checkpoints/last.pt`;
 - matching config: `composed_config.yaml` из той же run-директории.
 
-### 5.4 Оценка teacher-а
+### 5.7 Оценка teacher-а
 
 ```bash
 python -m src.training.eval_teacher_ssl \
@@ -512,6 +712,53 @@ python scripts/eval_teacher_ood_corruptions.py \
 Observer pipeline строит пары `clean/corrupted`, рендерит их в MIDI, прогоняет teacher для получения target-score и кэширует observer-графы.
 
 Здесь важно отличие от старого режима "сравнить только внутри одного encoded-трека": clean и corrupted сохраняются как отдельные MIDI-файлы, затем из каждого MIDI строится отдельный observer graph. Pair-связь хранится в `pairs/index/*_pairs.jsonl` и `targets/*_pairs.jsonl`; обучение observer-а загружает оба MIDI-derived графа и оптимизирует одновременно regression loss по teacher score и pair rank loss между clean/corrupted MIDI-графами.
+
+После section-aware teacher training старые observer artifacts лучше считать несовместимыми, если изменилось хотя бы одно из этого:
+
+- teacher checkpoint или teacher config;
+- `data.json_path`, из которого строятся пары;
+- список `dataloader.corruption_modes`;
+- MIDI rendering / chord parser settings;
+- `learned_weights.yaml` для chord scorer-а.
+
+Для section corruptions это особенно важно: старые observer pairs, построенные на short clips, не содержат `section_swap`, `section_duplicate` и section-drop MIDI. `build_pairs` сам генерирует clean/corrupted encoded JSON и MIDI, поэтому отдельно рендерить `data/rendered` для observer pipeline не нужно. Отдельный `render_encoded_song_to_midi` нужен только для smoke/listening или обучения chord scorer-а.
+
+Рекомендуемый section-aware observer rebuild после Stage 2/3 teacher:
+
+```bash
+python -m src.observer.run_observer_pipeline \
+  data.json_path=outputs/section_training/teacher_encoded_mixed_short_assembled.json \
+  observer_pipeline.output_root=outputs/observer_pipeline_sections \
+  observer_pipeline.overwrite=true \
+  observer_pipeline.build_pairs=true \
+  observer_pipeline.build_targets=true \
+  observer_pipeline.build_graph_cache=true \
+  observer_pipeline.train=true \
+  observer_training.teacher_checkpoint=$STAGE2_CKPT \
+  observer_training.teacher_config=outputs/<date>/<time>_teacher_stage2_assembled_sections/composed_config.yaml \
+  observer_training.chord_weights_yaml=outputs/chord_score_fit/full/learned_weights.yaml \
+  observer_training.device=cuda \
+  observer_training.epochs=20 \
+  dataloader.batch_size=8 \
+  dataloader.pairs_per_song=1 \
+  dataloader.corruption_modes='[adjacent_section_swap,non_adjacent_section_swap,section_duplicate,section_drop_keep_silence,section_drop_and_close_gap,section_entry_non_tonic_substitution,section_exit_non_dominant_substitution,strongbeat_nonchord_note,borrowed_melody_conflict,note_onset_shift,strong_weak_beat_flip]' \
+  optimizer.lr=1e-3
+```
+
+Если Stage 3 mixed checkpoint есть, вместо `$STAGE2_CKPT` используй Stage 3 checkpoint и `composed_config.yaml` из Stage 3 run. Если mixed JSON не собирал, можно поставить:
+
+```bash
+data.json_path=outputs/assembled_sections/teacher_encoded_assembled_compact_gap.json
+```
+
+В этом случае observer будет учиться только на assembled section songs.
+
+Минимальная инвалидация по шагам:
+
+- изменился только teacher checkpoint/config -> можно оставить pairs/MIDI/cache и пересобрать только targets + train: `build_pairs=false build_targets=true build_graph_cache=false train=true`;
+- изменились corruption modes или source JSON -> пересобери pairs, targets, cache и train;
+- изменился chord scorer или graph builder observer-а -> pairs/MIDI можно оставить, но targets/cache/train лучше пересобрать;
+- сомневаешься -> используй новый `observer_pipeline.output_root` или `observer_pipeline.overwrite=true` и пересобери всё.
 
 Рекомендуемый единый запуск:
 

@@ -72,6 +72,33 @@ BAR_LAYOUT = OrderedDict([
     ("n_onsets_in_bar", 5),
 ])
 
+SECTION_LABEL_IDS = {
+    "<PAD>": 0,
+    "<UNK>": 1,
+    "verse": 2,
+    "chorus": 3,
+    "pre-chorus": 4,
+    "bridge": 5,
+    "intro": 6,
+    "outro": 7,
+    "instrumental": 8,
+    "solo": 9,
+}
+
+SECTION_LAYOUT = OrderedDict([
+    ("label_id", 0),
+    ("order_index", 1),
+    ("start_beat", 2),
+    ("end_beat", 3),
+    ("duration_beats", 4),
+    ("normalized_start", 5),
+    ("normalized_end", 6),
+    ("n_labels", 7),
+    ("n_source_clips", 8),
+    ("inserted_gap_beats_before", 9),
+    ("positive_gap_seconds_from_previous", 10),
+])
+
 SONG_LAYOUT = OrderedDict([
     ("main_key_tonic_pc_id", 0),
     ("main_key_scale_id", 1),
@@ -93,6 +120,7 @@ PRIMARY_MASK_FIELDS = {
 
 NODE_LAYOUTS = {
     "song": SONG_LAYOUT,
+    "section": SECTION_LAYOUT,
     "bar": BAR_LAYOUT,
     "onset": ONSET_LAYOUT,
     "note": NOTE_LAYOUT,
@@ -101,6 +129,7 @@ NODE_LAYOUTS = {
 
 NODE_DIMS = {
     "song": len(SONG_LAYOUT),
+    "section": len(SECTION_LAYOUT),
     "bar": len(BAR_LAYOUT),
     "onset": len(ONSET_LAYOUT),
     "note": len(NOTE_LAYOUT),

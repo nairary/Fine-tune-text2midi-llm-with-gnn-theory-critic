@@ -17,18 +17,30 @@ from .graph_layouts import (
     NODE_DIMS,
     NOTE_LAYOUT,
     PRIMARY_MASK_FIELDS,
+    SECTION_LABEL_IDS,
     VALID_ID_SETS,
 )
 
 
-MANDATORY_NODE_TYPES = ("song", "bar", "onset", "note", "chord")
+MANDATORY_NODE_TYPES = ("song", "section", "bar", "onset", "note", "chord")
 MANDATORY_EDGE_TYPES = (
+    ("song", "contains_section", "section"),
+    ("section", "belongs_to_song", "song"),
     ("song", "contains_bar", "bar"),
+    ("section", "next_section", "section"),
+    ("section", "contains_bar", "bar"),
+    ("bar", "in_section", "section"),
     ("bar", "next_bar", "bar"),
     ("bar", "contains_onset", "onset"),
+    ("section", "contains_onset", "onset"),
+    ("onset", "in_section", "section"),
     ("onset", "next_onset", "onset"),
     ("onset", "starts_note", "note"),
     ("onset", "starts_chord", "chord"),
+    ("section", "contains_note", "note"),
+    ("note", "in_section", "section"),
+    ("section", "contains_chord", "chord"),
+    ("chord", "in_section", "section"),
     ("note", "next_note", "note"),
     ("chord", "next_chord", "chord"),
     ("chord", "covers_note", "note"),
@@ -76,6 +88,167 @@ def _sequence_pairs(num_nodes: int) -> List[Tuple[int, int]]:
     if num_nodes <= 1:
         return []
     return [(idx, idx + 1) for idx in range(num_nodes - 1)]
+
+
+def _label_tokens(value) -> List:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        tokens = []
+        for item in value:
+            tokens.extend(_label_tokens(item))
+        return tokens
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split("+") if part.strip()]
+        return parts or [value.strip()]
+    return [value]
+
+
+def _section_label_id(labels=None, label_ids=None, label=None) -> int:
+    for raw_id in _label_tokens(label_ids):
+        label_id = _safe_int(raw_id, -1)
+        if label_id >= 0:
+            return label_id
+
+    for raw_label in _label_tokens(labels) + _label_tokens(label):
+        if isinstance(raw_label, (int, float)):
+            label_id = _safe_int(raw_label, -1)
+            if label_id >= 0:
+                return label_id
+            continue
+        text = str(raw_label).strip()
+        if text in SECTION_LABEL_IDS:
+            return SECTION_LABEL_IDS[text]
+        normalized = text.lower()
+        if normalized in SECTION_LABEL_IDS:
+            return SECTION_LABEL_IDS[normalized]
+    return SECTION_LABEL_IDS["<UNK>"]
+
+
+def _section_label_count(labels=None, label_ids=None, label=None) -> int:
+    if label_ids is not None:
+        return len(_label_tokens(label_ids))
+    if labels is not None:
+        return len(_label_tokens(labels))
+    if label is not None:
+        return len(_label_tokens(label))
+    return 0
+
+
+def _section_source_clip_count(span: dict) -> int:
+    source_clip_ids = span.get("source_clip_song_ids")
+    if isinstance(source_clip_ids, (list, tuple)):
+        return len(source_clip_ids)
+    if span.get("source_clip_song_id") is not None:
+        return 1
+    return 0
+
+
+def _fallback_section_label(song_obj: dict) -> tuple[int, int]:
+    sections = song_obj.get("sections") or []
+    if not sections:
+        return SECTION_LABEL_IDS["<UNK>"], 0
+
+    first = sections[0] if isinstance(sections[0], dict) else {}
+    label_ids = first.get("label_ids")
+    labels = first.get("labels")
+    label = first.get("label")
+    return (
+        _section_label_id(labels=labels, label_ids=label_ids, label=label),
+        _section_label_count(labels=labels, label_ids=label_ids, label=label),
+    )
+
+
+def _normalized_section_position(beat: float, end_beat: float) -> float:
+    denominator = max(end_beat - 1.0, 1e-6)
+    return max(0.0, min(1.0, (beat - 1.0) / denominator))
+
+
+def _normalize_section_infos(song_obj: dict, meta: dict, end_beat: float) -> List[dict]:
+    section_infos = []
+    raw_spans = meta.get("section_spans") or []
+    for fallback_index, span in enumerate(raw_spans):
+        if not isinstance(span, dict):
+            continue
+
+        start_value = span.get("target_start_beat")
+        if start_value is None:
+            start_value = span.get("start_beat")
+        end_value = span.get("target_end_beat")
+        if end_value is None:
+            end_value = span.get("end_beat")
+
+        start_beat = max(1.0, _safe_float(start_value, 1.0))
+        end = _safe_float(end_value, start_beat)
+        end_beat_for_section = max(start_beat, end)
+        if end_beat_for_section <= start_beat:
+            continue
+
+        order_index = _safe_int(span.get("section_index"), fallback_index)
+        labels = span.get("labels")
+        label = span.get("label")
+        label_ids = span.get("label_ids")
+        label_id = _section_label_id(labels=labels, label_ids=label_ids, label=label)
+        label_count = _section_label_count(labels=labels, label_ids=label_ids, label=label)
+        duration = end_beat_for_section - start_beat
+        section_infos.append(
+            {
+                "start_beat": start_beat,
+                "end_beat": end_beat_for_section,
+                "row": [
+                    float(label_id),
+                    float(order_index),
+                    start_beat,
+                    end_beat_for_section,
+                    duration,
+                    _normalized_section_position(start_beat, end_beat),
+                    _normalized_section_position(end_beat_for_section, end_beat),
+                    float(label_count),
+                    float(_section_source_clip_count(span)),
+                    _safe_float(span.get("inserted_gap_beats_before"), 0.0),
+                    _safe_float(span.get("positive_gap_seconds_from_previous"), 0.0),
+                ],
+            }
+        )
+
+    if section_infos:
+        return sorted(section_infos, key=lambda item: (item["start_beat"], item["end_beat"], item["row"][1]))
+
+    label_id, label_count = _fallback_section_label(song_obj)
+    section_end = max(1.0, end_beat)
+    return [
+        {
+            "start_beat": 1.0,
+            "end_beat": section_end,
+            "row": [
+                float(label_id),
+                0.0,
+                1.0,
+                section_end,
+                max(0.0, section_end - 1.0),
+                0.0,
+                _normalized_section_position(section_end, section_end),
+                float(label_count),
+                1.0,
+                0.0,
+                0.0,
+            ],
+        }
+    ]
+
+
+def _section_index_for_beat(beat: float, section_infos: List[dict]) -> int | None:
+    eps = 1e-6
+    for idx, section in enumerate(section_infos):
+        start = section["start_beat"]
+        end = section["end_beat"]
+        if beat + eps < start:
+            continue
+        if beat < end - eps:
+            return idx
+        if idx == len(section_infos) - 1 and beat <= end + eps:
+            return idx
+    return None
 
 
 def _compute_bar_index(beat: float, num_beats: float) -> int:
@@ -133,6 +306,7 @@ def build_graph_from_encoded(song_obj):
     bpm = _safe_float(meta.get("main_bpm"), DEFAULT_BPM)
     end_beat = _infer_end_beat(song_obj, notes, chords, meta)
     n_bars = _bar_count(end_beat, num_beats)
+    section_infos = _normalize_section_infos(song_obj, meta, end_beat)
 
     # Song node: use only encoded ids for categorical meter/key fields.
     song_row = [[
@@ -144,19 +318,26 @@ def build_graph_from_encoded(song_obj):
         end_beat,
     ]]
     _ensure_node_storage(graph, "song", NODE_DIMS["song"], song_row)
+    _ensure_node_storage(graph, "section", NODE_DIMS["section"], [info["row"] for info in section_infos])
 
     # Precompute event-to-bar mappings.
     note_bar_indices = []
     chord_bar_indices = []
+    note_section_indices = []
+    chord_section_indices = []
     notes_per_bar = [0 for _ in range(n_bars)]
     chords_per_bar = [0 for _ in range(n_bars)]
     for note in notes:
-        bar_index = min(_compute_bar_index(_safe_float(note.get("beat"), 1.0), num_beats), n_bars - 1)
+        beat = _safe_float(note.get("beat"), 1.0)
+        bar_index = min(_compute_bar_index(beat, num_beats), n_bars - 1)
         note_bar_indices.append(bar_index)
+        note_section_indices.append(_section_index_for_beat(beat, section_infos))
         notes_per_bar[bar_index] += 1
     for chord in chords:
-        bar_index = min(_compute_bar_index(_safe_float(chord.get("beat"), 1.0), num_beats), n_bars - 1)
+        beat = _safe_float(chord.get("beat"), 1.0)
+        bar_index = min(_compute_bar_index(beat, num_beats), n_bars - 1)
         chord_bar_indices.append(bar_index)
+        chord_section_indices.append(_section_index_for_beat(beat, section_infos))
         chords_per_bar[bar_index] += 1
 
     # Onset nodes from unique note/chord start beats.
@@ -180,9 +361,11 @@ def build_graph_from_encoded(song_obj):
 
     onset_rows = []
     onset_bar_indices = []
+    onset_section_indices = []
     for beat in onset_beats:
         bar_index = min(_compute_bar_index(beat, num_beats), n_bars - 1)
         onset_bar_indices.append(bar_index)
+        onset_section_indices.append(_section_index_for_beat(beat, section_infos))
         onsets_per_bar[bar_index] += 1
         onset_rows.append([
             beat,
@@ -195,8 +378,10 @@ def build_graph_from_encoded(song_obj):
 
     # Bar nodes after onset counts are known.
     bar_rows = []
+    bar_section_indices = []
     for bar_index in range(n_bars):
         start = _bar_start(bar_index, num_beats)
+        bar_section_indices.append(_section_index_for_beat(start, section_infos))
         bar_rows.append([
             float(bar_index),
             start,
@@ -246,13 +431,39 @@ def build_graph_from_encoded(song_obj):
         chord_rows.append(row)
     _ensure_node_storage(graph, "chord", NODE_DIMS["chord"], chord_rows)
 
-    # Sequence edges.
+    # Hierarchy and sequence edges.
+    n_sections = len(section_infos)
+    _ensure_edge_storage(graph, ("song", "contains_section", "section"), [(0, idx) for idx in range(n_sections)])
+    _ensure_edge_storage(graph, ("section", "belongs_to_song", "song"), [(idx, 0) for idx in range(n_sections)])
     _ensure_edge_storage(graph, ("song", "contains_bar", "bar"), [(0, idx) for idx in range(n_bars)])
+    _ensure_edge_storage(graph, ("section", "next_section", "section"), _sequence_pairs(n_sections))
+    section_bar_pairs = [
+        (section_idx, bar_idx)
+        for bar_idx, section_idx in enumerate(bar_section_indices)
+        if section_idx is not None
+    ]
+    _ensure_edge_storage(graph, ("section", "contains_bar", "bar"), section_bar_pairs)
+    _ensure_edge_storage(
+        graph,
+        ("bar", "in_section", "section"),
+        [(bar_idx, section_idx) for section_idx, bar_idx in section_bar_pairs],
+    )
     _ensure_edge_storage(graph, ("bar", "next_bar", "bar"), _sequence_pairs(n_bars))
     _ensure_edge_storage(
         graph,
         ("bar", "contains_onset", "onset"),
         [(bar_index, onset_idx) for onset_idx, bar_index in enumerate(onset_bar_indices)],
+    )
+    section_onset_pairs = [
+        (section_idx, onset_idx)
+        for onset_idx, section_idx in enumerate(onset_section_indices)
+        if section_idx is not None
+    ]
+    _ensure_edge_storage(graph, ("section", "contains_onset", "onset"), section_onset_pairs)
+    _ensure_edge_storage(
+        graph,
+        ("onset", "in_section", "section"),
+        [(onset_idx, section_idx) for section_idx, onset_idx in section_onset_pairs],
     )
     _ensure_edge_storage(graph, ("onset", "next_onset", "onset"), _sequence_pairs(len(onset_beats)))
     _ensure_edge_storage(graph, ("note", "next_note", "note"), _sequence_pairs(len(notes)))
@@ -272,6 +483,30 @@ def build_graph_from_encoded(song_obj):
         if onset_idx is not None:
             chord_onset_pairs.append((onset_idx, chord_idx))
     _ensure_edge_storage(graph, ("onset", "starts_chord", "chord"), chord_onset_pairs)
+
+    section_note_pairs = [
+        (section_idx, note_idx)
+        for note_idx, section_idx in enumerate(note_section_indices)
+        if section_idx is not None
+    ]
+    _ensure_edge_storage(graph, ("section", "contains_note", "note"), section_note_pairs)
+    _ensure_edge_storage(
+        graph,
+        ("note", "in_section", "section"),
+        [(note_idx, section_idx) for section_idx, note_idx in section_note_pairs],
+    )
+
+    section_chord_pairs = [
+        (section_idx, chord_idx)
+        for chord_idx, section_idx in enumerate(chord_section_indices)
+        if section_idx is not None
+    ]
+    _ensure_edge_storage(graph, ("section", "contains_chord", "chord"), section_chord_pairs)
+    _ensure_edge_storage(
+        graph,
+        ("chord", "in_section", "section"),
+        [(chord_idx, section_idx) for section_idx, chord_idx in section_chord_pairs],
+    )
 
     # Harmonic coverage edges.
     cover_pairs = []
@@ -296,6 +531,8 @@ def build_graph_from_encoded(song_obj):
         "beat_unit": beat_unit,
         "bpm": bpm,
         "end_beat": end_beat,
+        "n_sections": len(section_infos),
+        "section_label_ids": [int(info["row"][0]) for info in section_infos],
     }
     return graph
 

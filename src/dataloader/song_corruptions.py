@@ -436,6 +436,634 @@ def _duration_scale_factors(corruption_cfg: dict, specific_key: str) -> list[flo
     return factors
 
 
+def _section_span_bounds(span: dict) -> tuple[float | None, float | None]:
+    start = try_parse_float(span.get("target_start_beat"))
+    if start is None:
+        start = try_parse_float(span.get("start_beat"))
+    end = try_parse_float(span.get("target_end_beat"))
+    if end is None:
+        end = try_parse_float(span.get("end_beat"))
+    if start is None or end is None or end <= start:
+        return None, None
+    return float(start), float(end)
+
+
+def _normalized_section_spans(song_obj: dict) -> list[dict]:
+    meta = song_obj.get("meta", {})
+    spans = meta.get("section_spans") if isinstance(meta, dict) else None
+    if not isinstance(spans, list):
+        return []
+
+    normalized = []
+    for fallback_idx, span in enumerate(spans):
+        if not isinstance(span, dict):
+            continue
+        start, end = _section_span_bounds(span)
+        if start is None or end is None:
+            continue
+        item = copy.deepcopy(span)
+        item["_original_section_list_index"] = fallback_idx
+        item["_start_beat"] = start
+        item["_end_beat"] = end
+        item["_duration_beats"] = end - start
+        normalized.append(item)
+    normalized.sort(key=lambda x: (x["_start_beat"], x["_end_beat"], int(x.get("section_index", 0) or 0)))
+    return normalized
+
+
+def _section_label_for_metadata(span: dict) -> str:
+    label = span.get("label")
+    if isinstance(label, str) and label:
+        return label
+    labels = span.get("labels")
+    if isinstance(labels, list) and labels:
+        return "+".join(str(x) for x in labels)
+    return "unknown"
+
+
+def _beat_in_interval(beat: float | None, start: float, end: float, *, is_last: bool = False) -> bool:
+    if beat is None:
+        return False
+    if beat < start - DEFAULT_EPSILON:
+        return False
+    if is_last:
+        return beat <= end + DEFAULT_EPSILON
+    return beat < end - DEFAULT_EPSILON
+
+
+def _event_beat(event: dict) -> float | None:
+    return try_parse_float(event.get("beat"))
+
+
+def _shift_event_beat(event: dict, offset_beats: float, song_obj: dict) -> None:
+    beat = _event_beat(event)
+    if beat is None:
+        return
+    event["beat"] = float(beat + offset_beats)
+    _sync_pos_in_bar_if_present(event, song_obj)
+
+
+def _sort_events_in_place(song_obj: dict) -> None:
+    for key in ("melody", "chords"):
+        events = song_obj.get(key)
+        if isinstance(events, list):
+            events.sort(key=lambda event: (safe_float(event.get("beat"), 1.0), safe_float(event.get("duration"), 0.0)))
+    meta = song_obj.get("meta", {})
+    if isinstance(meta, dict):
+        for key in ("key_regions", "tempo_regions", "meter_regions"):
+            regions = meta.get(key)
+            if isinstance(regions, list):
+                regions.sort(key=lambda event: safe_float(event.get("beat"), 1.0))
+
+
+def _section_blocks(song_obj: dict, spans: list[dict]) -> list[dict]:
+    blocks = []
+    meta = song_obj.get("meta", {})
+    melody = song_obj.get("melody", []) if isinstance(song_obj.get("melody"), list) else []
+    chords = song_obj.get("chords", []) if isinstance(song_obj.get("chords"), list) else []
+    region_lists = {
+        key: meta.get(key, []) if isinstance(meta, dict) and isinstance(meta.get(key), list) else []
+        for key in ("key_regions", "tempo_regions", "meter_regions")
+    }
+
+    for idx, span in enumerate(spans):
+        start = span["_start_beat"]
+        end = span["_end_beat"]
+        is_last = idx == len(spans) - 1
+        blocks.append(
+            {
+                "span": span,
+                "start": start,
+                "end": end,
+                "duration": span["_duration_beats"],
+                "melody": [
+                    (event_idx, event)
+                    for event_idx, event in enumerate(melody)
+                    if isinstance(event, dict) and _beat_in_interval(_event_beat(event), start, end, is_last=is_last)
+                ],
+                "chords": [
+                    (event_idx, event)
+                    for event_idx, event in enumerate(chords)
+                    if isinstance(event, dict) and _beat_in_interval(_event_beat(event), start, end, is_last=is_last)
+                ],
+                "regions": {
+                    key: [
+                        (event_idx, event)
+                        for event_idx, event in enumerate(regions)
+                        if isinstance(event, dict) and _beat_in_interval(_event_beat(event), start, end, is_last=is_last)
+                    ]
+                    for key, regions in region_lists.items()
+                },
+            }
+        )
+    return blocks
+
+
+def _copy_block_event(event: dict, old_start: float, new_start: float, song_obj: dict, new_section_index: int, source_section_index: int) -> dict:
+    copied = copy.deepcopy(event)
+    _shift_event_beat(copied, new_start - old_start, song_obj)
+    copied["corrupted_section_index"] = int(new_section_index)
+    copied["section_corruption_source_section_index"] = int(source_section_index)
+    return copied
+
+
+def _rebuild_song_from_section_order(song_obj: dict, order: list[int], *, duplicate_counts: dict[int, int] | None = None) -> dict:
+    spans = _normalized_section_spans(song_obj)
+    blocks = _section_blocks(song_obj, spans)
+    duplicate_counts = duplicate_counts or {}
+    new_melody: list[dict] = []
+    new_chords: list[dict] = []
+    new_regions = {"key_regions": [], "tempo_regions": [], "meter_regions": []}
+    new_spans: list[dict] = []
+    cursor = 1.0
+
+    for new_section_index, source_section_index in enumerate(order):
+        block = blocks[source_section_index]
+        span = block["span"]
+        duration = max(0.0, float(block["duration"]))
+        start = cursor
+        end = start + duration
+        for _, event in block["melody"]:
+            new_melody.append(_copy_block_event(event, block["start"], start, song_obj, new_section_index, source_section_index))
+        for _, event in block["chords"]:
+            new_chords.append(_copy_block_event(event, block["start"], start, song_obj, new_section_index, source_section_index))
+        for key in new_regions:
+            for _, region in block["regions"][key]:
+                new_regions[key].append(_copy_block_event(region, block["start"], start, song_obj, new_section_index, source_section_index))
+
+        copied_span = copy.deepcopy(span)
+        for internal_key in ("_original_section_list_index", "_start_beat", "_end_beat", "_duration_beats"):
+            copied_span.pop(internal_key, None)
+        copied_span.setdefault("original_section_index", span.get("section_index", source_section_index))
+        copied_span["section_index"] = int(new_section_index)
+        copied_span["target_start_beat"] = float(start)
+        copied_span["target_end_beat"] = float(end)
+        copied_span["duration_beats"] = float(duration)
+        copied_span["section_corruption_source_section_index"] = int(source_section_index)
+        copied_span["section_corruption_duplicate_ordinal"] = int(duplicate_counts.get(source_section_index, 0))
+        copied_span["inserted_gap_beats_before"] = 0.0
+        copied_span["inserted_gap_seconds_before"] = 0.0
+        copied_span["inserted_gap_bars_before"] = 0.0
+        copied_span["extra_full_gap_bars_before"] = 0
+        copied_span["gap_placement_reason"] = "section_corruption_compact_rebuild"
+        new_spans.append(copied_span)
+        duplicate_counts[source_section_index] = int(duplicate_counts.get(source_section_index, 0)) + 1
+        cursor = end
+
+    song_obj["melody"] = new_melody
+    song_obj["chords"] = new_chords
+    meta = song_obj.setdefault("meta", {})
+    meta["section_spans"] = new_spans
+    meta["end_beat"] = float(cursor)
+    meta["section_corruption_rebuild_policy"] = "compact_sections"
+    for key, values in new_regions.items():
+        if values or key in meta:
+            meta[key] = values
+    _sort_events_in_place(song_obj)
+    return song_obj
+
+
+def _section_target_indices_from_cfg(corruption_cfg: dict, key: str, n_sections: int) -> list[int]:
+    raw = corruption_cfg.get(key)
+    if raw is None:
+        raw = corruption_cfg.get("section_target_index")
+    if raw is None:
+        return []
+    raw_values = raw if isinstance(raw, (list, tuple)) else [raw]
+    indices = []
+    for value in raw_values:
+        try:
+            idx = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < n_sections:
+            indices.append(idx)
+    return list(dict.fromkeys(indices))
+
+
+def _root_id_for_raw(root_raw: int, theory_ctx: dict) -> int | None:
+    for root_id, raw_value in theory_ctx.get("root_id_to_raw", {}).items():
+        if int(raw_value) == int(root_raw):
+            return int(root_id)
+    return None
+
+
+_ROOT_LABELS_MAJOR = {
+    0: "I",
+    1: "ii",
+    2: "iii",
+    3: "IV",
+    4: "V",
+    5: "vi",
+    6: "vii",
+    7: "bVII",
+}
+_ROOT_LABELS_MINOR = {
+    0: "i",
+    1: "ii",
+    2: "III",
+    3: "iv",
+    4: "V",
+    5: "VI",
+    6: "vii",
+    7: "bVII",
+}
+
+
+def _mode_family_for_functions(song_obj: dict, theory_ctx: dict) -> str:
+    scale_id = int(song_obj.get("meta", {}).get("main_key_scale_id", 2) or 2)
+    mode_name = theory_ctx.get("scale_id_to_name", {}).get(scale_id, "major")
+    return "minor" if mode_name in {"minor", "dorian", "phrygian", "locrian", "harmonic_minor"} else "major"
+
+
+def classify_chord_function_root_only(song_obj: dict, chord: dict, theory_ctx: dict, *, rule_set: str = "boundary_strict") -> dict:
+    """Classify a chord into broad T/PD/D slots using root degree only.
+
+    `applied_id` is intentionally ignored here; section-boundary corruptions use
+    this as a conservative root-level heuristic, not as full Roman-numeral analysis.
+    """
+    if int(chord.get("is_rest", 0) or 0) == 1:
+        return {"slot": "UNKNOWN", "root_raw": None, "mode_family": None, "degree_label": "rest", "reason": "rest_chord"}
+    root_raw = decode_root_raw(chord, theory_ctx)
+    if root_raw is None:
+        return {"slot": "UNKNOWN", "root_raw": None, "mode_family": None, "degree_label": "unknown", "reason": "missing_root"}
+
+    mode_family = _mode_family_for_functions(song_obj, theory_ctx)
+    if rule_set == "boundary_expanded":
+        tonic_roots = {0, 2, 5}
+    else:
+        tonic_roots = {0}
+    predominant_roots = {1, 3}
+    dominant_roots = {4, 6}
+
+    root_raw = int(root_raw)
+    if root_raw in tonic_roots:
+        slot = "T"
+    elif root_raw in predominant_roots:
+        slot = "PD"
+    elif root_raw in dominant_roots:
+        slot = "D"
+    else:
+        slot = "OTHER"
+
+    labels = _ROOT_LABELS_MINOR if mode_family == "minor" else _ROOT_LABELS_MAJOR
+    return {
+        "slot": slot,
+        "root_raw": root_raw,
+        "mode_family": mode_family,
+        "degree_label": labels.get(root_raw, str(root_raw)),
+        "rule_set": rule_set,
+        "reason": "root_only",
+    }
+
+
+def _chord_candidates_in_section(song_obj: dict, span: dict, *, is_last: bool) -> list[tuple[float, int]]:
+    chords = song_obj.get("chords", []) if isinstance(song_obj.get("chords"), list) else []
+    start, end = span["_start_beat"], span["_end_beat"]
+    return [
+        (safe_float(chord.get("beat"), 1.0), idx)
+        for idx, chord in enumerate(chords)
+        if isinstance(chord, dict)
+        and int(chord.get("is_rest", 0) or 0) == 0
+        and _beat_in_interval(_event_beat(chord), start, end, is_last=is_last)
+    ]
+
+
+def _first_chord_index_in_section(song_obj: dict, spans: list[dict], section_idx: int) -> int | None:
+    candidates = _chord_candidates_in_section(song_obj, spans[section_idx], is_last=section_idx == len(spans) - 1)
+    return min(candidates)[1] if candidates else None
+
+
+def _last_chord_index_in_section(song_obj: dict, spans: list[dict], section_idx: int) -> int | None:
+    candidates = _chord_candidates_in_section(song_obj, spans[section_idx], is_last=section_idx == len(spans) - 1)
+    return max(candidates)[1] if candidates else None
+
+
+def _set_chord_root_raw(chord: dict, new_root_raw: int, theory_ctx: dict) -> int | None:
+    new_root_id = _root_id_for_raw(new_root_raw, theory_ctx)
+    if new_root_id is None:
+        return None
+    chord["root_id"] = int(new_root_id)
+    if "root_degree_raw" in chord:
+        chord["root_degree_raw"] = int(new_root_raw)
+    return int(new_root_id)
+
+
+def _replacement_root_raw(candidates: list[int], current_root_raw: int, theory_ctx: dict, rng) -> int | None:
+    valid = [root_raw for root_raw in candidates if root_raw != current_root_raw and _root_id_for_raw(root_raw, theory_ctx) is not None]
+    if not valid:
+        return None
+    return int(rng.choice(valid))
+
+
+def _section_order_metadata(mode: str, spans: list[dict], old_order: list[int], new_order: list[int], extra_details: dict | None = None) -> dict:
+    metadata = _identity_metadata(mode)
+    labels = [_section_label_for_metadata(spans[idx]) for idx in range(len(spans))]
+    details = {
+        "original_section_order": old_order,
+        "new_section_order": new_order,
+        "section_labels": labels,
+        "boundary_beats": [
+            [float(spans[idx]["_start_beat"]), float(spans[idx]["_end_beat"])]
+            for idx in range(len(spans))
+        ],
+        "section_rebuild_policy": "compact_sections",
+    }
+    if extra_details:
+        details.update(extra_details)
+    metadata.update({
+        "applied": True,
+        "topology_changed": True,
+        "details": details,
+    })
+    return metadata
+
+
+def _corrupt_adjacent_section_swap(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("adjacent_section_swap")
+    spans = _normalized_section_spans(song_obj)
+    if len(spans) < 2:
+        metadata["reason_skipped"] = "not_enough_sections"
+        return song_obj, metadata, False
+
+    configured = _section_target_indices_from_cfg(corruption_cfg, "section_swap_left_index", len(spans))
+    left_candidates = [idx for idx in configured if idx + 1 < len(spans)]
+    if not left_candidates:
+        left_candidates = list(range(len(spans) - 1))
+    left_idx = int(rng.choice(left_candidates))
+    order = list(range(len(spans)))
+    order[left_idx], order[left_idx + 1] = order[left_idx + 1], order[left_idx]
+    _rebuild_song_from_section_order(song_obj, order)
+    metadata = _section_order_metadata(
+        "adjacent_section_swap",
+        spans,
+        old_order=list(range(len(spans))),
+        new_order=order,
+        extra_details={"affected_section_indices": [left_idx, left_idx + 1]},
+    )
+    return song_obj, metadata, True
+
+
+def _corrupt_non_adjacent_section_swap(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("non_adjacent_section_swap")
+    spans = _normalized_section_spans(song_obj)
+    if len(spans) < 3:
+        metadata["reason_skipped"] = "not_enough_sections"
+        return song_obj, metadata, False
+
+    configured = _section_target_indices_from_cfg(corruption_cfg, "section_swap_indices", len(spans))
+    pair = None
+    if len(configured) >= 2 and abs(configured[0] - configured[1]) > 1:
+        pair = (configured[0], configured[1])
+    if pair is None:
+        pairs = [(left, right) for left in range(len(spans)) for right in range(left + 2, len(spans))]
+        if not pairs:
+            metadata["reason_skipped"] = "no_non_adjacent_section_pair"
+            return song_obj, metadata, False
+        pair = rng.choice(pairs)
+
+    left_idx, right_idx = int(pair[0]), int(pair[1])
+    order = list(range(len(spans)))
+    order[left_idx], order[right_idx] = order[right_idx], order[left_idx]
+    _rebuild_song_from_section_order(song_obj, order)
+    metadata = _section_order_metadata(
+        "non_adjacent_section_swap",
+        spans,
+        old_order=list(range(len(spans))),
+        new_order=order,
+        extra_details={"affected_section_indices": [left_idx, right_idx]},
+    )
+    return song_obj, metadata, True
+
+
+def _corrupt_section_duplicate(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("section_duplicate")
+    spans = _normalized_section_spans(song_obj)
+    if len(spans) < 1:
+        metadata["reason_skipped"] = "no_sections"
+        return song_obj, metadata, False
+
+    configured = _section_target_indices_from_cfg(corruption_cfg, "section_duplicate_index", len(spans))
+    section_idx = int(configured[0]) if configured else int(rng.choice(list(range(len(spans)))))
+    max_times = int(corruption_cfg.get("section_duplicate_max_times", corruption_cfg.get("section_duplicate_n_max", 2)) or 2)
+    max_times = max(1, max_times)
+    forced_times = corruption_cfg.get("section_duplicate_times")
+    if forced_times is not None:
+        try:
+            duplicate_times = max(1, min(max_times, int(forced_times)))
+        except (TypeError, ValueError):
+            duplicate_times = 1
+    else:
+        duplicate_times = int(rng.randint(1, max_times))
+
+    order = []
+    for idx in range(len(spans)):
+        order.append(idx)
+        if idx == section_idx:
+            order.extend([idx] * duplicate_times)
+
+    _rebuild_song_from_section_order(song_obj, order)
+    metadata = _section_order_metadata(
+        "section_duplicate",
+        spans,
+        old_order=list(range(len(spans))),
+        new_order=order,
+        extra_details={"affected_section_indices": [section_idx], "duplicate_times": duplicate_times},
+    )
+    return song_obj, metadata, True
+
+
+def _remove_section_events_keep_silence(song_obj: dict, section_idx: int, spans: list[dict]) -> tuple[list[int], list[int]]:
+    span = spans[section_idx]
+    start, end = span["_start_beat"], span["_end_beat"]
+    is_last = section_idx == len(spans) - 1
+    removed_note_indices = []
+    removed_chord_indices = []
+
+    melody = song_obj.get("melody", []) if isinstance(song_obj.get("melody"), list) else []
+    new_melody = []
+    for idx, note in enumerate(melody):
+        if isinstance(note, dict) and _beat_in_interval(_event_beat(note), start, end, is_last=is_last):
+            removed_note_indices.append(idx)
+            continue
+        new_melody.append(note)
+    song_obj["melody"] = new_melody
+
+    chords = song_obj.get("chords", []) if isinstance(song_obj.get("chords"), list) else []
+    new_chords = []
+    for idx, chord in enumerate(chords):
+        if isinstance(chord, dict) and _beat_in_interval(_event_beat(chord), start, end, is_last=is_last):
+            removed_chord_indices.append(idx)
+            continue
+        new_chords.append(chord)
+    song_obj["chords"] = new_chords
+
+    meta = song_obj.get("meta", {})
+    if isinstance(meta, dict):
+        for key in ("key_regions", "tempo_regions", "meter_regions"):
+            regions = meta.get(key)
+            if not isinstance(regions, list):
+                continue
+            meta[key] = [
+                region
+                for region in regions
+                if not (isinstance(region, dict) and _beat_in_interval(_event_beat(region), start, end, is_last=is_last))
+            ]
+        meta["section_corruption_rebuild_policy"] = "keep_silence"
+    _sort_events_in_place(song_obj)
+    return removed_note_indices, removed_chord_indices
+
+
+def _corrupt_section_drop_keep_silence(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("section_drop_keep_silence")
+    spans = _normalized_section_spans(song_obj)
+    if len(spans) < 2:
+        metadata["reason_skipped"] = "not_enough_sections"
+        return song_obj, metadata, False
+
+    configured = _section_target_indices_from_cfg(corruption_cfg, "section_drop_index", len(spans))
+    section_idx = int(configured[0]) if configured else int(rng.choice(list(range(len(spans)))))
+    removed_note_indices, removed_chord_indices = _remove_section_events_keep_silence(song_obj, section_idx, spans)
+    if not removed_note_indices and not removed_chord_indices:
+        metadata["reason_skipped"] = "selected_section_has_no_events"
+        return song_obj, metadata, False
+
+    metadata.update({
+        "applied": True,
+        "topology_changed": True,
+        "n_notes_modified": len(removed_note_indices),
+        "n_chords_modified": len(removed_chord_indices),
+        "details": {
+            "affected_section_indices": [section_idx],
+            "removed_note_indices_original": removed_note_indices,
+            "removed_chord_indices_original": removed_chord_indices,
+            "removed_section_label": _section_label_for_metadata(spans[section_idx]),
+            "removed_section_boundary_beats": [spans[section_idx]["_start_beat"], spans[section_idx]["_end_beat"]],
+            "section_rebuild_policy": "keep_silence",
+        },
+    })
+    return song_obj, metadata, True
+
+
+def _corrupt_section_drop_and_close_gap(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("section_drop_and_close_gap")
+    spans = _normalized_section_spans(song_obj)
+    if len(spans) < 2:
+        metadata["reason_skipped"] = "not_enough_sections"
+        return song_obj, metadata, False
+
+    configured = _section_target_indices_from_cfg(corruption_cfg, "section_drop_index", len(spans))
+    section_idx = int(configured[0]) if configured else int(rng.choice(list(range(len(spans)))))
+    order = [idx for idx in range(len(spans)) if idx != section_idx]
+    _rebuild_song_from_section_order(song_obj, order)
+    metadata = _section_order_metadata(
+        "section_drop_and_close_gap",
+        spans,
+        old_order=list(range(len(spans))),
+        new_order=order,
+        extra_details={
+            "affected_section_indices": [section_idx],
+            "removed_section_label": _section_label_for_metadata(spans[section_idx]),
+            "removed_section_boundary_beats": [spans[section_idx]["_start_beat"], spans[section_idx]["_end_beat"]],
+        },
+    )
+    return song_obj, metadata, True
+
+
+def _corrupt_section_entry_non_tonic_substitution(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("section_entry_non_tonic_substitution")
+    spans = _normalized_section_spans(song_obj)
+    chords = song_obj.get("chords", []) if isinstance(song_obj.get("chords"), list) else []
+    if not spans or not chords:
+        metadata["reason_skipped"] = "missing_sections_or_chords"
+        return song_obj, metadata, False
+
+    rule_set = str(corruption_cfg.get("section_function_rule_set", "boundary_strict"))
+    configured = _section_target_indices_from_cfg(corruption_cfg, "section_boundary_index", len(spans))
+    section_indices = configured or list(range(len(spans)))
+    rng.shuffle(section_indices)
+    replacement_candidates = list(corruption_cfg.get("section_non_tonic_root_raws", [1, 3, 4, 6]))
+
+    for section_idx in section_indices:
+        chord_idx = _first_chord_index_in_section(song_obj, spans, section_idx)
+        if chord_idx is None:
+            continue
+        chord = chords[chord_idx]
+        before = classify_chord_function_root_only(song_obj, chord, theory_ctx, rule_set=rule_set)
+        if before["slot"] != "T" or before["root_raw"] is None:
+            continue
+        new_root_raw = _replacement_root_raw(replacement_candidates, int(before["root_raw"]), theory_ctx, rng)
+        if new_root_raw is None:
+            continue
+        old_root_id = int(chord.get("root_id", 0) or 0)
+        new_root_id = _set_chord_root_raw(chord, new_root_raw, theory_ctx)
+        after = classify_chord_function_root_only(song_obj, chord, theory_ctx, rule_set=rule_set)
+        metadata.update({
+            "applied": True,
+            "n_chords_modified": 1,
+            "chord_corrupted_indices": [chord_idx],
+            "details": {
+                "affected_section_indices": [section_idx],
+                "boundary": "entry",
+                "old_root_id": old_root_id,
+                "new_root_id": new_root_id,
+                "function_before": before,
+                "function_after": after,
+            },
+        })
+        return song_obj, metadata, True
+
+    metadata["reason_skipped"] = "no_tonic_section_entry_chord"
+    return song_obj, metadata, False
+
+
+def _corrupt_section_exit_non_dominant_substitution(song_obj, theory_ctx, rng, corruption_cfg):
+    metadata = _identity_metadata("section_exit_non_dominant_substitution")
+    spans = _normalized_section_spans(song_obj)
+    chords = song_obj.get("chords", []) if isinstance(song_obj.get("chords"), list) else []
+    if not spans or not chords:
+        metadata["reason_skipped"] = "missing_sections_or_chords"
+        return song_obj, metadata, False
+
+    rule_set = str(corruption_cfg.get("section_function_rule_set", "boundary_strict"))
+    configured = _section_target_indices_from_cfg(corruption_cfg, "section_boundary_index", len(spans))
+    section_indices = configured or list(range(len(spans)))
+    rng.shuffle(section_indices)
+    replacement_candidates = list(corruption_cfg.get("section_non_dominant_root_raws", [0, 1, 2, 3, 5]))
+
+    for section_idx in section_indices:
+        chord_idx = _last_chord_index_in_section(song_obj, spans, section_idx)
+        if chord_idx is None:
+            continue
+        chord = chords[chord_idx]
+        before = classify_chord_function_root_only(song_obj, chord, theory_ctx, rule_set=rule_set)
+        if before["slot"] != "D" or before["root_raw"] is None:
+            continue
+        new_root_raw = _replacement_root_raw(replacement_candidates, int(before["root_raw"]), theory_ctx, rng)
+        if new_root_raw is None:
+            continue
+        old_root_id = int(chord.get("root_id", 0) or 0)
+        new_root_id = _set_chord_root_raw(chord, new_root_raw, theory_ctx)
+        after = classify_chord_function_root_only(song_obj, chord, theory_ctx, rule_set=rule_set)
+        metadata.update({
+            "applied": True,
+            "n_chords_modified": 1,
+            "chord_corrupted_indices": [chord_idx],
+            "details": {
+                "affected_section_indices": [section_idx],
+                "boundary": "exit",
+                "old_root_id": old_root_id,
+                "new_root_id": new_root_id,
+                "function_before": before,
+                "function_after": after,
+            },
+        })
+        return song_obj, metadata, True
+
+    metadata["reason_skipped"] = "no_dominant_section_exit_chord"
+    return song_obj, metadata, False
+
+
 def _corrupt_transpose_with_tonic_shift(song_obj, theory_ctx, rng, corruption_cfg):
     metadata = _identity_metadata("transpose_with_tonic_shift")
     semitones = list(corruption_cfg.get("transpose_semitones", [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]))
@@ -2200,6 +2828,13 @@ def _not_implemented_mode(song_obj, theory_ctx, rng, corruption_cfg, mode_name: 
 
 
 _CORRUPTION_REGISTRY: dict[str, Callable] = {
+    "adjacent_section_swap": _corrupt_adjacent_section_swap,
+    "non_adjacent_section_swap": _corrupt_non_adjacent_section_swap,
+    "section_duplicate": _corrupt_section_duplicate,
+    "section_drop_keep_silence": _corrupt_section_drop_keep_silence,
+    "section_drop_and_close_gap": _corrupt_section_drop_and_close_gap,
+    "section_exit_non_dominant_substitution": _corrupt_section_exit_non_dominant_substitution,
+    "section_entry_non_tonic_substitution": _corrupt_section_entry_non_tonic_substitution,
     "transpose_with_tonic_shift": _corrupt_transpose_with_tonic_shift,
     "melody_octave_shift": _corrupt_melody_octave_shift,
     "merge_repeated_melody_notes": _corrupt_merge_repeated_melody_notes,

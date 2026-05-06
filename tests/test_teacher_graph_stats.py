@@ -10,12 +10,23 @@ from src.dataloader.utils_graph import build_graph_from_encoded
 
 
 EDGE_TYPES_TO_REPORT = [
+    ("song", "contains_section", "section"),
+    ("section", "belongs_to_song", "song"),
     ("song", "contains_bar", "bar"),
+    ("section", "next_section", "section"),
+    ("section", "contains_bar", "bar"),
+    ("bar", "in_section", "section"),
     ("bar", "next_bar", "bar"),
     ("bar", "contains_onset", "onset"),
+    ("section", "contains_onset", "onset"),
+    ("onset", "in_section", "section"),
     ("onset", "next_onset", "onset"),
     ("onset", "starts_note", "note"),
     ("onset", "starts_chord", "chord"),
+    ("section", "contains_note", "note"),
+    ("note", "in_section", "section"),
+    ("section", "contains_chord", "chord"),
+    ("chord", "in_section", "section"),
     ("note", "next_note", "note"),
     ("chord", "next_chord", "chord"),
     ("chord", "covers_note", "note"),
@@ -40,7 +51,7 @@ def main():
     for idx, song_obj in enumerate(songs):
         graph = build_graph_from_encoded(song_obj)
         print(f"\n=== graph[{idx}] song_id={song_obj.get('song_id')} ===")
-        for node_type in ["song", "bar", "onset", "note", "chord"]:
+        for node_type in ["song", "section", "bar", "onset", "note", "chord"]:
             print(f"nodes[{node_type}]={graph[node_type].x.size(0)}")
         for edge_type in EDGE_TYPES_TO_REPORT:
             print(f"edges[{edge_type}]={graph[edge_type].edge_index.size(1)}")
