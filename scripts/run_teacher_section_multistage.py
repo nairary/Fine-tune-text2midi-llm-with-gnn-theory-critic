@@ -35,10 +35,10 @@ LOCAL_THEORY_MODES = [
     "inversion_bass_continuity_conflict",
     "note_onset_shift",
     "chord_onset_shift",
-    "strong_weak_beat_flip",
-    "duration_stretch_shrink_note",
-    "duration_stretch_shrink_chord",
-    "functional_progression_violation_strict",
+    # "strong_weak_beat_flip",
+    # "duration_stretch_shrink_note",
+    # "duration_stretch_shrink_chord",
+    # "functional_progression_violation_strict",
 ]
 
 SECTION_MODES = [
@@ -61,10 +61,10 @@ STAGE2_MODES = SECTION_MODES + [
     "inversion_bass_continuity_conflict",
     "note_onset_shift",
     "chord_onset_shift",
-    "strong_weak_beat_flip",
-    "duration_stretch_shrink_note",
-    "duration_stretch_shrink_chord",
-    "functional_progression_violation_strict",
+    # "strong_weak_beat_flip",
+    # "duration_stretch_shrink_note",
+    # "duration_stretch_shrink_chord",
+    # "functional_progression_violation_strict",
 ]
 
 STAGE3_MODES = SECTION_MODES + LOCAL_THEORY_MODES
@@ -102,29 +102,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2-checkpoint", type=Path, default=None, help="Skip Stage 2 and reuse this checkpoint.")
     parser.add_argument("--skip-stage3", action="store_true")
 
-    parser.add_argument("--stage1-epochs", type=int, default=500)
-    parser.add_argument("--stage1-mlm-epochs", type=int, default=300)
-    parser.add_argument("--stage1-corruption-epochs", type=int, default=200)
-    parser.add_argument("--stage1-batch-size", type=int, default=32)
+    parser.add_argument("--stage1-epochs", type=int, default=100)
+    parser.add_argument("--stage1-mlm-epochs", type=int, default=0)
+    parser.add_argument("--stage1-corruption-epochs", type=int, default=100)
+    parser.add_argument("--stage1-batch-size", type=int, default=128)
     parser.add_argument("--stage1-lr", type=float, default=3e-4)
     parser.add_argument("--stage1-limit-train-samples", type=int, default=None)
     parser.add_argument("--stage1-limit-val-samples", type=int, default=None)
 
-    parser.add_argument("--stage2-epochs", type=int, default=120)
-    parser.add_argument("--stage2-batch-size", type=int, default=16)
+    parser.add_argument("--stage2-epochs", type=int, default=100)
+    parser.add_argument("--stage2-batch-size", type=int, default=128)
     parser.add_argument("--stage2-lr", type=float, default=1e-4)
     parser.add_argument("--stage2-limit-train-samples", type=int, default=None)
     parser.add_argument("--stage2-limit-val-samples", type=int, default=None)
     parser.add_argument("--stage2-section-weight", type=float, default=0.25)
     parser.add_argument("--stage2-local-weight", type=float, default=0.75)
 
-    parser.add_argument("--stage3-epochs", type=int, default=60)
-    parser.add_argument("--stage3-batch-size", type=int, default=16)
+    parser.add_argument("--stage3-epochs", type=int, default=100)
+    parser.add_argument("--stage3-batch-size", type=int, default=128)
     parser.add_argument("--stage3-lr", type=float, default=5e-5)
     parser.add_argument("--stage3-limit-train-samples", type=int, default=None)
     parser.add_argument("--stage3-limit-val-samples", type=int, default=None)
-    parser.add_argument("--stage3-section-weight", type=float, default=0.20)
-    parser.add_argument("--stage3-local-weight", type=float, default=0.80)
+    parser.add_argument("--stage3-section-weight", type=float, default=0.40)
+    parser.add_argument("--stage3-local-weight", type=float, default=0.60)
     return parser.parse_args()
 
 
