@@ -4,6 +4,7 @@ corruption_backend: precomputed_pairs
 pair_corpus_root: outputs/fixed_corruption_pairs_v1
 manifest_output_dir: pairs/manifests
 pair_index_output_dir: pairs/index
+teacher_graph_index_dir: null
 precomputed_train_split: train
 precomputed_val_split: val
 batch_size: 128

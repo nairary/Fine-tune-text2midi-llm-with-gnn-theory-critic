@@ -33,6 +33,19 @@ class PairBuildError(ValueError):
     pass
 
 
+SECTION_CORRUPTION_MODES = {
+    "adjacent_section_swap",
+    "non_adjacent_section_swap",
+    "section_duplicate",
+    "section_drop_keep_silence",
+    "section_drop_and_close_gap",
+    "section_entry_non_tonic_substitution",
+    "section_exit_non_dominant_substitution",
+}
+
+PAIR_MODE_STRATEGIES = {"first_applicable", "all_modes", "section_all_local_balanced"}
+
+
 def _base_cwd() -> Path:
     try:
         return Path(hydra.utils.get_original_cwd())
@@ -199,15 +212,60 @@ def _stable_pair_group_id(
     theory_cfg: dict[str, Any],
     *,
     forced_mode: str | None = None,
+    task_kind: str | None = None,
 ) -> str:
+    cfg_payload = {"m": sorted(corruption_modes), "t": theory_cfg, "forced_mode": forced_mode}
+    if task_kind is not None:
+        cfg_payload["task_kind"] = task_kind
     cfg_key = json.dumps(
-        {"m": sorted(corruption_modes), "t": theory_cfg, "forced_mode": forced_mode},
+        cfg_payload,
         sort_keys=True,
         ensure_ascii=False,
     )
     cfg_hash = hashlib.sha1(cfg_key.encode("utf-8")).hexdigest()[:10]
-    pair_label = f"{forced_mode}-pair-{pair_idx}" if forced_mode is not None else f"pair-{pair_idx}"
+    if forced_mode is not None:
+        pair_label = f"{forced_mode}-pair-{pair_idx}"
+    elif task_kind:
+        pair_label = f"{task_kind}-pair-{pair_idx}"
+    else:
+        pair_label = f"pair-{pair_idx}"
     return f"{song_id}::{pair_label}::{cfg_hash}"
+
+
+def _split_section_local_modes(corruption_modes: list[str]) -> tuple[list[str], list[str]]:
+    section_modes = [mode for mode in corruption_modes if mode in SECTION_CORRUPTION_MODES]
+    local_modes = [mode for mode in corruption_modes if mode not in SECTION_CORRUPTION_MODES]
+    return section_modes, local_modes
+
+
+def _build_pair_tasks(
+    *,
+    pair_mode_strategy: str,
+    corruption_modes: list[str],
+    pairs_per_song: int,
+    section_pairs_per_mode: int,
+    local_pairs_per_song: int,
+) -> list[tuple[str, str | None, int]]:
+    if pair_mode_strategy == "all_modes":
+        return [("forced", mode, pair_idx) for mode in corruption_modes for pair_idx in range(pairs_per_song)]
+    if pair_mode_strategy == "first_applicable":
+        return [("first_applicable", None, pair_idx) for pair_idx in range(pairs_per_song)]
+    if pair_mode_strategy == "section_all_local_balanced":
+        section_modes, local_modes = _split_section_local_modes(corruption_modes)
+        tasks = [
+            ("section_forced", mode, pair_idx)
+            for mode in section_modes
+            for pair_idx in range(section_pairs_per_mode)
+        ]
+        tasks.extend(("local_balanced", None, pair_idx) for pair_idx in range(local_pairs_per_song) if local_modes)
+        return tasks
+    raise PairBuildError(f"Unsupported pair_mode_strategy '{pair_mode_strategy}'")
+
+
+def _seed_balancer_from_counts(balancer: CorruptionModeBalancer, counts: Counter[str]) -> None:
+    for mode, count in counts.items():
+        for _ in range(max(0, int(count))):
+            balancer.record_applied(str(mode))
 
 
 def _pair_is_complete(pair_row: dict[str, Any], manifest_by_sample_id: dict[str, dict[str, Any]]) -> bool:
@@ -293,14 +351,24 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
     pairs_per_song = max(1, int(cfg.dataloader.get("pairs_per_song", 1)))
     corruption_modes = list(cfg.dataloader.corruption_modes)
     pair_mode_strategy = str(cfg.dataloader.get("pair_mode_strategy", "first_applicable"))
-    if pair_mode_strategy not in {"first_applicable", "all_modes"}:
-        raise PairBuildError("dataloader.pair_mode_strategy must be 'first_applicable' or 'all_modes'")
+    if pair_mode_strategy not in PAIR_MODE_STRATEGIES:
+        raise PairBuildError(f"dataloader.pair_mode_strategy must be one of {sorted(PAIR_MODE_STRATEGIES)}")
+    section_pairs_per_mode = max(1, int(cfg.dataloader.get("section_pairs_per_mode", 1)))
+    local_pairs_per_song = int(cfg.dataloader.get("local_pairs_per_song", pairs_per_song))
+    if local_pairs_per_song < 0:
+        raise PairBuildError("dataloader.local_pairs_per_song must be >= 0")
+    section_modes, local_modes = _split_section_local_modes(corruption_modes)
     max_pairs_per_split_per_mode_raw = cfg.dataloader.get("max_pairs_per_split_per_mode")
     max_pairs_per_split_per_mode = (
         int(max_pairs_per_split_per_mode_raw) if max_pairs_per_split_per_mode_raw is not None else None
     )
     max_pairs_per_mode_by_split = dict(cfg.dataloader.get("max_pairs_per_mode_by_split", {}))
-    balance_mode_usage = bool(theory_cfg.get("balance_mode_usage", False)) and not deterministic and len(corruption_modes) > 1
+    balance_mode_usage = (
+        pair_mode_strategy != "section_all_local_balanced"
+        and bool(theory_cfg.get("balance_mode_usage", False))
+        and not deterministic
+        and len(corruption_modes) > 1
+    )
     mode_balancer = CorruptionModeBalancer(corruption_modes) if balance_mode_usage else None
 
     # validate meta exactly once per row
@@ -322,6 +390,9 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
         manifest_by_sample_id = manifest_by_split[split_key]
         pair_by_group_id = pair_by_split[split_key]
         split_mode_counter: Counter[str] = Counter(str(row.get("corruption_name", "")) for row in pair_by_group_id.values())
+        split_local_balancer = CorruptionModeBalancer(local_modes) if pair_mode_strategy == "section_all_local_balanced" and local_modes else None
+        if split_local_balancer is not None:
+            _seed_balancer_from_counts(split_local_balancer, Counter({mode: split_mode_counter.get(mode, 0) for mode in local_modes}))
         split_max_pairs_per_mode = (
             int(max_pairs_per_mode_by_split[split_key])
             if split_key in max_pairs_per_mode_by_split and max_pairs_per_mode_by_split[split_key] is not None
@@ -332,12 +403,15 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
             if split_lookup.get(meta["split"]) != split_key:
                 continue
 
-            if pair_mode_strategy == "all_modes":
-                pair_tasks = [(mode, pair_idx) for mode in corruption_modes for pair_idx in range(pairs_per_song)]
-            else:
-                pair_tasks = [(None, pair_idx) for pair_idx in range(pairs_per_song)]
+            pair_tasks = _build_pair_tasks(
+                pair_mode_strategy=pair_mode_strategy,
+                corruption_modes=corruption_modes,
+                pairs_per_song=pairs_per_song,
+                section_pairs_per_mode=section_pairs_per_mode,
+                local_pairs_per_song=local_pairs_per_song,
+            )
 
-            for forced_mode, pair_idx in pair_tasks:
+            for task_kind, forced_mode, pair_idx in pair_tasks:
                 if (
                     forced_mode is not None
                     and split_max_pairs_per_mode is not None
@@ -351,6 +425,7 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
                     corruption_modes,
                     theory_cfg,
                     forced_mode=forced_mode,
+                    task_kind=task_kind if pair_mode_strategy == "section_all_local_balanced" else None,
                 )
                 existing_pair = pair_by_group_id.get(pair_group_id)
                 if existing_pair is not None and not overwrite:
@@ -371,9 +446,13 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
                     seed = int(theory_cfg.get("deterministic_seed", 0)) + stable_song_seed + pair_idx
                     rng = random.Random(seed)
 
-                requested_modes = [forced_mode] if forced_mode is not None else corruption_modes
-                shuffle_modes = forced_mode is None
-                if mode_balancer is not None:
+                if task_kind == "local_balanced":
+                    requested_modes = split_local_balancer.ordered_modes(rng) if split_local_balancer is not None else list(local_modes)
+                    shuffle_modes = False
+                else:
+                    requested_modes = [forced_mode] if forced_mode is not None else corruption_modes
+                    shuffle_modes = forced_mode is None
+                if mode_balancer is not None and forced_mode is None:
                     requested_modes = mode_balancer.ordered_modes(rng)
                     shuffle_modes = False
                 corrupted_song, corr_meta = corrupt_song_obj(
@@ -394,7 +473,9 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
                     skip_rows.append({"source_song_id": meta["song_id"], "pair_group_id": pair_group_id, "split": split_key, "reason_skipped": reason_skip})
                     global_skip_counter[reason_skip] += 1
                     continue
-                if mode_balancer is not None:
+                if task_kind == "local_balanced" and split_local_balancer is not None and corr_name in local_modes:
+                    split_local_balancer.record_applied(corr_name)
+                if mode_balancer is not None and forced_mode is None:
                     mode_balancer.record_applied(corr_name)
 
                 candidate_rows: list[dict[str, Any]] = []
@@ -448,6 +529,8 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
                         "note_corrupted_indices": local_meta.get("note_corrupted_indices", []),
                         "chord_corrupted_indices": local_meta.get("chord_corrupted_indices", []),
                         "onset_corrupted_indices": local_meta.get("onset_corrupted_indices", []),
+                        "attempted_corruption_modes": local_meta.get("attempted_corruption_modes", []),
+                        "skipped_corruption_attempts": local_meta.get("skipped_corruption_attempts", []),
                     }
                     candidate_rows.append(row)
                     clean_written = clean_written or not is_corrupted
@@ -466,11 +549,15 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
                         "tonal_group": _infer_tonal_group(meta["mode_name"]),
                         "corruption_group": _infer_corruption_group(corr_name),
                         "topology_changed": bool(corr_meta.get("topology_changed", False)),
+                        "attempted_corruption_modes": corr_meta.get("attempted_corruption_modes", []),
+                        "skipped_corruption_attempts": corr_meta.get("skipped_corruption_attempts", []),
                         "is_valid_pair_for_rank": True,
                     }
                     stats.built_pairs += 1
                     if forced_mode is not None:
                         split_mode_counter[forced_mode] += 1
+                    else:
+                        split_mode_counter[corr_name] += 1
                 else:
                     for row in candidate_rows:
                         _cleanup_artifacts(Path(row["encoded_song_path"]), Path(row["midi_path"]))
@@ -486,6 +573,11 @@ def build_pairs(cfg: DictConfig) -> BuildStats:
         _write_jsonl(manifests_root / f"{split_key}.jsonl", manifest_rows_sorted)
         _write_jsonl(index_root / f"{split_key}_pairs.jsonl", pair_rows_sorted)
         LOGGER.info("Pair build split=%s built=%d skip_top=%s", split_key, len(pair_by_group_id), dict(split_skip_counter.most_common(5)))
+        LOGGER.info(
+            "Pair build split=%s corruption_counts=%s",
+            split_key,
+            dict(Counter(str(row.get("corruption_name", "")) for row in pair_rows_sorted).most_common()),
+        )
 
     _write_jsonl(skipped_log, _dedup_skip_rows(skip_rows))
     LOGGER.info("Pair build totals: total=%d built_pairs=%d skipped=%d", stats.total, stats.built_pairs, stats.skipped_rows)

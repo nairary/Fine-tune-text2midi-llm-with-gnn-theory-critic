@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import torch
 from torch.utils.data import Dataset
 
 from .utils_graph import build_graph_from_encoded, mask_graph
@@ -34,6 +35,12 @@ def _load_song(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _load_cached_graph(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"Cached teacher graph not found: {path}")
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
 def _corruption_metadata_from_manifest(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "applied": bool(row.get("is_corrupted", False)),
@@ -43,6 +50,8 @@ def _corruption_metadata_from_manifest(row: dict[str, Any]) -> dict[str, Any]:
         "note_corrupted_indices": row.get("note_corrupted_indices", []),
         "chord_corrupted_indices": row.get("chord_corrupted_indices", []),
         "onset_corrupted_indices": row.get("onset_corrupted_indices", []),
+        "attempted_corruption_modes": row.get("attempted_corruption_modes", []),
+        "skipped_corruption_attempts": row.get("skipped_corruption_attempts", []),
         "source_song_id": row.get("source_song_id"),
         "pair_group_id": row.get("pair_group_id"),
     }
@@ -66,6 +75,7 @@ class PrecomputedTeacherPairDataset(Dataset):
         mask_min_nodes: int = 1,
         optional_mask_field_prob: float = 0.5,
         base_dir: str | Path | None = None,
+        graph_index_jsonl: str | Path | None = None,
     ) -> None:
         self.pair_index_jsonl = Path(pair_index_jsonl)
         self.manifest_jsonl = Path(manifest_jsonl)
@@ -73,6 +83,7 @@ class PrecomputedTeacherPairDataset(Dataset):
         self.mask_prob = float(mask_prob)
         self.mask_min_nodes = int(mask_min_nodes)
         self.optional_mask_field_prob = float(optional_mask_field_prob)
+        self.graph_index_jsonl = Path(graph_index_jsonl) if graph_index_jsonl is not None else None
 
         if not self.pair_index_jsonl.exists():
             raise FileNotFoundError(f"Pair index not found: {self.pair_index_jsonl}")
@@ -81,6 +92,12 @@ class PrecomputedTeacherPairDataset(Dataset):
 
         manifest_rows = _read_jsonl(self.manifest_jsonl)
         self.manifest_by_sample_id = {str(row["sample_id"]): row for row in manifest_rows}
+        self.graph_by_sample_id: dict[str, dict[str, Any]] = {}
+        if self.graph_index_jsonl is not None:
+            if not self.graph_index_jsonl.exists():
+                raise FileNotFoundError(f"Teacher graph index not found: {self.graph_index_jsonl}")
+            graph_rows = _read_jsonl(self.graph_index_jsonl)
+            self.graph_by_sample_id = {str(row["sample_id"]): row for row in graph_rows}
 
         pair_rows = _read_jsonl(self.pair_index_jsonl)
         self.pair_rows: list[dict[str, Any]] = []
@@ -91,6 +108,8 @@ class PrecomputedTeacherPairDataset(Dataset):
             corrupted_id = str(row.get("corrupted_sample_id", ""))
             if clean_id not in self.manifest_by_sample_id or corrupted_id not in self.manifest_by_sample_id:
                 continue
+            if self.graph_by_sample_id and (clean_id not in self.graph_by_sample_id or corrupted_id not in self.graph_by_sample_id):
+                continue
             self.pair_rows.append(row)
 
         if not self.pair_rows:
@@ -99,24 +118,29 @@ class PrecomputedTeacherPairDataset(Dataset):
     def __len__(self) -> int:
         return len(self.pair_rows)
 
+    def _load_graph(self, row: dict[str, Any]):
+        sample_id = str(row["sample_id"])
+        graph_row = self.graph_by_sample_id.get(sample_id)
+        if graph_row is not None:
+            graph_path = _resolve_path(graph_row["graph_path"], self.base_dir)
+            return _load_cached_graph(graph_path)
+
+        encoded_path = _resolve_path(row["encoded_song_path"], self.base_dir)
+        return build_graph_from_encoded(_load_song(encoded_path))
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         pair = self.pair_rows[idx]
         clean_row = self.manifest_by_sample_id[str(pair["clean_sample_id"])]
         corrupted_row = self.manifest_by_sample_id[str(pair["corrupted_sample_id"])]
 
-        clean_path = _resolve_path(clean_row["encoded_song_path"], self.base_dir)
-        corrupted_path = _resolve_path(corrupted_row["encoded_song_path"], self.base_dir)
-        clean_song = _load_song(clean_path)
-        corrupted_song = _load_song(corrupted_path)
-
-        graph_real = build_graph_from_encoded(clean_song)
+        graph_real = self._load_graph(clean_row)
         graph_masked, masked_labels = mask_graph(
             graph_real,
             mask_prob=self.mask_prob,
             min_nodes_to_mask=self.mask_min_nodes,
             optional_mask_field_prob=self.optional_mask_field_prob,
         )
-        graph_corrupted = build_graph_from_encoded(corrupted_song)
+        graph_corrupted = self._load_graph(corrupted_row)
 
         return {
             "graph_real": graph_real,

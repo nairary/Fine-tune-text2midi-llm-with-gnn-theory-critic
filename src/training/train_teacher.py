@@ -4,7 +4,7 @@ import json
 import logging
 import random
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
@@ -73,6 +73,134 @@ class MetricTracker:
             if weight > 0:
                 averaged[key] = total / weight
         return averaged
+
+
+def update_corruption_usage_counts(
+    metadata_items: list[Mapping[str, Any] | None],
+    *,
+    attempted_counts: Counter[str],
+    applied_counts: Counter[str],
+    skipped_counts: Counter[str],
+    skipped_attempt_counts: Counter[str],
+    skipped_reason_counts: Counter[str],
+    skipped_attempt_reason_counts: Counter[str],
+) -> None:
+    for metadata in metadata_items:
+        if not isinstance(metadata, Mapping):
+            skipped_counts["unknown"] += 1
+            skipped_reason_counts["missing_metadata"] += 1
+            continue
+        mode = str(metadata.get("corruption_name") or metadata.get("mode") or "unknown")
+        attempted_modes = metadata.get("attempted_corruption_modes")
+        if isinstance(attempted_modes, list):
+            for attempted_mode in attempted_modes:
+                attempted_counts[str(attempted_mode)] += 1
+        else:
+            attempted_counts[mode] += 1
+
+        skipped_attempts = metadata.get("skipped_corruption_attempts")
+        if isinstance(skipped_attempts, list):
+            for attempt in skipped_attempts:
+                if not isinstance(attempt, Mapping):
+                    skipped_attempt_counts["unknown"] += 1
+                    skipped_attempt_reason_counts["unknown"] += 1
+                    continue
+                skipped_mode = str(attempt.get("mode") or "unknown")
+                skipped_reason = str(attempt.get("reason") or "unknown")
+                skipped_attempt_counts[skipped_mode] += 1
+                skipped_attempt_reason_counts[skipped_reason] += 1
+
+        if bool(metadata.get("applied", False)):
+            applied_counts[mode] += 1
+        else:
+            skipped_counts[mode] += 1
+            reason = str(metadata.get("reason_skipped") or "unknown")
+            skipped_reason_counts[reason] += 1
+
+
+def add_corruption_usage_metrics(
+    metrics: Dict[str, float],
+    *,
+    attempted_counts: Counter[str],
+    applied_counts: Counter[str],
+    skipped_counts: Counter[str],
+    skipped_attempt_counts: Counter[str],
+    skipped_reason_counts: Counter[str],
+    skipped_attempt_reason_counts: Counter[str],
+) -> Dict[str, float]:
+    enriched = dict(metrics)
+    enriched["corruption_attempted_total"] = float(sum(attempted_counts.values()))
+    enriched["corruption_applied_total"] = float(sum(applied_counts.values()))
+    enriched["corruption_skipped_total"] = float(sum(skipped_counts.values()))
+    enriched["corruption_skipped_attempt_total"] = float(sum(skipped_attempt_counts.values()))
+    for mode, count in sorted(attempted_counts.items()):
+        enriched[f"corruption_attempted_{mode}"] = float(count)
+    for mode, count in sorted(applied_counts.items()):
+        enriched[f"corruption_applied_{mode}"] = float(count)
+    for mode, count in sorted(skipped_counts.items()):
+        enriched[f"corruption_skipped_{mode}"] = float(count)
+    for mode, count in sorted(skipped_attempt_counts.items()):
+        enriched[f"corruption_skipped_attempt_{mode}"] = float(count)
+    for reason, count in sorted(skipped_reason_counts.items()):
+        enriched[f"corruption_skipped_reason_{reason}"] = float(count)
+    for reason, count in sorted(skipped_attempt_reason_counts.items()):
+        enriched[f"corruption_skipped_attempt_reason_{reason}"] = float(count)
+    return enriched
+
+
+def print_corruption_usage(prefix: str, metrics: Mapping[str, float]) -> None:
+    attempted = {
+        key.removeprefix("corruption_attempted_"): int(value)
+        for key, value in metrics.items()
+        if key.startswith("corruption_attempted_") and key != "corruption_attempted_total"
+    }
+    applied = {
+        key.removeprefix("corruption_applied_"): int(value)
+        for key, value in metrics.items()
+        if key.startswith("corruption_applied_") and key != "corruption_applied_total"
+    }
+    skipped = {
+        key.removeprefix("corruption_skipped_"): int(value)
+        for key, value in metrics.items()
+        if key.startswith("corruption_skipped_")
+        and key != "corruption_skipped_total"
+        and not key.startswith("corruption_skipped_reason_")
+        and not key.startswith("corruption_skipped_attempt_")
+    }
+    skipped_attempts = {
+        key.removeprefix("corruption_skipped_attempt_"): int(value)
+        for key, value in metrics.items()
+        if key.startswith("corruption_skipped_attempt_")
+        and key != "corruption_skipped_attempt_total"
+        and not key.startswith("corruption_skipped_attempt_reason_")
+    }
+    skipped_reasons = {
+        key.removeprefix("corruption_skipped_reason_"): int(value)
+        for key, value in metrics.items()
+        if key.startswith("corruption_skipped_reason_")
+        and not key.startswith("corruption_skipped_attempt_reason_")
+    }
+    skipped_attempt_reasons = {
+        key.removeprefix("corruption_skipped_attempt_reason_"): int(value)
+        for key, value in metrics.items()
+        if key.startswith("corruption_skipped_attempt_reason_")
+    }
+    if not attempted and not applied and not skipped and not skipped_attempts:
+        return
+    LOGGER.info(
+        "%s corruption_usage: attempted_total=%s, applied_total=%s, skipped_total=%s, skipped_attempt_total=%s, attempted_by_mode=%s, applied_by_mode=%s, skipped_by_mode=%s, skipped_attempts_by_mode=%s, skipped_reasons=%s, skipped_attempt_reasons=%s",
+        prefix,
+        int(metrics.get("corruption_attempted_total", 0)),
+        int(metrics.get("corruption_applied_total", 0)),
+        int(metrics.get("corruption_skipped_total", 0)),
+        int(metrics.get("corruption_skipped_attempt_total", 0)),
+        json.dumps(attempted, sort_keys=True),
+        json.dumps(applied, sort_keys=True),
+        json.dumps(skipped, sort_keys=True),
+        json.dumps(skipped_attempts, sort_keys=True),
+        json.dumps(skipped_reasons, sort_keys=True),
+        json.dumps(skipped_attempt_reasons, sort_keys=True),
+    )
 
 
 def set_seed(seed: int, deterministic: bool = False):
@@ -179,8 +307,19 @@ def build_loaders(cfg: DictConfig):
         pair_corpus_root = resolve_path(str(cfg.dataloader.pair_corpus_root))
         manifest_dir = str(cfg.dataloader.get("manifest_output_dir", "pairs/manifests"))
         pair_index_dir = str(cfg.dataloader.get("pair_index_output_dir", "pairs/index"))
+        teacher_graph_index_dir = cfg.dataloader.get("teacher_graph_index_dir")
         train_split_name = str(cfg.dataloader.get("precomputed_train_split", "train"))
         val_split_name = str(cfg.dataloader.get("precomputed_val_split", "val"))
+        train_graph_index = (
+            pair_corpus_root / str(teacher_graph_index_dir) / f"{train_split_name}.jsonl"
+            if teacher_graph_index_dir
+            else None
+        )
+        val_graph_index = (
+            pair_corpus_root / str(teacher_graph_index_dir) / f"{val_split_name}.jsonl"
+            if teacher_graph_index_dir
+            else None
+        )
 
         train_dataset = PrecomputedTeacherPairDataset(
             pair_index_jsonl=pair_corpus_root / pair_index_dir / f"{train_split_name}_pairs.jsonl",
@@ -189,6 +328,7 @@ def build_loaders(cfg: DictConfig):
             mask_min_nodes=int(cfg.dataloader.mask_min_nodes),
             optional_mask_field_prob=float(cfg.dataloader.optional_mask_field_prob),
             base_dir=resolve_path("."),
+            graph_index_jsonl=train_graph_index,
         )
         val_dataset = PrecomputedTeacherPairDataset(
             pair_index_jsonl=pair_corpus_root / pair_index_dir / f"{val_split_name}_pairs.jsonl",
@@ -197,6 +337,7 @@ def build_loaders(cfg: DictConfig):
             mask_min_nodes=int(cfg.dataloader.mask_min_nodes),
             optional_mask_field_prob=float(cfg.dataloader.optional_mask_field_prob),
             base_dir=resolve_path("."),
+            graph_index_jsonl=val_graph_index,
         )
 
         if cfg.training.limit_train_samples is not None:
@@ -400,6 +541,12 @@ def run_epoch(
     is_train = optimizer is not None
     model.train(is_train)
     tracker = MetricTracker()
+    corruption_attempted_counts: Counter[str] = Counter()
+    corruption_applied_counts: Counter[str] = Counter()
+    corruption_skipped_counts: Counter[str] = Counter()
+    corruption_skipped_attempt_counts: Counter[str] = Counter()
+    corruption_skipped_reason_counts: Counter[str] = Counter()
+    corruption_skipped_attempt_reason_counts: Counter[str] = Counter()
     recon_weights, enabled_heads = loss_cfg_to_runtime(losses_cfg)
     grad_clip = float(training_cfg.grad_clip) if training_cfg.grad_clip is not None else None
     autocast_enabled = bool(training_cfg.use_amp and device.type == "cuda")
@@ -463,14 +610,40 @@ def run_epoch(
         scalar_losses = {key: value.detach() for key, value in loss_dict.items() if isinstance(value, torch.Tensor)}
         tracker.update(scalar_losses, weight=1.0)
         tracker.update(metric_dict, weight=1.0)
+        update_corruption_usage_counts(
+            batch["corruption_metadata"],
+            attempted_counts=corruption_attempted_counts,
+            applied_counts=corruption_applied_counts,
+            skipped_counts=corruption_skipped_counts,
+            skipped_attempt_counts=corruption_skipped_attempt_counts,
+            skipped_reason_counts=corruption_skipped_reason_counts,
+            skipped_attempt_reason_counts=corruption_skipped_attempt_reason_counts,
+        )
 
         if step_index % int(training_cfg.log_every) == 0 or (max_batches is not None and step_index == max_batches):
-            LOGGER.info("step=%s metrics=%s", step_index, json.dumps(tracker.average(), sort_keys=True))
+            step_metrics = add_corruption_usage_metrics(
+                tracker.average(),
+                attempted_counts=corruption_attempted_counts,
+                applied_counts=corruption_applied_counts,
+                skipped_counts=corruption_skipped_counts,
+                skipped_attempt_counts=corruption_skipped_attempt_counts,
+                skipped_reason_counts=corruption_skipped_reason_counts,
+                skipped_attempt_reason_counts=corruption_skipped_attempt_reason_counts,
+            )
+            LOGGER.info("step=%s metrics=%s", step_index, json.dumps(step_metrics, sort_keys=True))
 
         if max_batches is not None and step_index >= max_batches:
             break
 
-    return tracker.average()
+    return add_corruption_usage_metrics(
+        tracker.average(),
+        attempted_counts=corruption_attempted_counts,
+        applied_counts=corruption_applied_counts,
+        skipped_counts=corruption_skipped_counts,
+        skipped_attempt_counts=corruption_skipped_attempt_counts,
+        skipped_reason_counts=corruption_skipped_reason_counts,
+        skipped_attempt_reason_counts=corruption_skipped_attempt_reason_counts,
+    )
 
 
 @torch.no_grad()
@@ -748,8 +921,10 @@ def main(cfg: DictConfig):
 
             metric_prefix = f"Epoch {global_epoch:03d} [{stage['name']}:{stage_epoch:03d}]"
             print_metrics(f"{metric_prefix} train", train_metrics)
+            print_corruption_usage(f"{metric_prefix} train", train_metrics)
             if val_metrics:
                 print_metrics(f"{metric_prefix} val", val_metrics)
+                print_corruption_usage(f"{metric_prefix} val", val_metrics)
             persist_metrics(
                 output_dir,
                 global_epoch,

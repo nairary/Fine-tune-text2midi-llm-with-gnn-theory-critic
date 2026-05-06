@@ -1,0 +1,39 @@
+name: section_cache_balanced
+batch_size: 8
+num_workers: 0
+shuffle: true
+pin_memory: false
+drop_last: false
+corruption_backend: song_theory
+corruption_modes:
+  - adjacent_section_swap
+  - non_adjacent_section_swap
+  - section_duplicate
+  - section_drop_keep_silence
+  - section_drop_and_close_gap
+  - section_entry_non_tonic_substitution
+  - section_exit_non_dominant_substitution
+  - strongbeat_nonchord_note
+  - borrowed_melody_conflict
+  - borrowed_kind_toggle_without_melody_change
+  - melody_semitone_add_clash
+  - melody_suspension_clash
+  - melody_alteration_clash
+  - melody_omit_core_tone_conflict
+  - inversion_bass_continuity_conflict
+  - note_onset_shift
+  - chord_onset_shift
+theory_aware:
+  strongbeat_min_duration: 1.0
+  strongbeat_only: true
+  balance_mode_usage: false
+  deterministic_per_sample: true
+  deterministic_seed: 123
+  corruption_family_weights: {}
+  corruption_mode_weights: {}
+pairs_per_song: 1
+pair_mode_strategy: section_all_local_balanced
+section_pairs_per_mode: 1
+local_pairs_per_song: 1
+max_pairs_per_split_per_mode: null
+max_pairs_per_mode_by_split: {}

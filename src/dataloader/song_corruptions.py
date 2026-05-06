@@ -2880,13 +2880,17 @@ def corrupt_song_obj(song_obj, corruption_modes, corruption_cfg, theory_ctx, rng
     if shuffle_modes:
         rng.shuffle(available_modes)
     last_metadata = None
+    attempted_modes = []
+    skipped_attempts = []
     for mode in available_modes:
+        attempted_modes.append(mode)
         if mode in _PLACEHOLDER_MODES:
             _, metadata, _ = _not_implemented_mode(song_corrupted, theory_ctx, rng, corruption_cfg, mode)
             metadata["corruption_name"] = mode
             metadata["applied"] = False
             if not metadata.get("reason_skipped"):
                 metadata["reason_skipped"] = "registered_but_not_implemented"
+            skipped_attempts.append({"mode": mode, "reason": str(metadata.get("reason_skipped") or "unknown")})
             last_metadata = metadata
             continue
 
@@ -2895,16 +2899,23 @@ def corrupt_song_obj(song_obj, corruption_modes, corruption_cfg, theory_ctx, rng
         if applied:
             metadata["corruption_name"] = mode
             metadata["reason_skipped"] = None
+            metadata["attempted_corruption_modes"] = list(attempted_modes)
+            metadata["skipped_corruption_attempts"] = list(skipped_attempts)
             return song_candidate, metadata
         metadata["corruption_name"] = mode
         metadata["applied"] = False
         if not metadata.get("reason_skipped"):
             metadata["reason_skipped"] = "not_applicable"
+        skipped_attempts.append({"mode": mode, "reason": str(metadata.get("reason_skipped") or "unknown")})
         last_metadata = metadata
 
     if last_metadata is not None:
+        last_metadata["attempted_corruption_modes"] = list(attempted_modes)
+        last_metadata["skipped_corruption_attempts"] = list(skipped_attempts)
         return song_corrupted, last_metadata
     identity = _identity_metadata("identity")
     identity["corruption_name"] = "identity"
     identity["reason_skipped"] = "no_applicable_corruption_found"
+    identity["attempted_corruption_modes"] = list(attempted_modes)
+    identity["skipped_corruption_attempts"] = list(skipped_attempts)
     return song_corrupted, identity

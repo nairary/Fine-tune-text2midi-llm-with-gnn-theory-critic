@@ -467,6 +467,14 @@ python scripts/run_teacher_section_multistage.py \
   --stage3-local-weight 0.85
 ```
 
+Во время обучения trainer печатает отдельную строку `corruption_usage` для train/val каждого epoch. Там видно, сколько modes было attempted, сколько реально применилось и сколько попыток было skipped:
+
+```text
+Epoch 001 [corruption:001] train corruption_usage: attempted_total=..., applied_total=..., skipped_attempt_total=..., attempted_by_mode={...}, applied_by_mode={...}, skipped_attempts_by_mode={...}
+```
+
+Те же счетчики сохраняются в `metrics.jsonl` как поля `corruption_attempted_<mode>`, `corruption_applied_<mode>`, `corruption_skipped_attempt_<mode>` и `corruption_skipped_attempt_reason_<reason>`. Это главный sanity check для section fine-tune: если `corruption_attempted_adjacent_section_swap` растет, а `corruption_applied_adjacent_section_swap` и другие section поля постоянно нулевые, значит structural corruptions пробуются, но фактически не доходят до обучения.
+
 Быстрая проверка пайплайна без полного обучения:
 
 ```bash
@@ -882,6 +890,11 @@ python -m src.observer.run_observer_pipeline \
 Важные настройки:
 
 - `dataloader.pairs_per_song` - сколько corrupted-пар генерировать на одну песню;
+- `dataloader.pair_mode_strategy=first_applicable` - дефолт: на песню создается `pairs_per_song` пар, каждая берет первый применимый corruption из списка;
+- `dataloader.pair_mode_strategy=all_modes` - пытается создать отдельную пару для каждого mode из `dataloader.corruption_modes`;
+- `dataloader.pair_mode_strategy=section_all_local_balanced` - пытается применить каждый section mode к каждому треку, а local/theory modes выбирает через balancer по числу реально applied corruptions;
+- `dataloader.section_pairs_per_mode=1` - сколько sampled пар делать на каждый section mode в `section_all_local_balanced`;
+- `dataloader.local_pairs_per_song=1` - сколько balanced local/theory пар делать на каждый трек в `section_all_local_balanced`;
 - `dataloader.corruption_modes` - список song-level corruptions;
 - `dataloader.theory_aware.deterministic_per_sample=true` нужен для воспроизводимых pair ids при `observer_pipeline.overwrite=false`;
 - `observer_pipeline.overwrite=true` полностью пересобирает artifacts;
@@ -889,6 +902,121 @@ python -m src.observer.run_observer_pipeline \
 - `observer_training.chord_instrument_name=chords` задает MIDI-инструмент для гармонического анализа;
 - `losses.use_pair_rank=true` включает pair rank loss;
 - `losses.min_teacher_gap_for_rank=0.25` отбрасывает слишком неоднозначные пары из rank loss, но regression loss все равно считается для clean и corrupted.
+
+Для section-aware кэша, где каждый трек получает все section corruptions и равномерно распределенные local/theory corruptions:
+
+```bash
+python -m src.observer.run_observer_pipeline \
+  dataloader=section_cache_balanced \
+  data.json_path=outputs/teacher_section_multistage/<RUN>/prepared_data/teacher_encoded_mixed_short_assembled.json \
+  observer_pipeline.output_root=outputs/section_pair_cache_v1 \
+  observer_pipeline.overwrite=true \
+  observer_pipeline.build_pairs=true \
+  observer_pipeline.build_targets=false \
+  observer_pipeline.build_graph_cache=false \
+  observer_pipeline.train=false
+```
+
+После build смотри распределение:
+
+```bash
+python - <<'PY'
+import collections, json
+from pathlib import Path
+
+for split in ("train", "val"):
+    path = Path("outputs/section_pair_cache_v1/pairs/index") / f"{split}_pairs.jsonl"
+    counter = collections.Counter(json.loads(line)["corruption_name"] for line in path.open())
+    print(split, counter)
+PY
+```
+
+Чтобы сразу построить TeacherGNN graph cache из этих clean/corrupted JSON:
+
+```bash
+python -m src.dataloader.build_teacher_pair_graph_cache \
+  --pair-corpus-root outputs/section_pair_cache_v1 \
+  --overwrite
+```
+
+Это создает:
+
+```text
+outputs/section_pair_cache_v1/
+  teacher_graphs/
+    graphs/train/*.pt
+    graphs/val/*.pt
+    index/train.jsonl
+    index/val.jsonl
+```
+
+После этого teacher можно обучать без повторного `build_graph_from_encoded`:
+
+```bash
+python -m src.training.train_teacher \
+  --config-name full_data_precomputed_pairs \
+  dataloader.pair_corpus_root=outputs/section_pair_cache_v1 \
+  dataloader.teacher_graph_index_dir=teacher_graphs/index \
+  dataloader.batch_size=32 \
+  training.epochs=100 \
+  experiment.epochs=100 \
+  scheduler.t_max=100 \
+  training.mlm_ssl_epochs=0 \
+  training.corruption_epochs=100 \
+  device=cuda \
+  training.device=cuda \
+  run_name=teacher_from_section_pair_cache
+```
+
+Единый helper, который делает pair corpus -> teacher graph cache -> optional training:
+
+```bash
+python scripts/run_section_pair_cache_teacher.py \
+  --data-json outputs/teacher_section_multistage/<RUN>/prepared_data/teacher_encoded_mixed_short_assembled.json \
+  --output-root outputs/section_pair_cache_v1 \
+  --overwrite \
+  --train \
+  --device cuda \
+  --epochs 100 \
+  --batch-size 32
+```
+
+Важно: cached teacher graph хранит clean/corrupted `HeteroData`. Masked graph для MLM все равно создается на лету, потому что masking рандомный и дешевый по сравнению со сборкой графа.
+
+### 6.1 Что уже реализовано для кэша ablation-ов
+
+На текущий момент реализован полный cache path для teacher ablation-ов:
+
+- генерация фиксированных clean/corrupted encoded JSON и MIDI через `build_pairs`;
+- стратегия `section_all_local_balanced`: все section modes пробуются на каждый трек, local/theory modes балансируются по числу реально примененных corruptions;
+- сохранение corruption metadata в manifest/pair rows: `corruption_name`, `corruption_group`, `attempted_corruption_modes`, `skipped_corruption_attempts`, corrupted node indices;
+- сохранение epoch-level счетчиков в `metrics.jsonl`: `corruption_attempted_<mode>`, `corruption_applied_<mode>`, `corruption_skipped_attempt_<mode>`;
+- построение cached TeacherGNN `HeteroData` graph objects из clean/corrupted encoded JSON;
+- обучение teacher-а из `teacher_graphs/index/*.jsonl` без повторного `build_graph_from_encoded`.
+
+Это подходит для повторных запусков:
+
+- current SAGE backbone;
+- будущий HGT backend;
+- future logit-fusion ablation;
+- разные loss weights / learning rates / batch sizes;
+- сравнение stage-2/3 checkpoints на одном и том же fixed corruption corpus.
+
+Кэш нужно пересобирать, если изменилось что-то из этого:
+
+- source JSON или assembled dataset;
+- список corruption modes или параметры corruption generation;
+- graph schema, node features, edge types;
+- код `build_graph_from_encoded`;
+- MIDI renderer, если дальше нужен observer MIDI cache;
+- teacher checkpoint/config, если пересчитываются observer targets.
+
+Кэш не нужно пересобирать для:
+
+- SAGE vs HGT, если graph schema не менялась;
+- logit fusion, если она использует уже существующие node/graph embeddings and logits;
+- изменения optimizer/lr/scheduler;
+- изменения loss weights.
 
 ## 7. Обучение GNN Observer
 
