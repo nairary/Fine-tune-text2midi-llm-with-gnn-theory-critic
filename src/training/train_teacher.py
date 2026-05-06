@@ -28,6 +28,7 @@ from src.evaluation.teacher_local_metrics import (
     save_local_diagnostic_reports,
 )
 from src.models.teacher_gnn import TeacherGNN
+from src.training.dynamic_loss_weighting import DynamicLossWeighter, build_teacher_dynamic_loss_weighter
 from src.training.teacher_losses import compute_teacher_ssl_losses
 
 LOGGER = logging.getLogger(__name__)
@@ -264,12 +265,16 @@ def build_model(sample_graph, model_cfg: DictConfig, losses_cfg: DictConfig) -> 
     )
 
 
-def build_optimizer(model: TeacherGNN, optimizer_cfg: DictConfig):
+def build_optimizer(model: TeacherGNN, optimizer_cfg: DictConfig, extra_parameters=None):
     if optimizer_cfg.name != "adamw":
         raise ValueError(f"Unsupported optimizer '{optimizer_cfg.name}'.")
     betas = tuple(float(beta) for beta in optimizer_cfg.betas)
+    param_groups = [{"params": list(model.parameters())}]
+    extra_parameters = list(extra_parameters) if extra_parameters is not None else []
+    if extra_parameters:
+        param_groups.append({"params": extra_parameters, "weight_decay": 0.0})
     return AdamW(
-        model.parameters(),
+        param_groups,
         lr=float(optimizer_cfg.lr),
         weight_decay=float(optimizer_cfg.weight_decay),
         betas=betas,
@@ -434,6 +439,36 @@ def loss_cfg_to_runtime(losses_cfg: DictConfig) -> tuple[dict, dict]:
     return recon_weights, enabled_heads
 
 
+def collect_dynamic_teacher_objectives(
+    loss_dict: Mapping[str, torch.Tensor],
+    losses_cfg: DictConfig,
+    stage_cfg: Mapping[str, Any],
+    *,
+    allowed_objectives: set[str] | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+    objective_specs = {
+        "recon": ("recon_loss", "lambda_recon", "enable_recon"),
+        "graph_rank": ("rank_loss", "lambda_graph_rank", "enable_graph_rank"),
+        "note_local": ("note_local_loss", "lambda_note_local", "enable_note_local"),
+        "chord_local": ("chord_local_loss", "lambda_chord_local", "enable_chord_local"),
+        "onset_local": ("onset_local_loss", "lambda_onset_local", "enable_onset_local"),
+    }
+    objective_losses: dict[str, torch.Tensor] = {}
+    base_weights: dict[str, float] = {}
+
+    for objective_name, (loss_key, weight_key, enable_key) in objective_specs.items():
+        if allowed_objectives is not None and objective_name not in allowed_objectives:
+            continue
+        if not bool(stage_cfg.get(enable_key, False)):
+            continue
+        if loss_key not in loss_dict:
+            continue
+        objective_losses[objective_name] = loss_dict[loss_key]
+        base_weights[objective_name] = float(losses_cfg.get(weight_key))
+
+    return objective_losses, base_weights
+
+
 def build_training_stages(training_cfg: DictConfig, losses_cfg: DictConfig, total_epochs: int) -> list[dict[str, Any]]:
     mlm_ssl_epochs = training_cfg.get("mlm_ssl_epochs")
     corruption_epochs = training_cfg.get("corruption_epochs")
@@ -536,10 +571,13 @@ def run_epoch(
     stage_cfg: Mapping[str, Any],
     optimizer: AdamW | None = None,
     scaler: torch.cuda.amp.GradScaler | None = None,
+    dynamic_loss_weighter: DynamicLossWeighter | None = None,
     max_batches: int | None = None,
 ):
     is_train = optimizer is not None
     model.train(is_train)
+    if dynamic_loss_weighter is not None:
+        dynamic_loss_weighter.train(is_train)
     tracker = MetricTracker()
     corruption_attempted_counts: Counter[str] = Counter()
     corruption_applied_counts: Counter[str] = Counter()
@@ -556,6 +594,9 @@ def run_epoch(
     enable_chord_local = bool(stage_cfg.get("enable_chord_local", bool(losses_cfg.enable_chord_local)))
     enable_onset_local = bool(stage_cfg.get("enable_onset_local", bool(losses_cfg.enable_onset_local)))
     require_corrupted_outputs = any((enable_graph_rank, enable_note_local, enable_chord_local, enable_onset_local))
+    grad_clip_parameters = list(model.parameters())
+    if dynamic_loss_weighter is not None:
+        grad_clip_parameters.extend(dynamic_loss_weighter.parameters())
 
     for step_index, batch in enumerate(loader, start=1):
         batch = move_batch_to_device(batch, device)
@@ -592,6 +633,16 @@ def run_epoch(
                 corrupted_batch=batch["graph_corrupted"],
                 local_negatives_per_positive=int(losses_cfg.local_negatives_per_positive),
             )
+            if dynamic_loss_weighter is not None:
+                objective_losses, base_weights = collect_dynamic_teacher_objectives(
+                    loss_dict,
+                    losses_cfg,
+                    stage_cfg,
+                    allowed_objectives=set(dynamic_loss_weighter.objective_names),
+                )
+                dynamic_loss, dynamic_metrics = dynamic_loss_weighter(objective_losses, base_weights)
+                loss_dict["loss"] = dynamic_loss
+                metric_dict.update(dynamic_metrics)
 
         if is_train:
             loss = loss_dict["loss"]
@@ -599,13 +650,13 @@ def run_epoch(
                 scaler.scale(loss).backward()
                 if grad_clip is not None:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    torch.nn.utils.clip_grad_norm_(grad_clip_parameters, grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 if grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    torch.nn.utils.clip_grad_norm_(grad_clip_parameters, grad_clip)
                 optimizer.step()
         scalar_losses = {key: value.detach() for key, value in loss_dict.items() if isinstance(value, torch.Tensor)}
         tracker.update(scalar_losses, weight=1.0)
@@ -654,6 +705,7 @@ def evaluate(
     losses_cfg: DictConfig,
     training_cfg: DictConfig,
     stage_cfg: Mapping[str, Any],
+    dynamic_loss_weighter: DynamicLossWeighter | None = None,
     max_batches: int | None = None,
 ):
     return run_epoch(
@@ -665,6 +717,7 @@ def evaluate(
         stage_cfg=stage_cfg,
         optimizer=None,
         scaler=None,
+        dynamic_loss_weighter=dynamic_loss_weighter,
         max_batches=max_batches,
     )
 
@@ -678,19 +731,20 @@ def save_checkpoint(
     *,
     stage_name: str,
     stage_epoch: int,
+    dynamic_loss_weighter: DynamicLossWeighter | None = None,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "epoch": epoch,
-            "stage": stage_name,
-            "stage_epoch": stage_epoch,
-            "metrics": dict(metrics),
-        },
-        path,
-    )
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+        "stage": stage_name,
+        "stage_epoch": stage_epoch,
+        "metrics": dict(metrics),
+    }
+    if dynamic_loss_weighter is not None:
+        payload["dynamic_loss_weighter_state_dict"] = dynamic_loss_weighter.state_dict()
+    torch.save(payload, path)
 
 
 def load_model_weights_from_checkpoint(
@@ -715,6 +769,26 @@ def load_model_weights_from_checkpoint(
     return checkpoint
 
 
+def load_dynamic_loss_weighter_from_checkpoint(
+    checkpoint: Mapping[str, Any],
+    dynamic_loss_weighter: DynamicLossWeighter,
+    *,
+    strict: bool = True,
+) -> bool:
+    state_dict = checkpoint.get("dynamic_loss_weighter_state_dict")
+    if state_dict is None:
+        LOGGER.info("Checkpoint has no dynamic loss weighter state; initializing dynamic weights from config.")
+        return False
+    missing, unexpected = dynamic_loss_weighter.load_state_dict(state_dict, strict=strict)
+    if missing or unexpected:
+        LOGGER.warning(
+            "Loaded dynamic loss weighter with missing keys=%s unexpected keys=%s",
+            list(missing),
+            list(unexpected),
+        )
+    return True
+
+
 def print_metrics(prefix: str, metrics: Mapping[str, float]):
     ordered_keys = [
         "loss",
@@ -731,6 +805,17 @@ def print_metrics(prefix: str, metrics: Mapping[str, float]):
         "note_local_loss",
         "chord_local_loss",
         "onset_local_loss",
+        "dynamic_weight_recon",
+        "dynamic_weight_graph_rank",
+        "dynamic_weight_note_local",
+        "dynamic_weight_chord_local",
+        "dynamic_weight_onset_local",
+        "dynamic_log_var_recon",
+        "dynamic_log_var_graph_rank",
+        "dynamic_log_var_note_local",
+        "dynamic_log_var_chord_local",
+        "dynamic_log_var_onset_local",
+        "dynamic_active_objectives",
         "note_sd_acc",
         "chord_root_acc",
         "chord_type_acc",
@@ -794,6 +879,9 @@ def main(cfg: DictConfig):
     _, train_loader, val_loader = build_loaders(cfg)
     sample = train_loader.dataset[0]
     model = build_model(sample["graph_real"], cfg.model, cfg.losses).to(device)
+    dynamic_loss_weighter = build_teacher_dynamic_loss_weighter(cfg.losses)
+    if dynamic_loss_weighter is not None:
+        dynamic_loss_weighter = dynamic_loss_weighter.to(device)
 
     init_checkpoint = cfg.training.get("init_checkpoint")
     init_checkpoint_metadata = None
@@ -812,6 +900,14 @@ def main(cfg: DictConfig):
             init_checkpoint_metadata.get("stage_epoch"),
             init_checkpoint_metadata.get("epoch"),
         )
+        if dynamic_loss_weighter is not None:
+            loaded_dynamic = load_dynamic_loss_weighter_from_checkpoint(
+                init_checkpoint_metadata,
+                dynamic_loss_weighter,
+                strict=bool(cfg.training.get("init_checkpoint_strict", True)),
+            )
+            if loaded_dynamic:
+                LOGGER.info("Initialized dynamic loss weights from checkpoint=%s", init_checkpoint_path)
 
     epochs = effective_epochs(cfg.training, cfg.experiment)
     stage_plan = build_training_stages(cfg.training, cfg.losses, epochs)
@@ -847,6 +943,7 @@ def main(cfg: DictConfig):
         "init_checkpoint_stage": init_checkpoint_metadata.get("stage") if init_checkpoint_metadata else None,
         "init_checkpoint_stage_epoch": init_checkpoint_metadata.get("stage_epoch") if init_checkpoint_metadata else None,
         "init_checkpoint_epoch": init_checkpoint_metadata.get("epoch") if init_checkpoint_metadata else None,
+        "dynamic_loss_weighting": OmegaConf.to_container(cfg.losses.get("dynamic_weighting", {}), resolve=True),
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -870,7 +967,11 @@ def main(cfg: DictConfig):
             stage["enable_chord_local"],
             stage["enable_onset_local"],
         )
-        optimizer = build_optimizer(model, cfg.optimizer)
+        optimizer = build_optimizer(
+            model,
+            cfg.optimizer,
+            extra_parameters=dynamic_loss_weighter.parameters() if dynamic_loss_weighter is not None else None,
+        )
         scheduler = build_stage_scheduler(optimizer, cfg.scheduler, stage["epochs"])
         scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.training.use_amp and device.type == "cuda"))
         stage_best_metric = float("-inf") if stage["selection_mode"] == "max" else float("inf")
@@ -887,6 +988,7 @@ def main(cfg: DictConfig):
                 stage_cfg=stage,
                 optimizer=optimizer,
                 scaler=scaler,
+                dynamic_loss_weighter=dynamic_loss_weighter,
                 max_batches=train_batch_limit,
             )
 
@@ -901,6 +1003,7 @@ def main(cfg: DictConfig):
                     losses_cfg=cfg.losses,
                     training_cfg=cfg.training,
                     stage_cfg=stage,
+                    dynamic_loss_weighter=dynamic_loss_weighter,
                     max_batches=val_batch_limit,
                 )
                 if stage["run_local_eval"]:
@@ -943,6 +1046,7 @@ def main(cfg: DictConfig):
                     val_metrics or train_metrics,
                     stage_name=stage["name"],
                     stage_epoch=stage_epoch,
+                    dynamic_loss_weighter=dynamic_loss_weighter,
                 )
                 save_checkpoint(
                     checkpoint_dir / "last.pt",
@@ -952,6 +1056,7 @@ def main(cfg: DictConfig):
                     val_metrics or train_metrics,
                     stage_name=stage["name"],
                     stage_epoch=stage_epoch,
+                    dynamic_loss_weighter=dynamic_loss_weighter,
                 )
 
             current_metric = val_metrics.get(stage["selection_metric"])
@@ -965,6 +1070,7 @@ def main(cfg: DictConfig):
                     val_metrics,
                     stage_name=stage["name"],
                     stage_epoch=stage_epoch,
+                    dynamic_loss_weighter=dynamic_loss_weighter,
                 )
                 save_checkpoint(
                     checkpoint_dir / stage["best_checkpoint_name"],
@@ -974,6 +1080,7 @@ def main(cfg: DictConfig):
                     val_metrics,
                     stage_name=stage["name"],
                     stage_epoch=stage_epoch,
+                    dynamic_loss_weighter=dynamic_loss_weighter,
                 )
 
 

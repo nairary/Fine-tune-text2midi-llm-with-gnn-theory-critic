@@ -3,6 +3,19 @@ lambda_graph_rank: 0.5
 lambda_note_local: 0.5
 lambda_chord_local: 0.5
 lambda_onset_local: 0.5
+dynamic_weighting:
+  enabled: false
+  method: uncertainty
+  init_log_var: 0.0
+  min_log_var: -5.0
+  max_log_var: 5.0
+  regularizer_weight: 1.0
+  objectives:
+    recon: true
+    graph_rank: true
+    note_local: true
+    chord_local: true
+    onset_local: true
 graph_rank_intra_weight: 1.0
 graph_rank_inter_weight: 1.0
 graph_binary_weight: 1.0

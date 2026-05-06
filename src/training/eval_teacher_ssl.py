@@ -17,8 +17,10 @@ from src.training.train_teacher import (
     build_training_stages,
     effective_epochs,
     evaluate,
+    load_dynamic_loss_weighter_from_checkpoint,
     print_metrics,
 )
+from src.training.dynamic_loss_weighting import build_teacher_dynamic_loss_weighter
 
 
 def parse_args():
@@ -39,8 +41,12 @@ def main():
     sample = val_loader.dataset[0]
 
     model = build_model(sample["graph_real"], cfg.model, cfg.losses).to(device)
-    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
+    dynamic_loss_weighter = build_teacher_dynamic_loss_weighter(cfg.losses)
+    if dynamic_loss_weighter is not None:
+        dynamic_loss_weighter = dynamic_loss_weighter.to(device)
+        load_dynamic_loss_weighter_from_checkpoint(checkpoint, dynamic_loss_weighter, strict=False)
     checkpoint_stage = checkpoint.get("stage")
     if checkpoint_stage is None:
         stage_cfg = {
@@ -62,6 +68,7 @@ def main():
         losses_cfg=cfg.losses,
         training_cfg=cfg.training,
         stage_cfg=stage_cfg,
+        dynamic_loss_weighter=dynamic_loss_weighter,
         max_batches=cfg.training.limit_val_batches,
     )
     print_metrics("Validation", metrics)

@@ -134,3 +134,118 @@
 - [x] Step 4: implement section-level corruptions.
 - [ ] Step 5: run a small smoke training/eval with mixed short + assembled data.
 - [ ] Step 6: expand corruption families only after the MVP path works.
+
+## 8. Cached Dataset / Ablation Base
+- [ ] Build one fixed clean/corrupted pair cache for teacher ablations:
+  - encoded clean/corrupted JSON
+  - rendered clean/corrupted MIDI where needed
+  - cached TeacherGNN `HeteroData` objects
+  - manifest metadata with applied/attempted/skipped corruption modes
+- [ ] Use the same cache for comparable experiments whenever graph schema/features do not change.
+- [ ] Do not rebuild cache for pure training changes:
+  - optimizer / learning rate / scheduler
+  - fixed or dynamic loss weights
+  - SAGE vs HGT if node/edge schema is unchanged
+  - logit fusion if it only uses existing graph/node embeddings and logits
+- [ ] Rebuild cache only when changing:
+  - source JSON / assembled dataset
+  - corruption list or corruption parameters
+  - graph schema, node features, edge types
+  - `build_graph_from_encoded`
+  - MIDI renderer if observer MIDI cache depends on it
+
+## 9. Dynamic Loss Weights
+- [x] Add optional dynamic weighting for active teacher objectives:
+  - `recon_loss`
+  - `rank_loss`
+  - `note_local_loss`
+  - `chord_local_loss`
+  - `onset_local_loss`
+- [x] Keep current fixed `lambda_*` behavior as the default baseline.
+- [x] Implement a config switch, for example:
+  - `losses.dynamic_weighting.enabled`
+  - `losses.dynamic_weighting.method: uncertainty`
+  - `losses.dynamic_weighting.init_log_var`
+  - `losses.dynamic_weighting.min_log_var`
+  - `losses.dynamic_weighting.max_log_var`
+- [x] Use learnable log-variance / uncertainty weights over enabled objectives.
+- [x] Treat existing `lambda_*` values as base multipliers, so dynamic weighting changes relative scale without deleting current priors.
+- [x] Save and restore dynamic-weight parameters in checkpoints.
+- [x] Log effective weights every epoch:
+  - `dynamic_weight_recon`
+  - `dynamic_weight_graph_rank`
+  - `dynamic_weight_note_local`
+  - `dynamic_weight_chord_local`
+  - `dynamic_weight_onset_local`
+  - matching `dynamic_log_var_*`
+- [x] Add tests:
+  - disabled mode reproduces fixed weighted sum
+  - enabled mode produces trainable parameters
+  - checkpoint roundtrip restores dynamic weights
+- [ ] Run ablation on the same fixed cache:
+  - fixed loss weights
+  - dynamic loss weights
+  - dynamic weights with and without reconstruction stage
+
+## 10. HGT Backend
+- [ ] Add an optional HGT backbone alongside the current TeacherGNN baseline.
+- [ ] Keep current backbone as the default, for example:
+  - `model.backbone: sage`
+  - `model.backbone: hgt`
+- [ ] Reuse existing per-node-type encoders and graph outputs:
+  - graph score head
+  - reconstruction heads
+  - local note/chord/onset heads
+- [ ] Implement HGT message passing over current heterogeneous metadata:
+  - node types from `HeteroData`
+  - edge types including section hierarchy edges
+  - configurable `hidden_dim`, `num_layers`, `num_heads`, dropout
+- [ ] Verify HGT works for both graph cases:
+  - old short clips with one dummy section
+  - assembled multi-section songs with real section spans
+- [ ] Keep SAGE and HGT output contracts identical so all existing losses and cached datasets still work.
+- [ ] Add tests:
+  - forward pass on dummy-section graph
+  - forward pass on real-section graph
+  - output keys/shapes match the current TeacherGNN contract
+- [ ] Run ablation on the same fixed cache:
+  - SAGE baseline
+  - HGT same hidden size
+  - HGT larger model if memory allows
+
+## 11. Logit Fusion
+- [ ] Add optional learned fusion of scoring signals without replacing the baseline graph scorer.
+- [ ] Keep current graph score as a component logit:
+  - `graph_score_base`
+  - final `graph_score`
+- [ ] Fuse existing signals that are already available from the model:
+  - base graph logit
+  - summarized note local logits
+  - summarized chord local logits
+  - summarized onset local logits
+  - optional section-level summary later, if section local heads are added
+- [ ] Make fusion configurable, for example:
+  - `model.score_fusion_mode: none`
+  - `model.score_fusion_mode: learned_logit_fusion`
+  - `model.score_fusion_hidden_dim`
+- [ ] Train fusion with the same clean-vs-corrupted ranking/binary losses.
+- [ ] Log component scores for diagnostics:
+  - base graph logit mean
+  - local summary logits
+  - final fused graph logit
+  - clean/corrupted margin per component
+- [ ] Add tests:
+  - fusion disabled reproduces current `graph_score`
+  - fusion enabled returns the same public output keys
+  - rank loss consumes fused `graph_score`
+- [ ] Run ablation on the same fixed cache:
+  - base graph score only
+  - graph score + local-logit fusion
+  - HGT + fusion after HGT baseline is stable
+
+## 12. Updated Practical Order
+- [ ] Step 7: finish fixed section pair cache and smoke-train teacher from cached graphs.
+- [x] Step 8: implement dynamic loss weights first because it does not require cache rebuild.
+- [ ] Step 9: implement HGT backend with the same output contract.
+- [ ] Step 10: implement logit fusion after HGT/SAGE baselines are comparable.
+- [ ] Step 11: run ablations from one fixed cache and compare metrics.
