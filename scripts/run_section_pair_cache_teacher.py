@@ -63,6 +63,7 @@ def main() -> None:
             args.python,
             "-m",
             "src.observer.run_observer_pipeline",
+            "+run_name=section_pair_cache_build",
             f"dataloader={args.dataloader}",
             f"data.json_path={args.data_json}",
             f"observer_pipeline.output_root={args.output_root}",
