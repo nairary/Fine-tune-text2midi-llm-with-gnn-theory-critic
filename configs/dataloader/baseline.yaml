@@ -16,6 +16,8 @@ theory_aware:
   rhythm_shift_max_steps: 1
   deterministic_per_sample: false
   deterministic_seed: 0
+  corruption_family_weights: {}
+  corruption_mode_weights: {}
 corruption_modes:
   - note_sd_replacement
   - chord_root_replacement

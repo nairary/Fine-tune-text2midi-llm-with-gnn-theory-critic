@@ -16,6 +16,8 @@ theory_aware:
   balance_mode_usage: false
   deterministic_per_sample: true
   deterministic_seed: 123
+  corruption_family_weights: {}
+  corruption_mode_weights: {}
 pairs_per_song: 1
 pair_mode_strategy: first_applicable
 max_pairs_per_split_per_mode: null

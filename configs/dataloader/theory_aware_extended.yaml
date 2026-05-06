@@ -20,6 +20,8 @@ theory_aware:
   deterministic_per_sample: false
   # Базовый seed для deterministic_per_sample (итоговый seed = deterministic_seed + idx).
   deterministic_seed: 0
+  corruption_family_weights: {}
+  corruption_mode_weights: {}
 
 corruption_modes:
   # Меняет ноту на сильной доле так, чтобы она перестала быть аккордовым тоном.

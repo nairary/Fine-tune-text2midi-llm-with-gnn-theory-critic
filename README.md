@@ -442,6 +442,42 @@ section_exit_non_dominant_substitution
 
 Не надо перегенерировать старый `teacher_encoded.json` только из-за dummy sections: новая graph schema применяется при загрузке. Нужно заново собрать `outputs/assembled_sections/teacher_encoded_assembled_compact_gap.json`, если изменились `original_songs_timeline.json`, assembly-policy или код assembly.
 
+Автоматический запуск всех этих шагов:
+
+```bash
+python scripts/run_teacher_section_multistage.py \
+  --device cuda \
+  --render-assembled-midi-smoke
+```
+
+Скрипт делает audit timeline, собирает assembled JSON через `next_bar_gap`, нормализует `valid` -> `val` во временном training JSON, запускает Stage 1 -> Stage 2 -> Stage 3 и печатает финальный checkpoint. Stage-директории и временный mixed JSON лежат в `outputs/teacher_section_multistage/...`, если явно не передать `--run-root` или `--mixed-json`. По умолчанию веса семейств corruptions такие:
+
+- Stage 1: только local/theory corruptions;
+- Stage 2: `section=0.25`, `local=0.75`;
+- Stage 3: `section=0.20`, `local=0.80`.
+
+Эти веса задаются через `dataloader.theory_aware.corruption_family_weights` и применяются внутри mode balancer-а: вес семейства делится между modes этого семейства, после чего balancer старается держать target usage. Для другого mix:
+
+```bash
+python scripts/run_teacher_section_multistage.py \
+  --device cuda \
+  --stage2-section-weight 0.20 \
+  --stage2-local-weight 0.80 \
+  --stage3-section-weight 0.15 \
+  --stage3-local-weight 0.85
+```
+
+Быстрая проверка пайплайна без полного обучения:
+
+```bash
+python scripts/run_teacher_section_multistage.py \
+  --smoke \
+  --device cpu \
+  --run-root outputs/teacher_section_multistage_smoke
+```
+
+Если assembled JSON уже собран и его не нужно пересобирать, добавь `--skip-assembly`. Если хочешь остановиться после section fine-tune, добавь `--skip-stage3`.
+
 ### 5.2 Smoke test
 
 ```bash

@@ -14,6 +14,61 @@ from .theory_helpers import build_theory_context
 from .utils_graph import build_graph_from_encoded, corrupt_graph, mask_graph
 
 
+_SECTION_CORRUPTION_MODES = {
+    "adjacent_section_swap",
+    "non_adjacent_section_swap",
+    "section_duplicate",
+    "section_drop_keep_silence",
+    "section_drop_and_close_gap",
+    "section_entry_non_tonic_substitution",
+    "section_exit_non_dominant_substitution",
+}
+
+
+def _positive_float(value) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0.0 else None
+
+
+def _family_weight(config: dict, aliases: tuple[str, ...]) -> float | None:
+    for alias in aliases:
+        if alias in config:
+            return _positive_float(config.get(alias))
+    return None
+
+
+def _build_corruption_mode_weights(modes: Sequence[str], theory_aware_cfg: dict) -> dict[str, float] | None:
+    weights: dict[str, float] = {}
+
+    family_weights_cfg = theory_aware_cfg.get("corruption_family_weights")
+    if isinstance(family_weights_cfg, dict) and family_weights_cfg:
+        section_modes = [str(mode) for mode in modes if str(mode) in _SECTION_CORRUPTION_MODES]
+        local_modes = [str(mode) for mode in modes if str(mode) not in _SECTION_CORRUPTION_MODES]
+        section_weight = _family_weight(family_weights_cfg, ("section", "sections", "structural", "structure"))
+        local_weight = _family_weight(family_weights_cfg, ("local", "theory", "harmonic", "harmony"))
+
+        if section_modes:
+            section_weight = 1.0 if section_weight is None else section_weight
+            per_mode = section_weight / max(1, len(section_modes))
+            weights.update({mode: per_mode for mode in section_modes})
+        if local_modes:
+            local_weight = 1.0 if local_weight is None else local_weight
+            per_mode = local_weight / max(1, len(local_modes))
+            weights.update({mode: per_mode for mode in local_modes})
+
+    mode_weights_cfg = theory_aware_cfg.get("corruption_mode_weights")
+    if isinstance(mode_weights_cfg, dict) and mode_weights_cfg:
+        for mode in modes:
+            weight = _positive_float(mode_weights_cfg.get(mode))
+            if weight is not None:
+                weights[str(mode)] = weight
+
+    return weights or None
+
+
 class HookTheoryDataset(Dataset):
     def __init__(
         self,
@@ -40,7 +95,14 @@ class HookTheoryDataset(Dataset):
             and self.corruption_modes is not None
             and len(self.corruption_modes) > 1
         )
-        self.corruption_mode_balancer = CorruptionModeBalancer(self.corruption_modes or ()) if self.balance_mode_usage else None
+        mode_weights = (
+            _build_corruption_mode_weights(self.corruption_modes or (), self.theory_aware_cfg)
+            if self.balance_mode_usage
+            else None
+        )
+        self.corruption_mode_balancer = (
+            CorruptionModeBalancer(self.corruption_modes or (), mode_weights=mode_weights) if self.balance_mode_usage else None
+        )
         self.theory_ctx = build_theory_context() if self.corruption_backend == "song_theory" else None
 
         with open(self.json_path, "r", encoding="utf-8") as f:

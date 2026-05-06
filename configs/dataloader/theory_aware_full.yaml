@@ -15,6 +15,8 @@ theory_aware:
   balance_mode_usage: true
   deterministic_per_sample: false
   deterministic_seed: 123
+  corruption_family_weights: {}
+  corruption_mode_weights: {}
 corruption_modes:
   - strongbeat_nonchord_note
   - borrowed_melody_conflict
