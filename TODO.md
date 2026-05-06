@@ -1,85 +1,133 @@
 # TODO
 
-## 1. Structural Analysis Cache via AnalysisGNN
-- [ ] Add offline export from `song_theory` / encoded songs to `MusicXML` or another `partitura`-readable symbolic format.
-- [ ] Run `analysisgnn` offline over the exported scores and cache structural predictions.
-- [ ] Store compact per-song structural cache with:
-  - cadence onsets / spans / types / confidence
-  - phrase boundaries / spans / confidence
-  - optional local harmony fields: `localkey`, `romanNumeral`, `bass`, `inversion`
-- [ ] Version the cache by source-song hash, exporter version, and `analysisgnn` checkpoint version.
-- [ ] Add fallback behavior for songs where export or structural analysis fails.
+## 1. Timeline / Section Dataset Audit
+- [ ] Use `data/HTCanon/HK_processed/original_songs_timeline.json` as the source of original-song section grouping.
+- [ ] Validate that every `clip_song_id` in the timeline exists in `data/HTCanon/encoded_full/teacher_encoded.json`.
+- [ ] Build an audit report per `ori_uid`:
+  - ordered timeline segments
+  - section labels
+  - clip ids
+  - start/end seconds
+  - gap / overlap between neighboring segments
+  - split membership
+- [ ] Classify original songs into assembly buckets:
+  - `single_section`
+  - `safe_multisection`
+  - `small_gap`
+  - `large_gap`
+  - `small_overlap`
+  - `large_overlap`
+  - `mixed_split`
+- [ ] Decide conservative MVP filters:
+  - at least 2 sections
+  - single split only
+  - skip large overlaps
+  - either compact gaps or skip large gaps
+- [ ] Save summary metrics: number of usable originals, section label distribution, transition distribution, duration distribution.
 
-## 2. Cadence / Phrase-Aware Corruptions
-- [ ] Add cadence-targeted corruptions that sabotage structurally important endings instead of random chord positions.
-- [ ] Candidate cadence corruptions:
-  - `cadential_dominant_break`
-  - `final_tonic_substitution`
-  - `cadential_inversion_conflict`
-  - `leading_tone_resolution_break`
-- [ ] Add phrase-aware corruptions that target phrase boundaries or phrase endings.
-- [ ] Decide which phrase corruption family is musically stable enough to use in training:
-  - break end-of-phrase closure
-  - shift / blur boundary emphasis
-  - create harmonic carry-over across boundary
-- [ ] Use prediction confidence thresholds so weak `analysisgnn` phrase/cadence outputs do not pollute training data.
+## 2. Section-Aware Song Assembly
+- [ ] Build assembled encoded songs by grouping clips under the same `ori_uid`.
+- [ ] Sort clips by `segment_start_seconds`.
+- [ ] Start with compact concatenation:
+  - append sections back-to-back
+  - ignore real-time gaps in seconds
+  - do not insert silence/rests yet
+- [ ] Shift every event beat inside each clip into assembled-song coordinates.
+- [ ] Preserve traceability metadata:
+  - `ori_uid`
+  - source `clip_song_id`
+  - source section label(s)
+  - source start/end seconds
+  - assembled start/end beats
+  - source split
+- [ ] Add `meta.section_spans` to assembled songs.
+- [ ] Save assembled dataset separately from original clips.
+- [ ] Keep original short clips as the baseline dataset.
 
-## 3. Onset-Level Structural Prediction
-- [ ] Add explicit onset-level prediction tasks instead of using onset nodes only as intermediate graph structure.
-- [ ] First priority onset tasks:
-  - `cadence_flag`
-  - `phrase_boundary`
-- [ ] Optional later onset tasks:
-  - `cadence_type`
-  - local harmonic state at onset
-- [ ] Keep note-level modeling in parallel so onset aggregation does not wash out single bad-note events.
-- [ ] Add onset-level consistency / aggregation rules for harmony-sensitive predictions.
+## 3. Graph Schema: Add Section Hierarchy
+- [ ] Add a new graph hierarchy level:
+  - `song -> section -> musical events`
+- [ ] Add `section` nodes for assembled songs using `meta.section_spans`.
+- [ ] Add one dummy section for every old short clip without real section spans:
+  - label: `clip` or `unknown`
+  - span: whole song
+- [ ] Add section node features:
+  - section label id
+  - order index
+  - duration beats
+  - normalized start/end position
+  - optional source clip count
+- [ ] Add section edges:
+  - `song -> section`
+  - `section -> song`
+  - `section -> section_next`
+  - `section -> chord`
+  - `section -> note`
+  - optionally `section -> onset/beat` if those nodes exist
+- [ ] Keep existing song-level readout paths so the current model remains a stable baseline.
+- [ ] Add tests that old short clips still build graphs correctly with one dummy section.
 
-## 4. Dense Structural Supervision
-- [ ] Extend supervision beyond global `graph_score` and local corruption labels.
-- [ ] Treat cadence / phrase labels as train-time structural supervision, not as inference-time required inputs.
-- [ ] Distinguish two supervision families explicitly:
-  - local anomaly supervision: `note/chord/onset corrupted or not`
-  - structural supervision: `cadence / phrase / harmonic role`
-- [ ] Evaluate whether structural labels should be attached to `onset` nodes only or also summarized into `chord` nodes.
+## 4. Section-Level Corruptions
+- [ ] Add corruption targets at section and section-transition level.
+- [ ] First MVP corruption:
+  - `adjacent_section_swap`
+  - example: `verse -> pre-chorus -> chorus` becomes `verse -> chorus -> pre-chorus`
+- [ ] Add additional section corruptions after MVP:
+  - `non_adjacent_section_swap`
+  - `section_duplicate`
+  - `section_drop`
+  - `section_boundary_blur`
+  - `section_entry_chord_substitution`
+  - `section_exit_chord_substitution`
+- [ ] Preserve corruption metadata:
+  - corruption type
+  - affected section ids
+  - original labels
+  - original order
+  - new order
+  - boundary beats
+- [ ] Keep local chord/melody corruptions as a baseline.
+- [ ] Avoid generating section-level corruptions for songs with only one section.
 
-## 5. Observer Distillation Upgrade
-- [ ] Keep observer inference MIDI-only, but enrich observer training with privileged structural labels from offline cache.
-- [ ] Add observer auxiliary heads for:
-  - `cadence_flag` on onset
-  - `phrase_boundary` on onset
-- [ ] Train observer with combined objective:
-  - scalar teacher score regression
-  - pairwise clean-vs-corrupted rank loss
-  - auxiliary structural losses
-- [ ] Verify that cadence / phrase auxiliary tasks improve ranking quality instead of only adding task noise.
+## 5. Training Strategy
+- [ ] Use one graph schema for all data by always including section nodes.
+- [ ] Stage 1: pretrain on the main short-clip dataset:
+  - dummy section per clip
+  - existing local corruptions
+  - no dependence on real section labels
+- [ ] Stage 2: fine-tune on assembled multi-section data:
+  - real section nodes
+  - section-aware corruptions
+  - lower learning rate
+- [ ] Use mixed fine-tune batches to avoid forgetting:
+  - mostly assembled section data
+  - some original short clips
+  - some old local corruptions
+- [ ] Compare:
+  - short-only baseline
+  - assembled-only fine-tune
+  - mixed fine-tune
 
-## 6. HGT / Encoder Upgrade
-- [ ] Add configurable encoder backend switch:
-  - current `HeteroConv + SAGEConv`
-  - `HGT`
-- [ ] Benchmark `HGT` against current backbone before replacing the default.
-- [ ] Test `HGT` first where heterogeneity matters most:
-  - observer with onset structural heads
-  - teacher with richer structural supervision
-- [ ] Keep the current backbone as a stable baseline and fallback.
+## 6. Evaluation / Ablations
+- [ ] Track existing ranking metrics:
+  - pair rank accuracy
+  - clean-vs-corrupted score margin
+- [ ] Add section-specific metrics:
+  - section-swap detection success
+  - transition corruption success
+  - metrics grouped by transition label pair (`verse->chorus`, `pre-chorus->chorus`, etc.)
+- [ ] Check regression on old short-clip evaluation.
+- [ ] Ablate:
+  - no section nodes
+  - dummy section only
+  - real section nodes without section corruptions
+  - real section nodes with section corruptions
+  - mixed vs section-only fine-tuning
 
-## 7. Evaluation / Ablations
-- [ ] Add ablations to separate gains from:
-  - better corruptions
-  - structural labels
-  - onset-level tasks
-  - `HGT`
-- [ ] Track metrics that reflect structural improvements, not only scalar score fit:
-  - `pair_rank_acc`
-  - global clean-vs-corrupted separation
-  - cadence-targeted corruption success
-  - phrase-targeted corruption success
-- [ ] Compare observer performance with and without auxiliary cadence / phrase heads.
-
-## 8. Practical Order of Work
-- [ ] Step 1: build offline symbolic export and structural cache.
-- [ ] Step 2: add cadence-aware corruptions.
-- [ ] Step 3: add observer onset auxiliary heads for cadence.
-- [ ] Step 4: add phrase supervision only after cadence pipeline is stable.
-- [ ] Step 5: benchmark `HGT` as an optional encoder upgrade.
+## 7. Practical Order Of Work
+- [ ] Step 1: implement timeline audit script and reports.
+- [ ] Step 2: implement compact assembled-song builder with `meta.section_spans`.
+- [ ] Step 3: add dummy/real `section` nodes to graph construction.
+- [ ] Step 4: implement `adjacent_section_swap` corruption.
+- [ ] Step 5: run a small smoke training/eval with mixed short + assembled data.
+- [ ] Step 6: expand corruption families only after the MVP path works.

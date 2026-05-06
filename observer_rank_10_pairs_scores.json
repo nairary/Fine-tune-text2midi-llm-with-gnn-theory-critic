@@ -1,0 +1,208 @@
+{
+  "checkpoint": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/training/last.pt",
+  "count": 20,
+  "scores": [
+    3.163635015487671,
+    3.260542869567871,
+    3.855412006378174,
+    -27.39891242980957,
+    3.8554117679595947,
+    -28.111095428466797,
+    3.855412006378174,
+    -27.603904724121094,
+    3.16363525390625,
+    -27.59554100036621,
+    3.1636343002319336,
+    -28.472902297973633,
+    3.855412006378174,
+    3.7118890285491943,
+    3.177469253540039,
+    -28.639434814453125,
+    3.177469253540039,
+    -28.775482177734375,
+    5.329639434814453,
+    5.329638957977295
+  ],
+  "results": [
+    {
+      "index": 18,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/d_gwBnBbmGV::melody_omit_core_tone_conflict-pair-0::cbb825bdb4::clean.mid",
+      "key": 4,
+      "mode": "phrygian",
+      "score": 5.329639434814453,
+      "rank": 1,
+      "error": null
+    },
+    {
+      "index": 19,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/d_gwBnBbmGV::melody_omit_core_tone_conflict-pair-0::cbb825bdb4::corrupted.mid",
+      "key": 4,
+      "mode": "phrygian",
+      "score": 5.329638957977295,
+      "rank": 2,
+      "error": null
+    },
+    {
+      "index": 2,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/yZOxVPBNmdq::chord_onset_shift-pair-0::edae06038a::clean.mid",
+      "key": 0,
+      "mode": "major",
+      "score": 3.855412006378174,
+      "rank": 3,
+      "error": null
+    },
+    {
+      "index": 6,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/yZOxVPBNmdq::melody_semitone_add_clash-pair-0::9119c2194a::clean.mid",
+      "key": 0,
+      "mode": "major",
+      "score": 3.855412006378174,
+      "rank": 4,
+      "error": null
+    },
+    {
+      "index": 12,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/yZOxVPBNmdq::melody_omit_core_tone_conflict-pair-0::cbb825bdb4::clean.mid",
+      "key": 0,
+      "mode": "major",
+      "score": 3.855412006378174,
+      "rank": 5,
+      "error": null
+    },
+    {
+      "index": 4,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/yZOxVPBNmdq::melody_alteration_clash-pair-0::1d1321a8db::clean.mid",
+      "key": 0,
+      "mode": "major",
+      "score": 3.8554117679595947,
+      "rank": 6,
+      "error": null
+    },
+    {
+      "index": 13,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/yZOxVPBNmdq::melody_omit_core_tone_conflict-pair-0::cbb825bdb4::corrupted.mid",
+      "key": 0,
+      "mode": "major",
+      "score": 3.7118890285491943,
+      "rank": 7,
+      "error": null
+    },
+    {
+      "index": 1,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/QLgnvjEyg-V::melody_omit_core_tone_conflict-pair-0::cbb825bdb4::corrupted.mid",
+      "key": 0,
+      "mode": "minor",
+      "score": 3.260542869567871,
+      "rank": 8,
+      "error": null
+    },
+    {
+      "index": 14,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/wDpgvrlBgad::melody_semitone_add_clash-pair-0::9119c2194a::clean.mid",
+      "key": 7,
+      "mode": "major",
+      "score": 3.177469253540039,
+      "rank": 9,
+      "error": null
+    },
+    {
+      "index": 16,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/wDpgvrlBgad::melody_alteration_clash-pair-0::1d1321a8db::clean.mid",
+      "key": 7,
+      "mode": "major",
+      "score": 3.177469253540039,
+      "rank": 10,
+      "error": null
+    },
+    {
+      "index": 8,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/QLgnvjEyg-V::melody_semitone_add_clash-pair-0::9119c2194a::clean.mid",
+      "key": 0,
+      "mode": "minor",
+      "score": 3.16363525390625,
+      "rank": 11,
+      "error": null
+    },
+    {
+      "index": 0,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/QLgnvjEyg-V::melody_omit_core_tone_conflict-pair-0::cbb825bdb4::clean.mid",
+      "key": 0,
+      "mode": "minor",
+      "score": 3.163635015487671,
+      "rank": 12,
+      "error": null
+    },
+    {
+      "index": 10,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/QLgnvjEyg-V::melody_alteration_clash-pair-0::1d1321a8db::clean.mid",
+      "key": 0,
+      "mode": "minor",
+      "score": 3.1636343002319336,
+      "rank": 13,
+      "error": null
+    },
+    {
+      "index": 3,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/yZOxVPBNmdq::chord_onset_shift-pair-0::edae06038a::corrupted.mid",
+      "key": 0,
+      "mode": "major",
+      "score": -27.39891242980957,
+      "rank": 14,
+      "error": null
+    },
+    {
+      "index": 9,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/QLgnvjEyg-V::melody_semitone_add_clash-pair-0::9119c2194a::corrupted.mid",
+      "key": 0,
+      "mode": "minor",
+      "score": -27.59554100036621,
+      "rank": 15,
+      "error": null
+    },
+    {
+      "index": 7,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/yZOxVPBNmdq::melody_semitone_add_clash-pair-0::9119c2194a::corrupted.mid",
+      "key": 0,
+      "mode": "major",
+      "score": -27.603904724121094,
+      "rank": 16,
+      "error": null
+    },
+    {
+      "index": 5,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/yZOxVPBNmdq::melody_alteration_clash-pair-0::1d1321a8db::corrupted.mid",
+      "key": 0,
+      "mode": "major",
+      "score": -28.111095428466797,
+      "rank": 17,
+      "error": null
+    },
+    {
+      "index": 11,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/QLgnvjEyg-V::melody_alteration_clash-pair-0::1d1321a8db::corrupted.mid",
+      "key": 0,
+      "mode": "minor",
+      "score": -28.472902297973633,
+      "rank": 18,
+      "error": null
+    },
+    {
+      "index": 15,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/wDpgvrlBgad::melody_semitone_add_clash-pair-0::9119c2194a::corrupted.mid",
+      "key": 7,
+      "mode": "major",
+      "score": -28.639434814453125,
+      "rank": 19,
+      "error": null
+    },
+    {
+      "index": 17,
+      "midi_path": "/home/humtech/DIPLOMA/Fine-tune-text2midi-llm-with-gnn-theory-critic/outputs/fixed_corruption_pairs_v1/pairs/midi/val/wDpgvrlBgad::melody_alteration_clash-pair-0::1d1321a8db::corrupted.mid",
+      "key": 7,
+      "mode": "major",
+      "score": -28.775482177734375,
+      "rank": 20,
+      "error": null
+    }
+  ]
+}
