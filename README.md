@@ -398,6 +398,13 @@ Teacher обучается на encoded JSON. Он сам строит real/mask
 Default full-набор song-level corruptions для teacher-а лежит в `configs/config.yaml` и сейчас включает:
 
 ```text
+adjacent_section_swap
+non_adjacent_section_swap
+section_duplicate
+section_drop_keep_silence
+section_drop_and_close_gap
+section_entry_non_tonic_substitution
+section_exit_non_dominant_substitution
 strongbeat_nonchord_note
 borrowed_melody_conflict
 borrowed_kind_toggle_without_melody_change
@@ -408,13 +415,9 @@ melody_omit_core_tone_conflict
 inversion_bass_continuity_conflict
 note_onset_shift
 chord_onset_shift
-strong_weak_beat_flip
-duration_stretch_shrink_note
-duration_stretch_shrink_chord
-functional_progression_violation_strict
 ```
 
-Этот набор намеренно держит в train in-domain ошибки гармонии, мелодии, onset-ов и длительностей. `drop_note_from_onset` и `drop_chord_from_onset` лучше проверять отдельной ablation, потому что это topology-changing негативы и они могут стать слишком легким shortcut. OOD-набор (`out_of_key_note`, `local_semitone_fragment_shift`, `octave_leap_violation`, `semitone_from_bass_or_chord_tone`) вынесен в `configs/dataloader/theory_aware_ood.yaml`.
+Этот набор держит в train секционные перестановки/удаления/дублирования, ошибки входа/выхода секции, локальные ошибки гармонии, мелодии и onset-ов. `strong_weak_beat_flip`, duration-corruptions и `functional_progression_violation_strict` убраны из стандартного train-набора как слишком шумные. `drop_note_from_onset` и `drop_chord_from_onset` лучше проверять отдельной ablation, потому что это topology-changing негативы и они могут стать слишком легким shortcut. OOD-набор (`out_of_key_note`, `local_semitone_fragment_shift`, `octave_leap_violation`, `semitone_from_bass_or_chord_tone`) вынесен в `configs/dataloader/theory_aware_ood.yaml`.
 
 Benign / near-benign corruptions (`transpose_with_tonic_shift`, `merge_repeated_melody_notes`, `split_long_melody_note`, `melody_octave_shift`, `drop_tonic_seventh_on_strong_beat`) проверяются тестами из раздела 1 и могут запускаться явно через `dataloader.corruption_modes=[...]` или через `infer_teacher_score --modes ...`.
 
@@ -553,7 +556,7 @@ python -m src.training.train_teacher \
   training.init_checkpoint=$STAGE1_CKPT \
   training.init_checkpoint_strict=true \
   dataloader.batch_size=16 \
-  dataloader.corruption_modes='[adjacent_section_swap,non_adjacent_section_swap,section_duplicate,section_drop_keep_silence,section_drop_and_close_gap,section_entry_non_tonic_substitution,section_exit_non_dominant_substitution,strongbeat_nonchord_note,borrowed_melody_conflict,melody_semitone_add_clash,melody_suspension_clash,melody_alteration_clash,melody_omit_core_tone_conflict,inversion_bass_continuity_conflict,note_onset_shift,chord_onset_shift,strong_weak_beat_flip,duration_stretch_shrink_note,duration_stretch_shrink_chord,functional_progression_violation_strict]' \
+  dataloader.corruption_modes='[adjacent_section_swap,non_adjacent_section_swap,section_duplicate,section_drop_keep_silence,section_drop_and_close_gap,section_entry_non_tonic_substitution,section_exit_non_dominant_substitution,strongbeat_nonchord_note,borrowed_melody_conflict,borrowed_kind_toggle_without_melody_change,melody_semitone_add_clash,melody_suspension_clash,melody_alteration_clash,melody_omit_core_tone_conflict,inversion_bass_continuity_conflict,note_onset_shift,chord_onset_shift]' \
   optimizer.lr=1e-4 \
   training.epochs=120 \
   experiment.epochs=120 \
@@ -622,7 +625,7 @@ python -m src.training.train_teacher \
   training.init_checkpoint=$STAGE2_CKPT \
   training.init_checkpoint_strict=true \
   dataloader.batch_size=16 \
-  dataloader.corruption_modes='[adjacent_section_swap,non_adjacent_section_swap,section_duplicate,section_drop_keep_silence,section_drop_and_close_gap,section_entry_non_tonic_substitution,section_exit_non_dominant_substitution,strongbeat_nonchord_note,borrowed_melody_conflict,borrowed_kind_toggle_without_melody_change,melody_semitone_add_clash,melody_suspension_clash,melody_alteration_clash,melody_omit_core_tone_conflict,inversion_bass_continuity_conflict,note_onset_shift,chord_onset_shift,strong_weak_beat_flip,duration_stretch_shrink_note,duration_stretch_shrink_chord,functional_progression_violation_strict]' \
+  dataloader.corruption_modes='[adjacent_section_swap,non_adjacent_section_swap,section_duplicate,section_drop_keep_silence,section_drop_and_close_gap,section_entry_non_tonic_substitution,section_exit_non_dominant_substitution,strongbeat_nonchord_note,borrowed_melody_conflict,borrowed_kind_toggle_without_melody_change,melody_semitone_add_clash,melody_suspension_clash,melody_alteration_clash,melody_omit_core_tone_conflict,inversion_bass_continuity_conflict,note_onset_shift,chord_onset_shift]' \
   optimizer.lr=5e-5 \
   training.epochs=60 \
   experiment.epochs=60 \
@@ -785,7 +788,7 @@ python -m src.observer.run_observer_pipeline \
   observer_training.epochs=20 \
   dataloader.batch_size=8 \
   dataloader.pairs_per_song=1 \
-  dataloader.corruption_modes='[adjacent_section_swap,non_adjacent_section_swap,section_duplicate,section_drop_keep_silence,section_drop_and_close_gap,section_entry_non_tonic_substitution,section_exit_non_dominant_substitution,strongbeat_nonchord_note,borrowed_melody_conflict,note_onset_shift,strong_weak_beat_flip]' \
+  dataloader.corruption_modes='[adjacent_section_swap,non_adjacent_section_swap,section_duplicate,section_drop_keep_silence,section_drop_and_close_gap,section_entry_non_tonic_substitution,section_exit_non_dominant_substitution,strongbeat_nonchord_note,borrowed_melody_conflict,borrowed_kind_toggle_without_melody_change,melody_semitone_add_clash,melody_suspension_clash,melody_alteration_clash,melody_omit_core_tone_conflict,inversion_bass_continuity_conflict,note_onset_shift,chord_onset_shift]' \
   optimizer.lr=1e-3
 ```
 
@@ -1015,6 +1018,23 @@ python -m src.training.train_teacher \
 ```
 
 По умолчанию остается `model.backbone=sage`. Для HGT `model.hidden_dim` должен делиться на `model.hgt_num_heads`.
+
+Logit fusion включается отдельным флагом и не требует пересборки данных. В этом режиме модель считает базовый `graph_score_base` из graph embedding, агрегирует локальные note/chord/onset logits в `local_score_summaries`, а финальный `graph_score` учится как MLP над этими логитами:
+
+```bash
+python -m src.training.train_teacher \
+  data.json_path=outputs/teacher_section_multistage/20260506_161507_teacher_sections/prepared_data/teacher_encoded_mixed_short_assembled.json \
+  model.score_fusion_mode=learned_logit_fusion \
+  model.score_fusion_hidden_dim=64 \
+  training.mlm_ssl_epochs=0 \
+  training.corruption_epochs=50 \
+  training.epochs=50 \
+  experiment.epochs=50 \
+  device=cuda \
+  training.device=cuda
+```
+
+Для HGT + fusion добавь `model.backbone=hgt model.hgt_num_heads=4`. Диагностические поля `score_base_*` и `score_local_summary_*` сохраняются в `metrics.jsonl`.
 
 Кэш нужно пересобирать, если изменилось что-то из этого:
 

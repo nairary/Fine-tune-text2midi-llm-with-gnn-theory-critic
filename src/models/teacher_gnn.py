@@ -57,6 +57,8 @@ class TeacherGNN(nn.Module):
         local_context_mode: str = "mean",
         local_context_num_heads: int = 4,
         use_hybrid_graph_scorer: bool = False,
+        score_fusion_mode: str = "none",
+        score_fusion_hidden_dim: int | None = None,
         local_summary_use_mean: bool = True,
         local_summary_use_max: bool = True,
         local_summary_use_topk_mean: bool = False,
@@ -81,6 +83,7 @@ class TeacherGNN(nn.Module):
         self.local_context_mode = str(local_context_mode)
         self.local_context_num_heads = int(local_context_num_heads)
         self.use_hybrid_graph_scorer = bool(use_hybrid_graph_scorer)
+        self.score_fusion_mode = str(score_fusion_mode or "none")
         self.local_summary_use_mean = bool(local_summary_use_mean)
         self.local_summary_use_max = bool(local_summary_use_max)
         self.local_summary_use_topk_mean = bool(local_summary_use_topk_mean)
@@ -99,6 +102,10 @@ class TeacherGNN(nn.Module):
         if self.local_context_mode not in {"mean", "attention"}:
             raise ValueError(
                 f"Unsupported local_context_mode='{self.local_context_mode}'. Supported modes are 'mean' and 'attention'."
+            )
+        if self.score_fusion_mode not in {"none", "learned_logit_fusion"}:
+            raise ValueError(
+                f"Unsupported score_fusion_mode='{self.score_fusion_mode}'. Supported modes are 'none' and 'learned_logit_fusion'."
             )
 
         self.encoders = nn.ModuleDict(
@@ -171,11 +178,24 @@ class TeacherGNN(nn.Module):
             [self.local_summary_use_mean, self.local_summary_use_max, self.local_summary_use_topk_mean]
         )
         self.local_summary_dim = len(self.active_local_head_types) * self.local_summary_stats_count
-        graph_score_input_dim = self.pooling_output_dim + (self.local_summary_dim if self.use_hybrid_graph_scorer else 0)
+        graph_score_input_dim = (
+            self.pooling_output_dim
+            if self.score_fusion_mode == "learned_logit_fusion"
+            else self.pooling_output_dim + (self.local_summary_dim if self.use_hybrid_graph_scorer else 0)
+        )
         self.graph_score_head = GraphScoreHead(
             input_dim=graph_score_input_dim,
             hidden_dim=self.score_head_hidden_dim,
         )
+        self.score_fusion_head = None
+        if self.score_fusion_mode == "learned_logit_fusion":
+            self.score_fusion_hidden_dim = score_fusion_hidden_dim or self.score_head_hidden_dim
+            self.score_fusion_head = GraphScoreHead(
+                input_dim=1 + self.local_summary_dim,
+                hidden_dim=self.score_fusion_hidden_dim,
+            )
+        else:
+            self.score_fusion_hidden_dim = score_fusion_hidden_dim
 
     def encode_nodes(self, batch) -> Dict[str, torch.Tensor]:
         encoded = {}
@@ -386,22 +406,34 @@ class TeacherGNN(nn.Module):
         local_scores = self.compute_contextual_local_scores(batch, node_embeddings)
         graph_embedding, pooled_by_type = self.pool(node_embeddings=node_embeddings, batch_dict=batch_dict)
         local_score_summaries = self.summarize_local_scores(batch, local_scores, batch_dict)
-        if self.use_hybrid_graph_scorer:
+        if self.score_fusion_mode == "learned_logit_fusion":
+            graph_score_features = graph_embedding
+        elif self.use_hybrid_graph_scorer:
             graph_score_features = torch.cat([graph_embedding, local_score_summaries], dim=-1)
         else:
             graph_score_features = graph_embedding
         recon_logits = self.reconstruction_heads(node_embeddings)
-        graph_score = self.graph_score_head(graph_score_features)
+        graph_score_base = self.graph_score_head(graph_score_features)
+        graph_score_fusion_features = graph_score_features.new_zeros((graph_score_features.size(0), 0))
+        if self.score_fusion_mode == "learned_logit_fusion":
+            graph_score_base = self.graph_score_head(graph_embedding)
+            graph_score_fusion_features = torch.cat([graph_score_base.unsqueeze(-1), local_score_summaries], dim=-1)
+            graph_score = self.score_fusion_head(graph_score_fusion_features)
+            graph_score_features = graph_score_fusion_features
+        else:
+            graph_score = graph_score_base
 
         return {
             "node_embeddings": node_embeddings,
             "graph_embedding": graph_embedding,
             "graph_score": graph_score,
+            "graph_score_base": graph_score_base,
             "recon_logits": recon_logits,
             "local_scores": local_scores,
             "pooled_by_type": pooled_by_type,
             "local_score_summaries": local_score_summaries,
             "graph_score_features": graph_score_features,
+            "graph_score_fusion_features": graph_score_fusion_features,
         }
 
     @classmethod
@@ -429,6 +461,8 @@ class TeacherGNN(nn.Module):
         local_context_mode: str = "mean",
         local_context_num_heads: int = 4,
         use_hybrid_graph_scorer: bool = False,
+        score_fusion_mode: str = "none",
+        score_fusion_hidden_dim: int | None = None,
         local_summary_use_mean: bool = True,
         local_summary_use_max: bool = True,
         local_summary_use_topk_mean: bool = False,
@@ -460,6 +494,8 @@ class TeacherGNN(nn.Module):
             local_context_mode=local_context_mode,
             local_context_num_heads=local_context_num_heads,
             use_hybrid_graph_scorer=use_hybrid_graph_scorer,
+            score_fusion_mode=score_fusion_mode,
+            score_fusion_hidden_dim=score_fusion_hidden_dim,
             local_summary_use_mean=local_summary_use_mean,
             local_summary_use_max=local_summary_use_max,
             local_summary_use_topk_mean=local_summary_use_topk_mean,

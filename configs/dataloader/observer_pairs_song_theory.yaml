@@ -9,7 +9,6 @@ corruption_modes:
   - strongbeat_nonchord_note
   - borrowed_melody_conflict
   - note_onset_shift
-  - strong_weak_beat_flip
 theory_aware:
   strongbeat_min_duration: 1.0
   strongbeat_only: true

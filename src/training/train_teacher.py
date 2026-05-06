@@ -260,6 +260,8 @@ def build_model(sample_graph, model_cfg: DictConfig, losses_cfg: DictConfig) -> 
         local_context_mode=str(model_cfg.get("local_context_mode", "mean")),
         local_context_num_heads=int(model_cfg.get("local_context_num_heads", 4)),
         use_hybrid_graph_scorer=bool(model_cfg.use_hybrid_graph_scorer),
+        score_fusion_mode=str(model_cfg.get("score_fusion_mode", "none")),
+        score_fusion_hidden_dim=model_cfg.get("score_fusion_hidden_dim"),
         local_summary_use_mean=bool(model_cfg.local_summary_use_mean),
         local_summary_use_max=bool(model_cfg.local_summary_use_max),
         local_summary_use_topk_mean=bool(model_cfg.local_summary_use_topk_mean),
@@ -840,6 +842,14 @@ def print_metrics(prefix: str, metrics: Mapping[str, float]):
         "score_real_min",
         "score_corrupted_max",
         "score_gap_minmax",
+        "score_base_real_mean",
+        "score_base_corrupted_mean",
+        "score_base_mean_margin",
+        "score_base_rank_acc",
+        "score_local_summary_real_mean",
+        "score_local_summary_corrupted_mean",
+        "score_local_summary_mean_margin",
+        "score_local_summary_rank_acc",
     ]
     rendered = [f"{key}={metrics[key]:.4f}" for key in ordered_keys if key in metrics]
     LOGGER.info("%s: %s", prefix, ", ".join(rendered))

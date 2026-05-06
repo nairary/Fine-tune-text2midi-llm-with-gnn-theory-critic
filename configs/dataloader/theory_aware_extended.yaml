@@ -24,6 +24,20 @@ theory_aware:
   corruption_mode_weights: {}
 
 corruption_modes:
+  # Меняет местами две соседние секции.
+  - adjacent_section_swap
+  # Меняет местами две несоседние секции.
+  - non_adjacent_section_swap
+  # Дублирует секцию один или несколько раз.
+  - section_duplicate
+  # Удаляет секцию, оставляя на ее месте тишину.
+  - section_drop_keep_silence
+  # Удаляет секцию и закрывает временной разрыв.
+  - section_drop_and_close_gap
+  # Заменяет первый аккорд секции на не-тоническую функцию.
+  - section_entry_non_tonic_substitution
+  # Заменяет последний аккорд секции на не-доминантовую функцию.
+  - section_exit_non_dominant_substitution
   # Меняет ноту на сильной доле так, чтобы она перестала быть аккордовым тоном.
   - strongbeat_nonchord_note
   # Подставляет ноту, конфликтующую с borrowed-ладом аккорда.
@@ -44,11 +58,3 @@ corruption_modes:
   - note_onset_shift
   # Сдвигает onset аккорда на соседнюю позицию, ломая синхронизацию гармонии и мелодии.
   - chord_onset_shift
-  # Переносит ноту между сильной и слабой долей внутри такта.
-  - strong_weak_beat_flip
-  # Растягивает или сжимает длительность ноты.
-  - duration_stretch_shrink_note
-  # Растягивает или сжимает длительность аккорда.
-  - duration_stretch_shrink_chord
-  # Ломает функциональный T/PD/D-паттерн в триплете аккордов.
-  - functional_progression_violation_strict

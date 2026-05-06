@@ -34,11 +34,7 @@ LOCAL_THEORY_MODES = [
     "melody_omit_core_tone_conflict",
     "inversion_bass_continuity_conflict",
     "note_onset_shift",
-    "chord_onset_shift",
-    # "strong_weak_beat_flip",
-    # "duration_stretch_shrink_note",
-    # "duration_stretch_shrink_chord",
-    # "functional_progression_violation_strict",
+    "chord_onset_shift"
 ]
 
 SECTION_MODES = [
@@ -54,6 +50,7 @@ SECTION_MODES = [
 STAGE2_MODES = SECTION_MODES + [
     "strongbeat_nonchord_note",
     "borrowed_melody_conflict",
+    "borrowed_kind_toggle_without_melody_change",
     "melody_semitone_add_clash",
     "melody_suspension_clash",
     "melody_alteration_clash",
@@ -61,10 +58,6 @@ STAGE2_MODES = SECTION_MODES + [
     "inversion_bass_continuity_conflict",
     "note_onset_shift",
     "chord_onset_shift",
-    # "strong_weak_beat_flip",
-    # "duration_stretch_shrink_note",
-    # "duration_stretch_shrink_chord",
-    # "functional_progression_violation_strict",
 ]
 
 STAGE3_MODES = SECTION_MODES + LOCAL_THEORY_MODES

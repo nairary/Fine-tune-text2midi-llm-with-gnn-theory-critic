@@ -214,27 +214,27 @@
   - HGT larger model if memory allows
 
 ## 11. Logit Fusion
-- [ ] Add optional learned fusion of scoring signals without replacing the baseline graph scorer.
-- [ ] Keep current graph score as a component logit:
+- [x] Add optional learned fusion of scoring signals without replacing the baseline graph scorer.
+- [x] Keep current graph score as a component logit:
   - `graph_score_base`
   - final `graph_score`
-- [ ] Fuse existing signals that are already available from the model:
+- [x] Fuse existing signals that are already available from the model:
   - base graph logit
   - summarized note local logits
   - summarized chord local logits
   - summarized onset local logits
   - optional section-level summary later, if section local heads are added
-- [ ] Make fusion configurable, for example:
+- [x] Make fusion configurable, for example:
   - `model.score_fusion_mode: none`
   - `model.score_fusion_mode: learned_logit_fusion`
   - `model.score_fusion_hidden_dim`
-- [ ] Train fusion with the same clean-vs-corrupted ranking/binary losses.
-- [ ] Log component scores for diagnostics:
+- [x] Train fusion with the same clean-vs-corrupted ranking/binary losses.
+- [x] Log component scores for diagnostics:
   - base graph logit mean
   - local summary logits
   - final fused graph logit
   - clean/corrupted margin per component
-- [ ] Add tests:
+- [x] Add tests:
   - fusion disabled reproduces current `graph_score`
   - fusion enabled returns the same public output keys
   - rank loss consumes fused `graph_score`
@@ -247,5 +247,5 @@
 - [ ] Step 7: finish fixed section pair cache and smoke-train teacher from cached graphs.
 - [x] Step 8: implement dynamic loss weights first because it does not require cache rebuild.
 - [x] Step 9: implement HGT backend with the same output contract.
-- [ ] Step 10: implement logit fusion after HGT/SAGE baselines are comparable.
+- [x] Step 10: implement logit fusion after HGT/SAGE baselines are comparable.
 - [ ] Step 11: run ablations from one fixed cache and compare metrics.

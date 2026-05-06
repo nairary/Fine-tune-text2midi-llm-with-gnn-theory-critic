@@ -168,3 +168,38 @@ def test_compute_teacher_ssl_losses_penalizes_cross_track_clean_corrupted_invers
     assert metric_dict["rank_acc"].item() == pytest.approx(0.75)
     assert metric_dict["score_gap_minmax"].item() == pytest.approx(-1.5)
     assert loss_dict["inter_rank_loss"].item() > 0.0
+
+
+def test_compute_teacher_ssl_losses_logs_logit_fusion_component_metrics():
+    real_outputs = {
+        "graph_score": torch.tensor([2.0, 1.0], dtype=torch.float),
+        "graph_score_base": torch.tensor([0.5, 0.25], dtype=torch.float),
+        "local_score_summaries": torch.tensor([[1.0, 0.5], [0.25, 0.0]], dtype=torch.float),
+    }
+    corrupted_outputs = {
+        "graph_score": torch.tensor([0.0, -1.0], dtype=torch.float),
+        "graph_score_base": torch.tensor([0.0, -0.25], dtype=torch.float),
+        "local_score_summaries": torch.tensor([[0.0, -0.5], [-0.25, -0.5]], dtype=torch.float),
+        "local_scores": {
+            "note": torch.tensor([0.0, 0.0], dtype=torch.float),
+            "chord": torch.tensor([0.0, 0.0], dtype=torch.float),
+            "onset": torch.tensor([0.0, 0.0], dtype=torch.float),
+        },
+    }
+
+    loss_dict, metric_dict = compute_teacher_ssl_losses(
+        real_outputs=real_outputs,
+        corrupted_outputs=corrupted_outputs,
+        enable_recon=False,
+        enable_graph_rank=True,
+        enable_note_local=False,
+        enable_chord_local=False,
+        enable_onset_local=False,
+    )
+
+    assert torch.isfinite(loss_dict["loss"])
+    assert metric_dict["rank_acc"].item() == pytest.approx(1.0)
+    assert metric_dict["score_base_rank_acc"].item() == pytest.approx(1.0)
+    assert metric_dict["score_local_summary_rank_acc"].item() == pytest.approx(1.0)
+    assert "score_base_mean_margin" in metric_dict
+    assert "score_local_summary_mean_margin" in metric_dict

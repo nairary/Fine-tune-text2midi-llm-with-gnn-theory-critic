@@ -193,7 +193,7 @@ def compute_ranking_loss(
     else:
         rank_loss = _zero_like_reference(reference)
 
-    return {
+    metrics = {
         "rank_loss": rank_loss,
         "intra_rank_loss": intra_rank_loss,
         "inter_rank_loss": inter_rank_loss,
@@ -213,6 +213,41 @@ def compute_ranking_loss(
         "score_corrupted_max": score_corrupted.max().detach(),
         "score_gap_minmax": (score_real.min() - score_corrupted.max()).detach(),
     }
+
+    score_base_real = real_outputs.get("graph_score_base")
+    score_base_corrupted = corrupted_outputs.get("graph_score_base")
+    if isinstance(score_base_real, torch.Tensor) and isinstance(score_base_corrupted, torch.Tensor):
+        base_real = score_base_real.view(-1)
+        base_corrupted = score_base_corrupted.view(-1)
+        if base_real.shape == score_real.shape and base_corrupted.shape == score_corrupted.shape:
+            base_margin = base_real[:, None] - base_corrupted[None, :]
+            metrics.update(
+                {
+                    "score_base_real_mean": base_real.mean().detach(),
+                    "score_base_corrupted_mean": base_corrupted.mean().detach(),
+                    "score_base_mean_margin": base_margin.mean().detach(),
+                    "score_base_rank_acc": (base_margin > float(margin)).float().mean().detach(),
+                }
+            )
+
+    local_summary_real = real_outputs.get("local_score_summaries")
+    local_summary_corrupted = corrupted_outputs.get("local_score_summaries")
+    if isinstance(local_summary_real, torch.Tensor) and isinstance(local_summary_corrupted, torch.Tensor):
+        if local_summary_real.dim() == 2 and local_summary_corrupted.dim() == 2 and local_summary_real.size(-1) > 0:
+            summary_real = local_summary_real.mean(dim=-1)
+            summary_corrupted = local_summary_corrupted.mean(dim=-1)
+            if summary_real.shape == score_real.shape and summary_corrupted.shape == score_corrupted.shape:
+                summary_margin = summary_real[:, None] - summary_corrupted[None, :]
+                metrics.update(
+                    {
+                        "score_local_summary_real_mean": summary_real.mean().detach(),
+                        "score_local_summary_corrupted_mean": summary_corrupted.mean().detach(),
+                        "score_local_summary_mean_margin": summary_margin.mean().detach(),
+                        "score_local_summary_rank_acc": (summary_margin > float(margin)).float().mean().detach(),
+                    }
+                )
+
+    return metrics
 
 
 def _sample_clean_indices(
@@ -441,4 +476,9 @@ def compute_teacher_ssl_losses(
         "score_corrupted_max": rank_bundle["score_corrupted_max"] if enable_graph_rank else rank_bundle["score_corrupted_max"].new_tensor(0.0),
         "score_gap_minmax": rank_bundle["score_gap_minmax"] if enable_graph_rank else rank_bundle["score_gap_minmax"].new_tensor(0.0),
     }
+    for key, value in rank_bundle.items():
+        if key in loss_dict or key in metric_dict:
+            continue
+        if key.startswith("score_base_") or key.startswith("score_local_summary_"):
+            metric_dict[key] = value if enable_graph_rank else value.new_tensor(0.0)
     return loss_dict, metric_dict

@@ -22,6 +22,8 @@ model:
   local_context_mode: mean
   local_context_num_heads: 4
   use_hybrid_graph_scorer: true
+  score_fusion_mode: none
+  score_fusion_hidden_dim: null
   local_summary_use_mean: true
   local_summary_use_max: true
   local_summary_use_topk_mean: true
@@ -55,6 +57,13 @@ dataloader:
     corruption_family_weights: {}
     corruption_mode_weights: {}
   corruption_modes:
+  - adjacent_section_swap
+  - non_adjacent_section_swap
+  - section_duplicate
+  - section_drop_keep_silence
+  - section_drop_and_close_gap
+  - section_entry_non_tonic_substitution
+  - section_exit_non_dominant_substitution
   - strongbeat_nonchord_note
   - borrowed_melody_conflict
   - borrowed_kind_toggle_without_melody_change
@@ -65,10 +74,6 @@ dataloader:
   - inversion_bass_continuity_conflict
   - note_onset_shift
   - chord_onset_shift
-  - strong_weak_beat_flip
-  - duration_stretch_shrink_note
-  - duration_stretch_shrink_chord
-  - functional_progression_violation_strict
 training:
   epochs: 500
   mlm_ssl_epochs: null

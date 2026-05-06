@@ -77,6 +77,7 @@ def _build_model(
     local_context_mode: str = "mean",
     local_summary_use_topk_mean: bool = False,
     backbone: str = "sage",
+    score_fusion_mode: str = "none",
 ) -> TeacherGNN:
     return TeacherGNN.from_hetero_data(
         sample_graph,
@@ -93,6 +94,8 @@ def _build_model(
         local_context_mode=local_context_mode,
         local_context_num_heads=4,
         use_hybrid_graph_scorer=use_hybrid_graph_scorer,
+        score_fusion_mode=score_fusion_mode,
+        score_fusion_hidden_dim=8,
         local_summary_use_mean=True,
         local_summary_use_max=True,
         local_summary_use_topk_mean=local_summary_use_topk_mean,
@@ -126,6 +129,19 @@ def test_hgt_forward_shapes_match_teacher_output_contract():
     assert outputs["recon_logits"]["chord_root"].shape[0] == batch["chord"].x.size(0)
     assert outputs["local_score_summaries"].shape == (2, model.local_summary_dim)
     assert outputs["graph_score_features"].shape == (2, model.pooling_output_dim + model.local_summary_dim)
+
+
+def test_hgt_with_learned_logit_fusion_keeps_output_contract():
+    batch = Batch.from_data_list([_build_graph(), _build_graph()])
+    model = _build_model(batch, pooling_mode="mean_max", backbone="hgt", score_fusion_mode="learned_logit_fusion")
+
+    outputs = model(batch)
+
+    assert model.backbone_type == "hgt"
+    assert model.score_fusion_mode == "learned_logit_fusion"
+    assert outputs["graph_score"].shape == (2,)
+    assert outputs["graph_score_base"].shape == (2,)
+    assert outputs["graph_score_fusion_features"].shape == (2, 1 + model.local_summary_dim)
 
 
 def test_hgt_rejects_hidden_dim_not_divisible_by_heads():
@@ -191,6 +207,38 @@ def test_hybrid_on_expands_graph_score_features():
 
     expected_dim = model.pooling_output_dim + model.local_summary_dim
     assert outputs["graph_score_features"].shape == (2, expected_dim)
+
+
+def test_score_fusion_disabled_exposes_final_score_as_base_score():
+    batch = Batch.from_data_list([_build_graph(), _build_graph()])
+    model = _build_model(batch, pooling_mode="mean", use_hybrid_graph_scorer=False, score_fusion_mode="none")
+
+    outputs = model(batch)
+
+    assert outputs["graph_score"].shape == (2,)
+    assert torch.allclose(outputs["graph_score"], outputs["graph_score_base"])
+    assert outputs["graph_score_fusion_features"].shape == (2, 0)
+    assert outputs["graph_score_features"].shape == outputs["graph_embedding"].shape
+
+
+def test_learned_logit_fusion_uses_base_logit_and_local_summary_features():
+    batch = Batch.from_data_list([_build_graph(), _build_graph()])
+    model = _build_model(
+        batch,
+        pooling_mode="mean_max",
+        use_hybrid_graph_scorer=True,
+        local_summary_use_topk_mean=True,
+        score_fusion_mode="learned_logit_fusion",
+    )
+
+    outputs = model(batch)
+
+    assert outputs["graph_score"].shape == (2,)
+    assert outputs["graph_score_base"].shape == (2,)
+    assert outputs["graph_score_fusion_features"].shape == (2, 1 + model.local_summary_dim)
+    assert outputs["graph_score_features"].shape == outputs["graph_score_fusion_features"].shape
+    assert torch.allclose(outputs["graph_score_fusion_features"][:, 0], outputs["graph_score_base"])
+    assert torch.allclose(outputs["graph_score_fusion_features"][:, 1:], outputs["local_score_summaries"])
 
 
 def test_local_context_attention_emits_local_scores_and_hybrid_features():

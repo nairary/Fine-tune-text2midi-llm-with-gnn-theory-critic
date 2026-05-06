@@ -20,6 +20,8 @@ local_context_mode: mean
 local_context_num_heads: 4
 
 use_hybrid_graph_scorer: false
+score_fusion_mode: none
+score_fusion_hidden_dim: null
 local_summary_use_mean: true
 local_summary_use_max: true
 local_summary_use_topk_mean: false

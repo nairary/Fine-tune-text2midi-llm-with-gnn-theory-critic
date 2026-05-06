@@ -215,6 +215,8 @@ def load_model_from_config_and_checkpoint(
         local_context_mode=str(cfg.model.get("local_context_mode", "mean")),
         local_context_num_heads=int(cfg.model.get("local_context_num_heads", 4)),
         use_hybrid_graph_scorer=bool(cfg.model.use_hybrid_graph_scorer),
+        score_fusion_mode=str(cfg.model.get("score_fusion_mode", "none")),
+        score_fusion_hidden_dim=cfg.model.get("score_fusion_hidden_dim"),
         local_summary_use_mean=bool(cfg.model.local_summary_use_mean),
         local_summary_use_max=bool(cfg.model.local_summary_use_max),
         local_summary_use_topk_mean=bool(cfg.model.local_summary_use_topk_mean),
