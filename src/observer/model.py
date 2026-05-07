@@ -96,6 +96,7 @@ class ObserverGNN(nn.Module):
             self.conv_norms.append(nn.ModuleDict({node_type: nn.LayerNorm(self.hidden_dim) for node_type in self.node_types}))
 
         pool_out_dim = pooling_output_dim or self.hidden_dim
+        self.pooling_output_dim = int(pool_out_dim)
         self.pool = MultiTypeMeanPooling(
             hidden_dim=self.hidden_dim,
             node_types=self.node_types,
@@ -134,9 +135,16 @@ class ObserverGNN(nn.Module):
                 out[node_type] = torch.zeros(node_store.num_nodes, dtype=torch.long, device=node_store.x.device)
         return out
 
-    def forward(self, batch) -> torch.Tensor:
+    def forward(self, batch, *, return_outputs: bool = False):
         x_dict = self.featurizer(batch)
         x_dict = self.backbone(x_dict, batch.edge_index_dict)
         batch_dict = self._get_batch_dict(batch)
-        pooled, _ = self.pool(x_dict, batch_dict)
-        return self.graph_head(pooled).squeeze(-1)
+        graph_embedding, pooled_by_type = self.pool(x_dict, batch_dict)
+        score = self.graph_head(graph_embedding).squeeze(-1)
+        if not return_outputs:
+            return score
+        return {
+            "score": score,
+            "graph_embedding": graph_embedding,
+            "pooled_by_type": pooled_by_type,
+        }

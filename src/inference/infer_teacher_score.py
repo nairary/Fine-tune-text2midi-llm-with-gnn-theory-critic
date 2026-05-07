@@ -123,7 +123,13 @@ def build_model_from_config(
 
 
 @torch.no_grad()
-def score_song(model: TeacherGNN, song_obj: dict[str, Any], device: torch.device) -> dict[str, Any]:
+def score_song(
+    model: TeacherGNN,
+    song_obj: dict[str, Any],
+    device: torch.device,
+    *,
+    include_intermediates: bool = False,
+) -> dict[str, Any]:
     graph = build_graph_from_encoded(song_obj)
     batch = Batch.from_data_list([graph]).to(device)
     outputs = model(batch)
@@ -135,6 +141,19 @@ def score_song(model: TeacherGNN, song_obj: dict[str, Any], device: torch.device
     summaries = outputs.get("local_score_summaries")
     if summaries is not None and summaries.numel() > 0:
         result["local_score_summaries"] = summaries[0].detach().cpu().tolist()
+
+    if include_intermediates:
+        graph_embedding = outputs.get("graph_embedding")
+        if graph_embedding is not None and graph_embedding.numel() > 0:
+            result["graph_embedding"] = graph_embedding[0].detach().cpu().tolist()
+
+        pooled_by_type = outputs.get("pooled_by_type") or {}
+        if pooled_by_type:
+            result["pooled_by_type"] = {
+                str(node_type): pooled[0].detach().cpu().tolist()
+                for node_type, pooled in pooled_by_type.items()
+                if pooled is not None and pooled.numel() > 0
+            }
 
     return result
 

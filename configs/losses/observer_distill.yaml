@@ -1,5 +1,11 @@
 lambda_reg: 1.0
 lambda_rank: 0.5
+lambda_score_distill: 1.0
+lambda_margin_distill: 0.5
+lambda_graph_embedding_distill: 0.0
+lambda_node_type_embedding_distill: 0.0
+lambda_local_summary_distill: 0.0
+embedding_distill_loss: mse
 min_teacher_gap_for_rank: 0.25
 use_pair_rank: true
 use_batch_rank: true

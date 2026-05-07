@@ -4,6 +4,7 @@ seed: 42
 device: cpu
 teacher_checkpoint: models/best_rank_acc.pt
 teacher_config: configs/config.yaml
+cache_teacher_intermediates: false
 chord_weights_yaml: null
 chord_instrument_name: chords
 use_fallback_44: true

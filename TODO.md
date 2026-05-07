@@ -243,9 +243,42 @@
   - graph score + local-logit fusion
   - HGT + fusion after HGT baseline is stable
 
-## 12. Updated Practical Order
+## 12. Observer Distillation Improvements
+- [x] Improve distillation from TeacherGNN into the lightweight observer.
+- [x] Keep current scalar-score distillation as the baseline:
+  - clean/corrupted teacher score
+  - teacher score margin
+  - binary clean-vs-corrupted target
+- [x] Add intermediate-representation distillation from teacher to observer:
+  - graph-level embedding after teacher pooling
+  - optional per-node-type pooled embeddings (`song`, `section`, `bar`, `onset`, `note`, `chord`)
+  - optional local-head summary logits for note/chord/onset corruption signals
+- [x] Add projection heads when teacher and observer hidden dimensions differ.
+- [x] Use detached teacher features saved during target/cache generation so observer training does not run TeacherGNN online.
+- [x] Make distillation losses configurable:
+  - `losses.lambda_score_distill`
+  - `losses.lambda_margin_distill`
+  - `losses.lambda_graph_embedding_distill`
+  - `losses.lambda_node_type_embedding_distill`
+  - `losses.lambda_local_summary_distill`
+- [x] Start with MSE/cosine losses for cached continuous embeddings and local-summary targets.
+- [ ] Add KL/BCE-style losses later if observer starts distilling full teacher class logits.
+- [x] Log distillation metrics separately from observer task metrics:
+  - score distillation loss
+  - margin distillation loss
+  - graph embedding distillation loss
+  - node-type embedding distillation loss
+  - local summary distillation loss
+- [ ] Ablate observer training:
+  - labels only
+  - scalar teacher-score distillation
+  - scalar + graph embedding distillation
+  - scalar + graph/node-type/local-summary distillation
+
+## 13. Updated Practical Order
 - [ ] Step 7: finish fixed section pair cache and smoke-train teacher from cached graphs.
 - [x] Step 8: implement dynamic loss weights first because it does not require cache rebuild.
 - [x] Step 9: implement HGT backend with the same output contract.
 - [x] Step 10: implement logit fusion after HGT/SAGE baselines are comparable.
 - [ ] Step 11: run ablations from one fixed cache and compare metrics.
+- [ ] Step 12: improve observer distillation with cached intermediate teacher representations.

@@ -102,18 +102,20 @@ def build_graph_cache(cfg: DictConfig) -> None:
             graph_path = split_graph_dir / f"{sample_id}.pt"
             graph_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(graph, graph_path)
-            rows.append(
-                {
-                    "sample_id": sample_id,
-                    "pair_group_id": target_row.get("pair_group_id"),
-                    "source_song_id": target_row.get("source_song_id"),
-                    "split": split,
-                    "is_corrupted": bool(target_row.get("is_corrupted", False)),
-                    "corruption_name": target_row.get("corruption_name", "identity"),
-                    "teacher_score": teacher_score,
-                    "graph_path": str(graph_path),
-                }
-            )
+            index_row = {
+                "sample_id": sample_id,
+                "pair_group_id": target_row.get("pair_group_id"),
+                "source_song_id": target_row.get("source_song_id"),
+                "split": split,
+                "is_corrupted": bool(target_row.get("is_corrupted", False)),
+                "corruption_name": target_row.get("corruption_name", "identity"),
+                "teacher_score": teacher_score,
+                "graph_path": str(graph_path),
+            }
+            for key in ("teacher_graph_embedding", "teacher_pooled_by_type", "teacher_local_score_summaries"):
+                if key in target_row:
+                    index_row[key] = target_row[key]
+            rows.append(index_row)
         _write_jsonl(split_index_path, sorted(rows, key=lambda x: str(x["sample_id"])))
         LOGGER.info("Graph cache split=%s built=%d skipped=%d", split, len(rows), skipped)
 

@@ -27,6 +27,7 @@ class ObserverPairCachedDataset(Dataset):
 
         self.pair_rows = self._read_jsonl(Path(pair_target_index_jsonl)) if Path(pair_target_index_jsonl).exists() else []
         self._validate_graph_rows()
+        self.distillation_target_dims = self._infer_distillation_target_dims()
         if self.mode == "pair":
             self._validate_pair_rows()
 
@@ -48,7 +49,52 @@ class ObserverPairCachedDataset(Dataset):
             graph_path = Path(str(row.get("graph_path", "")))
             if not graph_path.exists():
                 raise ValueError(f"Missing graph file for sample_id='{sample_id}': {graph_path}")
-            
+
+    @staticmethod
+    def _vector_dim(value: Any) -> int | None:
+        if not isinstance(value, list) or not value:
+            return None
+        try:
+            for item in value:
+                scalar = float(item)
+                if not math.isfinite(scalar):
+                    return None
+        except (TypeError, ValueError):
+            return None
+        return len(value)
+
+    def _infer_distillation_target_dims(self) -> dict[str, Any]:
+        dims: dict[str, Any] = {
+            "teacher_graph_embedding": None,
+            "teacher_local_score_summaries": None,
+            "teacher_pooled_by_type": {},
+        }
+        pooled_dims: dict[str, int] = {}
+        for row in self.graph_rows:
+            if dims["teacher_graph_embedding"] is None:
+                dims["teacher_graph_embedding"] = self._vector_dim(row.get("teacher_graph_embedding"))
+            if dims["teacher_local_score_summaries"] is None:
+                dims["teacher_local_score_summaries"] = self._vector_dim(row.get("teacher_local_score_summaries"))
+
+            pooled = row.get("teacher_pooled_by_type")
+            if isinstance(pooled, dict):
+                for node_type, values in pooled.items():
+                    if str(node_type) in pooled_dims:
+                        continue
+                    dim = self._vector_dim(values)
+                    if dim is not None:
+                        pooled_dims[str(node_type)] = dim
+        dims["teacher_pooled_by_type"] = pooled_dims
+        return dims
+
+    @staticmethod
+    def _teacher_distillation_targets(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: row[key]
+            for key in ("teacher_graph_embedding", "teacher_pooled_by_type", "teacher_local_score_summaries")
+            if key in row
+        }
+
     def _validate_pair_rows(self) -> None:
         if not self.pair_rows:
             raise ValueError("Pair target index is empty for pair mode")
@@ -105,5 +151,7 @@ class ObserverPairCachedDataset(Dataset):
             "graph_corrupted": graph_corrupted,
             "teacher_score_clean": teacher_score_clean,
             "teacher_score_corrupted": teacher_score_corrupted,
+            "teacher_distill_clean": self._teacher_distillation_targets(clean_row),
+            "teacher_distill_corrupted": self._teacher_distillation_targets(corr_row),
             "pair_metadata": pair,
         }

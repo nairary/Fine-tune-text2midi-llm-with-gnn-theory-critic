@@ -88,6 +88,12 @@ class ObserverModelTests(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (1,))
         self.assertTrue(torch.isfinite(out).all())
 
+        outputs = model(batch, return_outputs=True)
+        self.assertEqual(tuple(outputs["score"].shape), (1,))
+        self.assertEqual(tuple(outputs["graph_embedding"].shape), (1, model.pooling_output_dim))
+        self.assertIn("song", outputs["pooled_by_type"])
+        self.assertTrue(torch.isfinite(outputs["graph_embedding"]).all())
+
 
 if __name__ == "__main__":
     unittest.main()

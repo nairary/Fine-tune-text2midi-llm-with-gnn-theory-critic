@@ -108,6 +108,7 @@ def build_pair_targets(cfg: DictConfig) -> None:
             encoded_song_root=None,
             split=split,
             device=str(cfg.observer_training.device),
+            include_intermediates=bool(cfg.observer_training.get("cache_teacher_intermediates", False)),
         )
         write_jsonl(split_targets, target_rows)
         built_pairs, skipped_pairs = _join_pair_targets(

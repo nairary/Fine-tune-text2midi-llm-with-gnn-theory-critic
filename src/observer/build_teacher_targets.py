@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
         help="Fallback root for encoded songs, resolved as <root>/<split>/<song_id>.json when field is absent.",
     )
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--include-intermediates",
+        action="store_true",
+        help="Store detached teacher graph/pool/local-summary features for observer distillation.",
+    )
     return parser.parse_args()
 
 
@@ -83,6 +88,44 @@ def _load_encoded_song(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _finite_float_vector(value: Any, *, field_name: str) -> list[float]:
+    if not isinstance(value, list):
+        raise TeacherTargetBuildError(f"Teacher intermediate '{field_name}' must be a list")
+    out: list[float] = []
+    for idx, item in enumerate(value):
+        try:
+            scalar = float(item)
+        except (TypeError, ValueError) as exc:
+            raise TeacherTargetBuildError(f"Teacher intermediate '{field_name}[{idx}]' is not numeric: {item!r}") from exc
+        if not math.isfinite(scalar):
+            raise TeacherTargetBuildError(f"Teacher intermediate '{field_name}[{idx}]' is not finite: {scalar}")
+        out.append(scalar)
+    return out
+
+
+def _copy_teacher_intermediates(row_out: dict[str, Any], score_payload: dict[str, Any]) -> None:
+    if "graph_embedding" in score_payload:
+        row_out["teacher_graph_embedding"] = _finite_float_vector(
+            score_payload["graph_embedding"],
+            field_name="graph_embedding",
+        )
+    if "local_score_summaries" in score_payload:
+        row_out["teacher_local_score_summaries"] = _finite_float_vector(
+            score_payload["local_score_summaries"],
+            field_name="local_score_summaries",
+        )
+
+    pooled_by_type = score_payload.get("pooled_by_type")
+    if pooled_by_type is None:
+        return
+    if not isinstance(pooled_by_type, dict):
+        raise TeacherTargetBuildError("Teacher intermediate 'pooled_by_type' must be a mapping")
+    row_out["teacher_pooled_by_type"] = {
+        str(node_type): _finite_float_vector(values, field_name=f"pooled_by_type.{node_type}")
+        for node_type, values in pooled_by_type.items()
+    }
+
+
 def build_teacher_targets(
     rows: list[dict[str, Any]],
     teacher_checkpoint: Path,
@@ -91,6 +134,7 @@ def build_teacher_targets(
     encoded_song_root: Path | None,
     split: str | None,
     device: str,
+    include_intermediates: bool = False,
 ) -> list[dict[str, Any]]:
     """Build offline teacher scalar targets.
 
@@ -137,7 +181,12 @@ def build_teacher_targets(
 
         encoded_path = _resolve_encoded_song_path(sample, encoded_song_field, encoded_song_root, split)
         encoded_song = _load_encoded_song(encoded_path)
-        score_payload = score_song(model, encoded_song, device_t)
+        score_payload = score_song(
+            model,
+            encoded_song,
+            device_t,
+            include_intermediates=bool(include_intermediates),
+        )
         teacher_score = float(score_payload["graph_score"])
         if not math.isfinite(teacher_score):
             raise TeacherTargetBuildError(f"Teacher score for song_id='{song_id}' is not finite: {teacher_score}")
@@ -151,6 +200,8 @@ def build_teacher_targets(
         for passthrough_key in ("sample_id", "midi_path", "tonic_pc", "mode_name", "is_corrupted", "corruption_name", "pair_group_id", "source_song_id", "tonal_group", "corruption_group", "is_valid_pair_for_rank"):
             if passthrough_key in sample:
                 row_out[passthrough_key] = sample[passthrough_key]
+        if include_intermediates:
+            _copy_teacher_intermediates(row_out, score_payload)
         out_rows.append(row_out)
     return out_rows
 
@@ -173,6 +224,7 @@ def main() -> None:
         encoded_song_root=args.encoded_song_root,
         split=args.split,
         device=args.device,
+        include_intermediates=bool(args.include_intermediates),
     )
     write_jsonl(args.output_jsonl, output_rows)
 

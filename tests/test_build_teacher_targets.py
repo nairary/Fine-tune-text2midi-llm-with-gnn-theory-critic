@@ -65,6 +65,45 @@ class BuildTeacherTargetsTests(unittest.TestCase):
         self.assertAlmostEqual(out_rows[0]["teacher_score"], 0.5)
         self.assertEqual(out_rows[0]["split"], "train")
 
+    def test_build_with_intermediate_distillation_targets(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            song_path = tmp / "s1.json"
+            song_path.write_text(json.dumps({"meta": {}, "melody": [], "chords": []}), encoding="utf-8")
+            cfg_path = tmp / "cfg.yaml"
+            ckpt_path = tmp / "ckpt.pt"
+            cfg_path.write_text("model: {}\n", encoding="utf-8")
+            ckpt_path.write_text("x", encoding="utf-8")
+
+            rows = [{"song_id": "s1", "encoded_song_path": str(song_path), "sample_id": "s1::clean"}]
+            score_payload = {
+                "graph_score": 0.5,
+                "graph_embedding": [0.1, 0.2],
+                "local_score_summaries": [0.3],
+                "pooled_by_type": {"song": [0.4, 0.5], "note": [0.6, 0.7]},
+            }
+
+            with patch("src.observer.build_teacher_targets.build_model_from_config", return_value=object()), patch(
+                "src.observer.build_teacher_targets.score_song", return_value=score_payload
+            ) as score_mock, patch("omegaconf.OmegaConf.load", return_value=object()):
+                out_rows = build_teacher_targets(
+                    rows=rows,
+                    teacher_checkpoint=ckpt_path,
+                    teacher_config=cfg_path,
+                    encoded_song_field="encoded_song_path",
+                    encoded_song_root=None,
+                    split="train",
+                    device="cpu",
+                    include_intermediates=True,
+                )
+
+        score_args, score_kwargs = score_mock.call_args
+        self.assertEqual(score_args[1], {"meta": {}, "melody": [], "chords": []})
+        self.assertTrue(score_kwargs["include_intermediates"])
+        self.assertEqual(out_rows[0]["teacher_graph_embedding"], [0.1, 0.2])
+        self.assertEqual(out_rows[0]["teacher_local_score_summaries"], [0.3])
+        self.assertEqual(out_rows[0]["teacher_pooled_by_type"]["song"], [0.4, 0.5])
+
     def test_missing_song_id_raises(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)

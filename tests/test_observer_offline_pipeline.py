@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.observer.build_observer_pair_dataset import build_pairs
 from src.observer.build_observer_pair_targets import PairTargetJoinError, _join_pair_targets, build_pair_targets
 from src.observer.cached_dataset import ObserverPairCachedDataset
-from src.observer.train_observer_distill import _collate_pairs, _run_epoch
+from src.observer.train_observer_distill import ObserverDistillationAdapters, _collate_pairs, _run_epoch
 
 
 def _write_json(path: Path, payload):
@@ -574,6 +574,59 @@ def test_sample_weighted_metrics_not_batch_weighted():
     assert metrics["reg_loss"] == pytest.approx(0.875)
     assert metrics["loss"] == pytest.approx(0.875)
     assert metrics["pair_rank_acc"] != metrics["pair_rank_acc"]  # nan
+
+
+def test_run_epoch_uses_cached_graph_embedding_distillation_targets():
+    class DummyDistillModel(torch.nn.Module):
+        def forward(self, batch, *, return_outputs: bool = False):
+            score = batch["song"].x_num.view(-1)
+            if not return_outputs:
+                return score
+            return {
+                "score": score,
+                "graph_embedding": torch.zeros((score.numel(), 2), dtype=torch.float, device=score.device),
+                "pooled_by_type": {},
+            }
+
+    items = []
+    for _ in range(2):
+        items.append(
+            {
+                "graph_clean": _tiny_graph(0.0),
+                "graph_corrupted": _tiny_graph(0.0),
+                "teacher_score_clean": 0.0,
+                "teacher_score_corrupted": 0.0,
+                "teacher_distill_clean": {"teacher_graph_embedding": [1.0, 1.0]},
+                "teacher_distill_corrupted": {"teacher_graph_embedding": [1.0, 1.0]},
+                "pair_metadata": {},
+            }
+        )
+
+    adapters = ObserverDistillationAdapters(
+        observer_graph_dim=2,
+        observer_node_dim=2,
+        target_dims={"teacher_graph_embedding": 2, "teacher_pooled_by_type": {}, "teacher_local_score_summaries": None},
+    )
+    metrics = _run_epoch(
+        DummyDistillModel(),
+        [_collate_pairs(items)],
+        optimizer=None,
+        device=torch.device("cpu"),
+        cfg_losses=OmegaConf.create(
+            {
+                "lambda_reg": 0.0,
+                "lambda_rank": 0.0,
+                "lambda_graph_embedding_distill": 1.0,
+                "lambda_node_type_embedding_distill": 0.0,
+                "lambda_local_summary_distill": 0.0,
+                "min_teacher_gap_for_rank": 0.25,
+                "use_pair_rank": False,
+            }
+        ),
+        adapters=adapters,
+    )
+    assert metrics["graph_embedding_distill_loss"] == pytest.approx(1.0)
+    assert metrics["loss"] == pytest.approx(1.0)
 
 
 def test_early_fail_on_empty_pairs(tmp_path: Path):
