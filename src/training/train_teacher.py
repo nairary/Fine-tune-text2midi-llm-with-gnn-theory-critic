@@ -15,6 +15,7 @@ from hydra.utils import get_original_cwd
 from omegaconf import DictConfig, OmegaConf
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.nn.parameter import is_lazy
 from torch.utils.data import DataLoader, Dataset, Subset
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -834,6 +835,9 @@ def load_model_weights_from_checkpoint(
         for key, value in state_dict.items():
             current_value = current_state.get(key)
             if current_value is None:
+                filtered_state[key] = value
+                continue
+            if is_lazy(current_value):
                 filtered_state[key] = value
                 continue
             if tuple(current_value.shape) != tuple(value.shape):
