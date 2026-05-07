@@ -104,6 +104,8 @@ class HookTheoryDataset(Dataset):
             CorruptionModeBalancer(self.corruption_modes or (), mode_weights=mode_weights) if self.balance_mode_usage else None
         )
         self.theory_ctx = build_theory_context() if self.corruption_backend == "song_theory" else None
+        self.return_masked_graph = True
+        self.return_corrupted_graph = True
 
         with open(self.json_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -118,16 +120,27 @@ class HookTheoryDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+    def set_stage_outputs(self, *, masked: bool = True, corrupted: bool = True) -> None:
+        self.return_masked_graph = bool(masked)
+        self.return_corrupted_graph = bool(corrupted)
+
     def __getitem__(self, idx):
         song_obj = self.data[idx]
         graph_real = build_graph_from_encoded(song_obj)
-        graph_masked, masked_labels = mask_graph(
-            graph_real,
-            mask_prob=self.mask_prob,
-            min_nodes_to_mask=self.mask_min_nodes,
-            optional_mask_field_prob=self.optional_mask_field_prob,
-        )
-        if self.corruption_backend == "song_theory":
+        if self.return_masked_graph:
+            graph_masked, masked_labels = mask_graph(
+                graph_real,
+                mask_prob=self.mask_prob,
+                min_nodes_to_mask=self.mask_min_nodes,
+                optional_mask_field_prob=self.optional_mask_field_prob,
+            )
+        else:
+            graph_masked, masked_labels = None, {}
+
+        if not self.return_corrupted_graph:
+            graph_corrupted = None
+            corruption_metadata = None
+        elif self.corruption_backend == "song_theory":
             per_sample_rng = random
             if self.deterministic_per_sample:
                 base_seed = int(self.theory_aware_cfg.get("deterministic_seed", 0))
@@ -167,6 +180,14 @@ class HookTheoryDataset(Dataset):
         return self.corruption_mode_balancer.usage_counts()
 
 
+def _batch_graphs(graphs):
+    if all(graph is None for graph in graphs):
+        return None
+    if any(graph is None for graph in graphs):
+        raise ValueError("Cannot collate a batch with mixed present/missing graph objects.")
+    return Batch.from_data_list(graphs)
+
+
 def collate_fn(batch):
     graphs_real = [item["graph_real"] for item in batch]
     graphs_masked = [item["graph_masked"] for item in batch]
@@ -177,8 +198,8 @@ def collate_fn(batch):
 
     return {
         "graph_real": Batch.from_data_list(graphs_real),
-        "graph_masked": Batch.from_data_list(graphs_masked),
-        "graph_corrupted": Batch.from_data_list(graphs_corrupted),
+        "graph_masked": _batch_graphs(graphs_masked),
+        "graph_corrupted": _batch_graphs(graphs_corrupted),
         "masked_labels": masked_labels,
         "corruption_metadata": corruption_metadata,
         "graph_score_label": score_labels,

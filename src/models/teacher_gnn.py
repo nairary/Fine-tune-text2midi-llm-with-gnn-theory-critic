@@ -197,6 +197,10 @@ class TeacherGNN(nn.Module):
         else:
             self.score_fusion_hidden_dim = score_fusion_hidden_dim
 
+    @property
+    def graph_score_uses_local_summary(self) -> bool:
+        return bool(self.use_hybrid_graph_scorer or self.score_fusion_mode == "learned_logit_fusion")
+
     def encode_nodes(self, batch) -> Dict[str, torch.Tensor]:
         encoded = {}
         for node_type in self.node_types:
@@ -255,6 +259,85 @@ class TeacherGNN(nn.Module):
         index_tensor = torch.tensor(indices, dtype=torch.long, device=embeddings.device)
         return embeddings.index_select(0, index_tensor).mean(dim=0)
 
+    @staticmethod
+    def _mean_indexed_embeddings(
+        source_embeddings: torch.Tensor,
+        source_indices: torch.Tensor,
+        target_indices: torch.Tensor,
+        num_targets: int,
+    ) -> torch.Tensor:
+        output = source_embeddings.new_zeros((int(num_targets), source_embeddings.size(-1)))
+        if num_targets <= 0 or source_embeddings.numel() == 0 or source_indices.numel() == 0 or target_indices.numel() == 0:
+            return output
+
+        source_indices = source_indices.to(device=source_embeddings.device, dtype=torch.long).view(-1)
+        target_indices = target_indices.to(device=source_embeddings.device, dtype=torch.long).view(-1)
+        valid = (
+            (source_indices >= 0)
+            & (source_indices < source_embeddings.size(0))
+            & (target_indices >= 0)
+            & (target_indices < int(num_targets))
+        )
+        if not bool(valid.any()):
+            return output
+
+        source_indices = source_indices[valid]
+        target_indices = target_indices[valid]
+        output.index_add_(0, target_indices, source_embeddings.index_select(0, source_indices))
+        counts = source_embeddings.new_zeros((int(num_targets), 1))
+        counts.index_add_(0, target_indices, source_embeddings.new_ones((target_indices.numel(), 1)))
+        return output / counts.clamp_min(1.0)
+
+    @classmethod
+    def _bidirectional_neighbor_mean(cls, edge_index: torch.Tensor, embeddings: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        if edge_index.numel() == 0:
+            return embeddings.new_zeros((int(num_nodes), embeddings.size(-1)))
+        src, dst = edge_index[0], edge_index[1]
+        source_indices = torch.cat([dst, src], dim=0)
+        target_indices = torch.cat([src, dst], dim=0)
+        return cls._mean_indexed_embeddings(embeddings, source_indices, target_indices, num_nodes)
+
+    @classmethod
+    def _edge_source_to_target_mean(
+        cls,
+        edge_index: torch.Tensor,
+        source_embeddings: torch.Tensor,
+        num_targets: int,
+    ) -> torch.Tensor:
+        if edge_index.numel() == 0:
+            return source_embeddings.new_zeros((int(num_targets), source_embeddings.size(-1)))
+        return cls._mean_indexed_embeddings(source_embeddings, edge_index[0], edge_index[1], num_targets)
+
+    @classmethod
+    def _edge_target_to_source_mean(
+        cls,
+        edge_index: torch.Tensor,
+        target_embeddings: torch.Tensor,
+        num_sources: int,
+    ) -> torch.Tensor:
+        if edge_index.numel() == 0:
+            return target_embeddings.new_zeros((int(num_sources), target_embeddings.size(-1)))
+        return cls._mean_indexed_embeddings(target_embeddings, edge_index[1], edge_index[0], num_sources)
+
+    @staticmethod
+    def _song_contexts_for(
+        node_type: str,
+        node_embeddings: Dict[str, torch.Tensor],
+        batch_dict: Dict[str, torch.Tensor],
+        num_nodes: int,
+    ) -> torch.Tensor:
+        song_embeddings = node_embeddings["song"]
+        output = song_embeddings.new_zeros((int(num_nodes), song_embeddings.size(-1)))
+        if num_nodes <= 0 or song_embeddings.size(0) == 0:
+            return output
+        graph_indices = batch_dict[node_type].to(device=song_embeddings.device, dtype=torch.long).view(-1)
+        if graph_indices.numel() == 0:
+            return output
+        valid = (graph_indices >= 0) & (graph_indices < song_embeddings.size(0))
+        clamped = graph_indices.clamp(min=0, max=max(0, song_embeddings.size(0) - 1))
+        contexts = song_embeddings.index_select(0, clamped)
+        return contexts * valid.to(dtype=contexts.dtype).unsqueeze(-1)
+
     def _aggregate_local_context(self, node_type: str, query_embeddings: torch.Tensor, slot_tensor: torch.Tensor) -> torch.Tensor:
         if self.local_context_mode == "attention":
             return self.local_context_attn[node_type](query_embeddings, slot_tensor)
@@ -300,6 +383,8 @@ class TeacherGNN(nn.Module):
     def compute_contextual_local_scores(self, batch, node_embeddings: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if not self.local_score_heads:
             return {}
+        if self.local_context_mode == "mean":
+            return self._compute_mean_contextual_local_scores(batch, node_embeddings)
 
         edge_maps = self._prepare_edge_maps(batch)
         batch_dict = self._get_batch_dict(batch)
@@ -361,29 +446,129 @@ class TeacherGNN(nn.Module):
 
         return contextual_scores
 
+    def _compute_mean_contextual_local_scores(self, batch, node_embeddings: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        batch_dict = self._get_batch_dict(batch)
+        contextual_scores: Dict[str, torch.Tensor] = {}
+
+        note_embeddings = node_embeddings["note"]
+        chord_embeddings = node_embeddings["chord"]
+        onset_embeddings = node_embeddings["onset"]
+        note_count = note_embeddings.size(0)
+        chord_count = chord_embeddings.size(0)
+        onset_count = onset_embeddings.size(0)
+
+        if "note" in self.local_score_heads:
+            note_neighbors = self._bidirectional_neighbor_mean(
+                batch[("note", "next_note", "note")].edge_index,
+                note_embeddings,
+                note_count,
+            )
+            note_onsets = self._edge_source_to_target_mean(
+                batch[("onset", "starts_note", "note")].edge_index,
+                onset_embeddings,
+                note_count,
+            )
+            note_chords = self._edge_source_to_target_mean(
+                batch[("chord", "covers_note", "note")].edge_index,
+                chord_embeddings,
+                note_count,
+            )
+            note_song_context = self._song_contexts_for("note", node_embeddings, batch_dict, note_count)
+            note_context = (note_embeddings + note_neighbors + note_onsets + note_chords + note_song_context) / 5.0
+            contextual_scores["note"] = self.local_score_heads["note"](note_context)
+
+        if "chord" in self.local_score_heads:
+            chord_neighbors = self._bidirectional_neighbor_mean(
+                batch[("chord", "next_chord", "chord")].edge_index,
+                chord_embeddings,
+                chord_count,
+            )
+            chord_notes = self._edge_target_to_source_mean(
+                batch[("chord", "covers_note", "note")].edge_index,
+                note_embeddings,
+                chord_count,
+            )
+            chord_onsets = self._edge_source_to_target_mean(
+                batch[("onset", "starts_chord", "chord")].edge_index,
+                onset_embeddings,
+                chord_count,
+            )
+            chord_song_context = self._song_contexts_for("chord", node_embeddings, batch_dict, chord_count)
+            chord_context = (chord_embeddings + chord_neighbors + chord_notes + chord_onsets + chord_song_context) / 5.0
+            contextual_scores["chord"] = self.local_score_heads["chord"](chord_context)
+
+        if "onset" in self.local_score_heads:
+            onset_neighbors = self._bidirectional_neighbor_mean(
+                batch[("onset", "next_onset", "onset")].edge_index,
+                onset_embeddings,
+                onset_count,
+            )
+            onset_notes = self._edge_target_to_source_mean(
+                batch[("onset", "starts_note", "note")].edge_index,
+                note_embeddings,
+                onset_count,
+            )
+            onset_chords = self._edge_target_to_source_mean(
+                batch[("onset", "starts_chord", "chord")].edge_index,
+                chord_embeddings,
+                onset_count,
+            )
+            onset_song_context = self._song_contexts_for("onset", node_embeddings, batch_dict, onset_count)
+            onset_context = (onset_embeddings + onset_notes + onset_chords + onset_neighbors + onset_song_context) / 5.0
+            contextual_scores["onset"] = self.local_score_heads["onset"](onset_context)
+
+        return contextual_scores
+
     def _summarize_type_scores(self, scores: torch.Tensor, batch_vector: torch.Tensor, num_graphs: int) -> torch.Tensor:
-        summary_rows = []
-        for graph_idx in range(num_graphs):
-            graph_mask = batch_vector == graph_idx
-            graph_scores = scores[graph_mask]
-            stats = []
-            if graph_scores.numel() == 0:
-                if self.local_summary_use_mean:
-                    stats.append(scores.new_zeros(()))
-                if self.local_summary_use_max:
-                    stats.append(scores.new_zeros(()))
-                if self.local_summary_use_topk_mean:
-                    stats.append(scores.new_zeros(()))
-            else:
-                if self.local_summary_use_mean:
-                    stats.append(graph_scores.mean())
-                if self.local_summary_use_max:
-                    stats.append(graph_scores.max())
-                if self.local_summary_use_topk_mean:
-                    top_k = min(self.local_summary_topk, graph_scores.numel())
-                    stats.append(torch.topk(graph_scores, k=top_k).values.mean())
-            summary_rows.append(torch.stack(stats, dim=0))
-        return torch.stack(summary_rows, dim=0)
+        scores = scores.view(-1)
+        batch_vector = batch_vector.to(device=scores.device, dtype=torch.long).view(-1)
+        stats = []
+        if scores.numel() == 0 or num_graphs <= 0:
+            return scores.new_zeros((int(num_graphs), self.local_summary_stats_count))
+
+        valid = (batch_vector >= 0) & (batch_vector < int(num_graphs))
+        valid_scores = scores[valid]
+        valid_batch = batch_vector[valid]
+
+        counts = scores.new_zeros((int(num_graphs),))
+        if valid_batch.numel() > 0:
+            counts.index_add_(0, valid_batch, scores.new_ones((valid_batch.numel(),)))
+
+        if self.local_summary_use_mean:
+            sums = scores.new_zeros((int(num_graphs),))
+            if valid_batch.numel() > 0:
+                sums.index_add_(0, valid_batch, valid_scores)
+            stats.append(sums / counts.clamp_min(1.0))
+
+        if self.local_summary_use_max:
+            max_values = scores.new_full((int(num_graphs),), float("-inf"))
+            if valid_batch.numel() > 0:
+                max_values.scatter_reduce_(0, valid_batch, valid_scores, reduce="amax", include_self=True)
+            stats.append(torch.where(counts > 0, max_values, scores.new_zeros((int(num_graphs),))))
+
+        if self.local_summary_use_topk_mean:
+            topk_means = scores.new_zeros((int(num_graphs),))
+            if valid_batch.numel() > 0:
+                order = torch.argsort(valid_batch)
+                sorted_batch = valid_batch.index_select(0, order)
+                sorted_scores = valid_scores.index_select(0, order)
+                counts_long = torch.bincount(sorted_batch, minlength=int(num_graphs))
+                max_count = int(counts_long.max().item()) if counts_long.numel() > 0 else 0
+                if max_count > 0:
+                    group_offsets = torch.cumsum(counts_long, dim=0) - counts_long
+                    expanded_offsets = torch.repeat_interleave(group_offsets, counts_long)
+                    positions = torch.arange(sorted_scores.numel(), device=scores.device, dtype=torch.long) - expanded_offsets
+                    score_matrix = scores.new_full((int(num_graphs), max_count), float("-inf"))
+                    score_matrix[sorted_batch, positions] = sorted_scores
+                    top_k = min(self.local_summary_topk, max_count)
+                    topk_values = torch.topk(score_matrix, k=top_k, dim=1).values
+                    finite_mask = torch.isfinite(topk_values)
+                    topk_sums = torch.where(finite_mask, topk_values, scores.new_zeros(())).sum(dim=1)
+                    topk_counts = counts_long.clamp(max=top_k).to(dtype=scores.dtype).clamp_min(1.0)
+                    topk_means = torch.where(counts_long > 0, topk_sums / topk_counts, topk_means)
+            stats.append(topk_means)
+
+        return torch.stack(stats, dim=-1)
 
     def summarize_local_scores(self, batch, local_scores: Dict[str, torch.Tensor], batch_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         num_graphs = self.pool._infer_num_graphs(batch_dict)
@@ -399,29 +584,54 @@ class TeacherGNN(nn.Module):
             summaries.append(self._summarize_type_scores(scores, batch_dict[node_type], num_graphs))
         return torch.cat(summaries, dim=-1)
 
-    def forward(self, batch):
+    def forward(
+        self,
+        batch,
+        *,
+        compute_recon: bool = True,
+        compute_graph_score: bool = True,
+        compute_local_scores: bool = True,
+    ):
         x_dict = self.encode_nodes(batch)
         node_embeddings = self.backbone(x_dict, batch.edge_index_dict)
         batch_dict = self._get_batch_dict(batch)
-        local_scores = self.compute_contextual_local_scores(batch, node_embeddings)
-        graph_embedding, pooled_by_type = self.pool(node_embeddings=node_embeddings, batch_dict=batch_dict)
-        local_score_summaries = self.summarize_local_scores(batch, local_scores, batch_dict)
-        if self.score_fusion_mode == "learned_logit_fusion":
-            graph_score_features = graph_embedding
-        elif self.use_hybrid_graph_scorer:
-            graph_score_features = torch.cat([graph_embedding, local_score_summaries], dim=-1)
+        num_graphs = self.pool._infer_num_graphs(batch_dict)
+        compute_local = bool(compute_local_scores or (compute_graph_score and self.graph_score_uses_local_summary))
+
+        local_scores = self.compute_contextual_local_scores(batch, node_embeddings) if compute_local else {}
+        local_score_summaries = (
+            self.summarize_local_scores(batch, local_scores, batch_dict)
+            if compute_local
+            else next(iter(node_embeddings.values())).new_zeros((num_graphs, self.local_summary_dim))
+        )
+
+        if compute_graph_score:
+            graph_embedding, pooled_by_type = self.pool(node_embeddings=node_embeddings, batch_dict=batch_dict)
+            if self.score_fusion_mode == "learned_logit_fusion":
+                graph_score_features = graph_embedding
+            elif self.use_hybrid_graph_scorer:
+                graph_score_features = torch.cat([graph_embedding, local_score_summaries], dim=-1)
+            else:
+                graph_score_features = graph_embedding
+            graph_score_base = self.graph_score_head(graph_score_features)
+            graph_score_fusion_features = graph_score_features.new_zeros((graph_score_features.size(0), 0))
+            if self.score_fusion_mode == "learned_logit_fusion":
+                graph_score_base = self.graph_score_head(graph_embedding)
+                graph_score_fusion_features = torch.cat([graph_score_base.unsqueeze(-1), local_score_summaries], dim=-1)
+                graph_score = self.score_fusion_head(graph_score_fusion_features)
+                graph_score_features = graph_score_fusion_features
+            else:
+                graph_score = graph_score_base
         else:
-            graph_score_features = graph_embedding
-        recon_logits = self.reconstruction_heads(node_embeddings)
-        graph_score_base = self.graph_score_head(graph_score_features)
-        graph_score_fusion_features = graph_score_features.new_zeros((graph_score_features.size(0), 0))
-        if self.score_fusion_mode == "learned_logit_fusion":
-            graph_score_base = self.graph_score_head(graph_embedding)
-            graph_score_fusion_features = torch.cat([graph_score_base.unsqueeze(-1), local_score_summaries], dim=-1)
-            graph_score = self.score_fusion_head(graph_score_fusion_features)
-            graph_score_features = graph_score_fusion_features
-        else:
-            graph_score = graph_score_base
+            reference = next(iter(node_embeddings.values()))
+            graph_embedding = reference.new_zeros((num_graphs, self.pooling_output_dim))
+            pooled_by_type = {}
+            graph_score = reference.new_zeros((num_graphs,))
+            graph_score_base = reference.new_zeros((num_graphs,))
+            graph_score_features = reference.new_zeros((num_graphs, 0))
+            graph_score_fusion_features = reference.new_zeros((num_graphs, 0))
+
+        recon_logits = self.reconstruction_heads(node_embeddings) if compute_recon else {}
 
         return {
             "node_embeddings": node_embeddings,

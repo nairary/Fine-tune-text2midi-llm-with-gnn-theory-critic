@@ -209,6 +209,153 @@ def test_hybrid_on_expands_graph_score_features():
     assert outputs["graph_score_features"].shape == (2, expected_dim)
 
 
+def _slow_mean_contextual_local_scores(model: TeacherGNN, batch: Batch, node_embeddings: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    edge_maps = model._prepare_edge_maps(batch)
+    batch_dict = model._get_batch_dict(batch)
+    song_embeddings = node_embeddings["song"]
+    zero = song_embeddings.new_zeros((song_embeddings.size(-1),))
+
+    def song_context_for(node_type: str, node_idx: int) -> torch.Tensor:
+        graph_idx = int(batch_dict[node_type][node_idx].item()) if batch_dict[node_type].numel() > 0 else 0
+        if 0 <= graph_idx < song_embeddings.size(0):
+            return song_embeddings[graph_idx]
+        return zero
+
+    contextual_scores = {}
+    if "note" in model.local_score_heads:
+        note_contexts = []
+        for idx in range(node_embeddings["note"].size(0)):
+            onset_idx = edge_maps["note_to_onset"][idx]
+            onset_emb = node_embeddings["onset"][onset_idx] if onset_idx is not None else zero
+            note_contexts.append(
+                torch.stack(
+                    [
+                        node_embeddings["note"][idx],
+                        model._gather_mean(node_embeddings["note"], edge_maps["note_neighbors"][idx], zero),
+                        onset_emb,
+                        model._gather_mean(node_embeddings["chord"], edge_maps["note_to_chords"][idx], zero),
+                        song_context_for("note", idx),
+                    ],
+                    dim=0,
+                ).mean(dim=0)
+            )
+        contextual_scores["note"] = model.local_score_heads["note"](torch.stack(note_contexts, dim=0))
+
+    if "chord" in model.local_score_heads:
+        chord_contexts = []
+        for idx in range(node_embeddings["chord"].size(0)):
+            onset_idx = edge_maps["chord_to_onset"][idx]
+            onset_emb = node_embeddings["onset"][onset_idx] if onset_idx is not None else zero
+            chord_contexts.append(
+                torch.stack(
+                    [
+                        node_embeddings["chord"][idx],
+                        model._gather_mean(node_embeddings["chord"], edge_maps["chord_neighbors"][idx], zero),
+                        model._gather_mean(node_embeddings["note"], edge_maps["chord_to_notes"][idx], zero),
+                        onset_emb,
+                        song_context_for("chord", idx),
+                    ],
+                    dim=0,
+                ).mean(dim=0)
+            )
+        contextual_scores["chord"] = model.local_score_heads["chord"](torch.stack(chord_contexts, dim=0))
+
+    if "onset" in model.local_score_heads:
+        onset_contexts = []
+        for idx in range(node_embeddings["onset"].size(0)):
+            onset_contexts.append(
+                torch.stack(
+                    [
+                        node_embeddings["onset"][idx],
+                        model._gather_mean(node_embeddings["note"], edge_maps["onset_to_notes"][idx], zero),
+                        model._gather_mean(node_embeddings["chord"], edge_maps["onset_to_chords"][idx], zero),
+                        model._gather_mean(node_embeddings["onset"], edge_maps["onset_neighbors"][idx], zero),
+                        song_context_for("onset", idx),
+                    ],
+                    dim=0,
+                ).mean(dim=0)
+            )
+        contextual_scores["onset"] = model.local_score_heads["onset"](torch.stack(onset_contexts, dim=0))
+    return contextual_scores
+
+
+def test_fast_mean_local_context_matches_reference_loop():
+    batch = Batch.from_data_list([_build_graph(note_count=5, chord_count=3, onset_count=4), _build_graph(note_count=4, chord_count=4, onset_count=3)])
+    model = _build_model(batch, pooling_mode="mean", use_hybrid_graph_scorer=True, local_context_mode="mean")
+    model.eval()
+
+    with torch.no_grad():
+        node_embeddings = model.backbone(model.encode_nodes(batch), batch.edge_index_dict)
+        fast_scores = model.compute_contextual_local_scores(batch, node_embeddings)
+        slow_scores = _slow_mean_contextual_local_scores(model, batch, node_embeddings)
+
+    assert set(fast_scores) == set(slow_scores)
+    for node_type in fast_scores:
+        assert torch.allclose(fast_scores[node_type], slow_scores[node_type], atol=1e-6)
+
+
+def test_fast_local_summary_matches_reference_loop():
+    batch = Batch.from_data_list([_build_graph(note_count=5), _build_graph(note_count=3), _build_graph(note_count=0)])
+    model = _build_model(batch, pooling_mode="mean", use_hybrid_graph_scorer=True, local_summary_use_topk_mean=True)
+    scores = torch.tensor([0.1, -0.3, 0.7, 0.4, 0.2, 2.0, -1.0, 0.5])
+
+    summary = model._summarize_type_scores(scores, batch["note"].batch, num_graphs=3)
+    expected_rows = []
+    for graph_idx in range(3):
+        graph_scores = scores[batch["note"].batch == graph_idx]
+        if graph_scores.numel() == 0:
+            expected_rows.append(torch.zeros(3))
+            continue
+        expected_rows.append(
+            torch.tensor(
+                [
+                    graph_scores.mean(),
+                    graph_scores.max(),
+                    torch.topk(graph_scores, k=min(model.local_summary_topk, graph_scores.numel())).values.mean(),
+                ]
+            )
+        )
+    expected = torch.stack(expected_rows, dim=0)
+
+    assert torch.allclose(summary, expected, atol=1e-6)
+
+
+def test_forward_can_skip_unused_heads_for_mlm_stage():
+    batch = Batch.from_data_list([_build_graph(), _build_graph()])
+    model = _build_model(batch, pooling_mode="mean", use_hybrid_graph_scorer=True)
+
+    outputs = model(batch, compute_recon=True, compute_graph_score=False, compute_local_scores=False)
+
+    assert outputs["recon_logits"]
+    assert outputs["local_scores"] == {}
+    assert outputs["graph_score"].shape == (2,)
+    assert torch.count_nonzero(outputs["graph_score"]).item() == 0
+    assert outputs["graph_score_features"].shape == (2, 0)
+
+
+def test_forward_skips_reconstruction_for_corruption_stage():
+    batch = Batch.from_data_list([_build_graph(), _build_graph()])
+    model = _build_model(batch, pooling_mode="mean", use_hybrid_graph_scorer=True)
+
+    outputs = model(batch, compute_recon=False, compute_graph_score=True, compute_local_scores=True)
+
+    assert outputs["recon_logits"] == {}
+    assert set(outputs["local_scores"]) == {"note", "chord", "onset"}
+    assert outputs["graph_score"].shape == (2,)
+    assert outputs["graph_score_features"].shape == (2, model.pooling_output_dim + model.local_summary_dim)
+
+
+def test_graph_score_forces_local_summary_when_hybrid_needs_it():
+    batch = Batch.from_data_list([_build_graph(), _build_graph()])
+    model = _build_model(batch, pooling_mode="mean", use_hybrid_graph_scorer=True)
+
+    outputs = model(batch, compute_recon=False, compute_graph_score=True, compute_local_scores=False)
+
+    assert outputs["recon_logits"] == {}
+    assert set(outputs["local_scores"]) == {"note", "chord", "onset"}
+    assert outputs["graph_score_features"].shape == (2, model.pooling_output_dim + model.local_summary_dim)
+
+
 def test_score_fusion_disabled_exposes_final_score_as_base_score():
     batch = Batch.from_data_list([_build_graph(), _build_graph()])
     model = _build_model(batch, pooling_mode="mean", use_hybrid_graph_scorer=False, score_fusion_mode="none")

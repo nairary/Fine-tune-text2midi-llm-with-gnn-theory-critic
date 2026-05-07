@@ -36,15 +36,27 @@ def _filter_and_encode_targets(
     target_values: torch.Tensor,
     valid_ids: Iterable[int],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    valid_ids = list(valid_ids)
-    id_to_index = {int(value): idx for idx, value in enumerate(valid_ids)}
-    valid_positions = [idx for idx, value in enumerate(target_values.view(-1).tolist()) if int(value) in id_to_index]
-    if not valid_positions:
+    valid_ids = [int(value) for value in valid_ids if int(value) >= 0]
+    if not valid_ids:
         return selected_logits[:0], torch.empty((0,), dtype=torch.long, device=selected_logits.device)
-    valid_index_tensor = torch.tensor(valid_positions, dtype=torch.long, device=selected_logits.device)
-    filtered_logits = selected_logits.index_select(0, valid_index_tensor)
-    filtered_targets = target_values.view(-1).index_select(0, valid_index_tensor).tolist()
-    encoded_targets = torch.tensor([id_to_index[int(value)] for value in filtered_targets], dtype=torch.long, device=selected_logits.device)
+
+    target_long = target_values.view(-1).to(device=selected_logits.device, dtype=torch.long)
+    max_valid_id = max(int(value) for value in valid_ids)
+    if max_valid_id < 0:
+        return selected_logits[:0], torch.empty((0,), dtype=torch.long, device=selected_logits.device)
+
+    lookup = torch.full((max_valid_id + 1,), -1, dtype=torch.long, device=selected_logits.device)
+    lookup_ids = torch.tensor(valid_ids, dtype=torch.long, device=selected_logits.device)
+    lookup[lookup_ids] = torch.arange(len(valid_ids), dtype=torch.long, device=selected_logits.device)
+
+    in_range = (target_long >= 0) & (target_long <= max_valid_id)
+    encoded_all = torch.full_like(target_long, -1)
+    encoded_all[in_range] = lookup[target_long[in_range]]
+    valid_mask = encoded_all >= 0
+    if not bool(valid_mask.any()):
+        return selected_logits[:0], torch.empty((0,), dtype=torch.long, device=selected_logits.device)
+    filtered_logits = selected_logits[valid_mask]
+    encoded_targets = encoded_all[valid_mask]
     return filtered_logits, encoded_targets
 
 
@@ -299,7 +311,7 @@ def compute_local_corruption_losses(
             continue
 
         key = f"{level}_corrupted_indices"
-        sampled_logits = []
+        sampled_indices = []
         sampled_targets = []
         for graph_index, metadata in enumerate(corruption_metadata):
             metadata = metadata or {}
@@ -318,21 +330,29 @@ def compute_local_corruption_losses(
                 corrupted_indices=valid_corrupted,
                 negatives_per_positive=negatives_per_positive,
             )
-            for local_idx in valid_corrupted:
-                global_idx = start + local_idx
-                sampled_logits.append(level_logits_all[global_idx])
-                sampled_targets.append(1.0)
-            for local_idx in sampled_clean:
-                global_idx = start + local_idx
-                sampled_logits.append(level_logits_all[global_idx])
-                sampled_targets.append(0.0)
+            positive_indices = torch.tensor(
+                [start + local_idx for local_idx in valid_corrupted],
+                dtype=torch.long,
+                device=level_logits_all.device,
+            )
+            sampled_indices.append(positive_indices)
+            sampled_targets.append(level_logits_all.new_ones((positive_indices.numel(),)))
+            if sampled_clean:
+                negative_indices = torch.tensor(
+                    [start + local_idx for local_idx in sampled_clean],
+                    dtype=torch.long,
+                    device=level_logits_all.device,
+                )
+                sampled_indices.append(negative_indices)
+                sampled_targets.append(level_logits_all.new_zeros((negative_indices.numel(),)))
 
-        if not sampled_logits:
+        if not sampled_indices:
             losses[loss_key] = _zero_like_reference(level_logits_all)
             continue
 
-        level_logits = torch.stack(sampled_logits, dim=0)
-        level_targets = torch.tensor(sampled_targets, dtype=torch.float, device=level_logits.device)
+        level_indices = torch.cat(sampled_indices, dim=0)
+        level_logits = level_logits_all.index_select(0, level_indices)
+        level_targets = torch.cat(sampled_targets, dim=0)
         loss_value = F.binary_cross_entropy_with_logits(level_logits, level_targets)
         predictions = (torch.sigmoid(level_logits) >= 0.5).float()
         metrics[acc_key] = (predictions == level_targets).float().mean().detach()

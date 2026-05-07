@@ -225,15 +225,43 @@ def resolve_path(path_str: str) -> Path:
     return base_dir / path
 
 
-def move_batch_to_device(batch: dict, device: torch.device) -> dict:
+def _move_optional_graph(graph, device: torch.device, *, required: bool):
+    if graph is None:
+        if required:
+            raise ValueError("Required graph branch is missing from the batch.")
+        return None
+    return graph.to(device) if required else graph
+
+
+def move_batch_to_device(
+    batch: dict,
+    device: torch.device,
+    *,
+    need_real: bool = True,
+    need_masked: bool = True,
+    need_corrupted: bool = True,
+) -> dict:
     return {
-        "graph_real": batch["graph_real"].to(device),
-        "graph_masked": batch["graph_masked"].to(device),
-        "graph_corrupted": batch["graph_corrupted"].to(device),
+        "graph_real": _move_optional_graph(batch["graph_real"], device, required=need_real),
+        "graph_masked": _move_optional_graph(batch["graph_masked"], device, required=need_masked),
+        "graph_corrupted": _move_optional_graph(batch["graph_corrupted"], device, required=need_corrupted),
         "masked_labels": batch["masked_labels"],
         "corruption_metadata": batch["corruption_metadata"],
         "graph_score_label": batch["graph_score_label"].to(device),
     }
+
+
+def set_dataset_stage_outputs(dataset, *, masked: bool, corrupted: bool) -> None:
+    if hasattr(dataset, "set_stage_outputs"):
+        dataset.set_stage_outputs(masked=masked, corrupted=corrupted)
+    if hasattr(dataset, "base_dataset"):
+        set_dataset_stage_outputs(dataset.base_dataset, masked=masked, corrupted=corrupted)
+    if hasattr(dataset, "dataset"):
+        set_dataset_stage_outputs(dataset.dataset, masked=masked, corrupted=corrupted)
+
+
+def set_loader_stage_outputs(loader: DataLoader, *, masked: bool, corrupted: bool) -> None:
+    set_dataset_stage_outputs(loader.dataset, masked=masked, corrupted=corrupted)
 
 
 def build_model(sample_graph, model_cfg: DictConfig, losses_cfg: DictConfig) -> TeacherGNN:
@@ -598,19 +626,53 @@ def run_epoch(
     enable_chord_local = bool(stage_cfg.get("enable_chord_local", bool(losses_cfg.enable_chord_local)))
     enable_onset_local = bool(stage_cfg.get("enable_onset_local", bool(losses_cfg.enable_onset_local)))
     require_corrupted_outputs = any((enable_graph_rank, enable_note_local, enable_chord_local, enable_onset_local))
+    set_loader_stage_outputs(loader, masked=enable_recon, corrupted=require_corrupted_outputs)
     grad_clip_parameters = list(model.parameters())
     if dynamic_loss_weighter is not None:
         grad_clip_parameters.extend(dynamic_loss_weighter.parameters())
 
     for step_index, batch in enumerate(loader, start=1):
-        batch = move_batch_to_device(batch, device)
+        batch = move_batch_to_device(
+            batch,
+            device,
+            need_real=enable_graph_rank,
+            need_masked=enable_recon,
+            need_corrupted=require_corrupted_outputs,
+        )
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.cuda.amp.autocast(enabled=autocast_enabled):
-            masked_outputs = model(batch["graph_masked"]) if enable_recon else None
-            real_outputs = model(batch["graph_real"]) if enable_graph_rank else None
-            corrupted_outputs = model(batch["graph_corrupted"]) if require_corrupted_outputs else None
+            masked_outputs = (
+                model(
+                    batch["graph_masked"],
+                    compute_recon=True,
+                    compute_graph_score=False,
+                    compute_local_scores=False,
+                )
+                if enable_recon
+                else None
+            )
+            real_outputs = (
+                model(
+                    batch["graph_real"],
+                    compute_recon=False,
+                    compute_graph_score=True,
+                    compute_local_scores=False,
+                )
+                if enable_graph_rank
+                else None
+            )
+            corrupted_outputs = (
+                model(
+                    batch["graph_corrupted"],
+                    compute_recon=False,
+                    compute_graph_score=enable_graph_rank,
+                    compute_local_scores=any((enable_note_local, enable_chord_local, enable_onset_local)),
+                )
+                if require_corrupted_outputs
+                else None
+            )
             loss_dict, metric_dict = compute_teacher_ssl_losses(
                 masked_outputs=masked_outputs,
                 real_outputs=real_outputs,
@@ -665,15 +727,16 @@ def run_epoch(
         scalar_losses = {key: value.detach() for key, value in loss_dict.items() if isinstance(value, torch.Tensor)}
         tracker.update(scalar_losses, weight=1.0)
         tracker.update(metric_dict, weight=1.0)
-        update_corruption_usage_counts(
-            batch["corruption_metadata"],
-            attempted_counts=corruption_attempted_counts,
-            applied_counts=corruption_applied_counts,
-            skipped_counts=corruption_skipped_counts,
-            skipped_attempt_counts=corruption_skipped_attempt_counts,
-            skipped_reason_counts=corruption_skipped_reason_counts,
-            skipped_attempt_reason_counts=corruption_skipped_attempt_reason_counts,
-        )
+        if require_corrupted_outputs:
+            update_corruption_usage_counts(
+                batch["corruption_metadata"],
+                attempted_counts=corruption_attempted_counts,
+                applied_counts=corruption_applied_counts,
+                skipped_counts=corruption_skipped_counts,
+                skipped_attempt_counts=corruption_skipped_attempt_counts,
+                skipped_reason_counts=corruption_skipped_reason_counts,
+                skipped_attempt_reason_counts=corruption_skipped_attempt_reason_counts,
+            )
 
         if step_index % int(training_cfg.log_every) == 0 or (max_batches is not None and step_index == max_batches):
             step_metrics = add_corruption_usage_metrics(
@@ -763,7 +826,30 @@ def load_model_weights_from_checkpoint(
         raise ValueError(f"Checkpoint must be a mapping: {checkpoint_path}")
     if "model_state_dict" not in checkpoint:
         raise ValueError(f"Checkpoint has no 'model_state_dict': {checkpoint_path}")
-    missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
+    state_dict = checkpoint["model_state_dict"]
+    if not strict:
+        current_state = model.state_dict()
+        skipped_mismatched = []
+        filtered_state = {}
+        for key, value in state_dict.items():
+            current_value = current_state.get(key)
+            if current_value is None:
+                filtered_state[key] = value
+                continue
+            if tuple(current_value.shape) != tuple(value.shape):
+                skipped_mismatched.append((key, tuple(value.shape), tuple(current_value.shape)))
+                continue
+            filtered_state[key] = value
+        if skipped_mismatched:
+            LOGGER.warning(
+                "Skipped checkpoint keys with shape mismatch=%s",
+                [
+                    {"key": key, "checkpoint_shape": old_shape, "model_shape": new_shape}
+                    for key, old_shape, new_shape in skipped_mismatched
+                ],
+            )
+        state_dict = filtered_state
+    missing, unexpected = model.load_state_dict(state_dict, strict=strict)
     if missing or unexpected:
         LOGGER.warning(
             "Loaded checkpoint with missing keys=%s unexpected keys=%s",
