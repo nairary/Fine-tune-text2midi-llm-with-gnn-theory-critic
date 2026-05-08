@@ -163,6 +163,16 @@ def build_model_from_checkpoint(checkpoint_path: Path, device: torch.device) -> 
         hidden_dim=int(model_cfg.get("hidden_dim", 128)),
         num_layers=int(model_cfg.get("num_layers", 3)),
         dropout=float(model_cfg.get("dropout", 0.1)),
+        pooling_mode=str(model_cfg.get("pooling_mode", "mean")),
+        pooling_output_dim=model_cfg.get("pooling_output_dim"),
+        score_head_hidden_dim=model_cfg.get("score_head_hidden_dim"),
+        use_bar_sequence_transformer=bool(model_cfg.get("use_bar_sequence_transformer", False)),
+        bar_transformer_num_layers=int(model_cfg.get("bar_transformer_num_layers", 2)),
+        bar_transformer_num_heads=int(model_cfg.get("bar_transformer_num_heads", 4)),
+        bar_transformer_ff_dim=model_cfg.get("bar_transformer_ff_dim"),
+        bar_transformer_dropout=model_cfg.get("bar_transformer_dropout"),
+        bar_transformer_pooling=str(model_cfg.get("bar_transformer_pooling", "cls")),
+        bar_transformer_combine=str(model_cfg.get("bar_transformer_combine", "concat")),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()

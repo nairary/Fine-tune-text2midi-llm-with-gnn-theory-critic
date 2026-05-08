@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, Mapping, Sequence, Tuple
 
 import torch
@@ -57,6 +58,104 @@ class ObserverNodeFeaturizer(nn.Module):
         return encoded
 
 
+class BarSequenceTransformer(nn.Module):
+    """Encode the ordered bar sequence so the observer can model long-form structure."""
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        ff_dim: int | None = None,
+        dropout: float = 0.1,
+        pooling: str = "cls",
+    ) -> None:
+        super().__init__()
+        hidden_dim = int(hidden_dim)
+        num_heads = int(num_heads)
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by bar_transformer_num_heads ({num_heads}).")
+        pooling = str(pooling or "cls").lower()
+        if pooling not in {"cls", "mean"}:
+            raise ValueError("bar_transformer_pooling must be either 'cls' or 'mean'.")
+
+        self.hidden_dim = hidden_dim
+        self.pooling = pooling
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim)) if pooling == "cls" else None
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=int(ff_dim or 4 * hidden_dim),
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=int(num_layers))
+        self.output_norm = nn.LayerNorm(hidden_dim)
+
+    def _sinusoidal_positions(self, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        positions = torch.arange(length, device=device, dtype=dtype).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.hidden_dim, 2, device=device, dtype=dtype)
+            * (-math.log(10000.0) / float(self.hidden_dim))
+        )
+        pe = torch.zeros(length, self.hidden_dim, device=device, dtype=dtype)
+        pe[:, 0::2] = torch.sin(positions * div_term)
+        if self.hidden_dim > 1:
+            pe[:, 1::2] = torch.cos(positions * div_term[: pe[:, 1::2].size(1)])
+        return pe
+
+    def _pack_bars(
+        self,
+        bar_embeddings: torch.Tensor,
+        bar_batch: torch.Tensor,
+        num_graphs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_graphs = int(num_graphs)
+        hidden_dim = int(bar_embeddings.size(-1))
+        if bar_embeddings.numel() == 0:
+            empty = bar_embeddings.new_zeros((num_graphs, 1, hidden_dim))
+            mask = torch.ones((num_graphs, 1), dtype=torch.bool, device=bar_embeddings.device)
+            counts = torch.zeros((num_graphs,), dtype=torch.long, device=bar_embeddings.device)
+            return empty, mask, counts
+
+        bar_batch = bar_batch.to(device=bar_embeddings.device, dtype=torch.long).view(-1)
+        counts = torch.bincount(bar_batch.clamp_min(0), minlength=num_graphs)[:num_graphs]
+        max_bars = max(1, int(counts.max().item()))
+        packed = bar_embeddings.new_zeros((num_graphs, max_bars, hidden_dim))
+        mask = torch.ones((num_graphs, max_bars), dtype=torch.bool, device=bar_embeddings.device)
+
+        for graph_idx in range(num_graphs):
+            indices = torch.nonzero(bar_batch == graph_idx, as_tuple=False).view(-1)
+            if indices.numel() == 0:
+                continue
+            graph_bars = bar_embeddings.index_select(0, indices)
+            packed[graph_idx, : graph_bars.size(0)] = graph_bars
+            mask[graph_idx, : graph_bars.size(0)] = False
+        return packed, mask, counts
+
+    def forward(self, bar_embeddings: torch.Tensor, bar_batch: torch.Tensor, num_graphs: int) -> torch.Tensor:
+        packed, mask, counts = self._pack_bars(bar_embeddings, bar_batch, num_graphs)
+        bar_positions = self._sinusoidal_positions(packed.size(1), packed.device, packed.dtype)
+        packed = packed + bar_positions.unsqueeze(0)
+
+        if self.cls_token is not None:
+            cls = self.cls_token.to(dtype=packed.dtype).expand(packed.size(0), -1, -1)
+            packed = torch.cat([cls, packed], dim=1)
+            cls_mask = torch.zeros((mask.size(0), 1), dtype=torch.bool, device=mask.device)
+            mask = torch.cat([cls_mask, mask], dim=1)
+
+        encoded = self.encoder(packed, src_key_padding_mask=mask)
+        if self.cls_token is not None:
+            out = encoded[:, 0]
+        else:
+            valid = (~mask).to(dtype=encoded.dtype).unsqueeze(-1)
+            out = (encoded * valid).sum(dim=1) / counts.clamp_min(1).to(dtype=encoded.dtype).unsqueeze(-1)
+        return self.output_norm(out)
+
+
 class ObserverGNN(nn.Module):
     """Teacher-style hetero GNN that outputs one scalar per song graph."""
 
@@ -74,12 +173,23 @@ class ObserverGNN(nn.Module):
         pooling_mode: str = "mean",
         pooling_output_dim: int | None = None,
         score_head_hidden_dim: int | None = None,
+        use_bar_sequence_transformer: bool = False,
+        bar_transformer_num_layers: int = 2,
+        bar_transformer_num_heads: int = 4,
+        bar_transformer_ff_dim: int | None = None,
+        bar_transformer_dropout: float | None = None,
+        bar_transformer_pooling: str = "cls",
+        bar_transformer_combine: str = "concat",
     ):
         super().__init__()
         self.node_types = tuple(OBSERVER_NODE_TYPES)
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
         self.residual = bool(residual)
+        self.use_bar_sequence_transformer = bool(use_bar_sequence_transformer)
+        self.bar_transformer_combine = str(bar_transformer_combine or "concat").lower()
+        if self.bar_transformer_combine not in {"concat", "replace"}:
+            raise ValueError("bar_transformer_combine must be either 'concat' or 'replace'.")
 
         self.featurizer = ObserverNodeFeaturizer(
             cat_vocab_sizes=cat_vocab_sizes,
@@ -103,9 +213,23 @@ class ObserverGNN(nn.Module):
             output_dim=pool_out_dim,
             pooling_mode=pooling_mode,
         )
-        score_hidden = score_head_hidden_dim or max(1, pool_out_dim // 2)
+        self.pool_per_type_dim = int(self.pool.per_type_dim)
+        self.bar_sequence_encoder = None
+        graph_dim = int(pool_out_dim)
+        if self.use_bar_sequence_transformer:
+            self.bar_sequence_encoder = BarSequenceTransformer(
+                hidden_dim=self.hidden_dim,
+                num_layers=int(bar_transformer_num_layers),
+                num_heads=int(bar_transformer_num_heads),
+                ff_dim=None if bar_transformer_ff_dim is None else int(bar_transformer_ff_dim),
+                dropout=float(self.dropout if bar_transformer_dropout is None else bar_transformer_dropout),
+                pooling=str(bar_transformer_pooling),
+            )
+            graph_dim = self.hidden_dim if self.bar_transformer_combine == "replace" else int(pool_out_dim) + self.hidden_dim
+        self.pooling_output_dim = int(graph_dim)
+        score_hidden = score_head_hidden_dim or max(1, graph_dim // 2)
         self.graph_head = nn.Sequential(
-            nn.Linear(pool_out_dim, score_hidden),
+            nn.Linear(graph_dim, score_hidden),
             nn.ReLU(),
             nn.Linear(score_hidden, 1),
         )
@@ -135,11 +259,30 @@ class ObserverGNN(nn.Module):
                 out[node_type] = torch.zeros(node_store.num_nodes, dtype=torch.long, device=node_store.x.device)
         return out
 
+    @staticmethod
+    def _infer_num_graphs(batch_dict: Dict[str, torch.Tensor]) -> int:
+        max_graph_index = -1
+        for batch in batch_dict.values():
+            if batch.numel() > 0:
+                max_graph_index = max(max_graph_index, int(batch.max().item()))
+        return max_graph_index + 1 if max_graph_index >= 0 else 1
+
     def forward(self, batch, *, return_outputs: bool = False):
         x_dict = self.featurizer(batch)
         x_dict = self.backbone(x_dict, batch.edge_index_dict)
         batch_dict = self._get_batch_dict(batch)
-        graph_embedding, pooled_by_type = self.pool(x_dict, batch_dict)
+        pooled_embedding, pooled_by_type = self.pool(x_dict, batch_dict)
+        graph_embedding = pooled_embedding
+        if self.bar_sequence_encoder is not None:
+            bar_embedding = self.bar_sequence_encoder(
+                x_dict["bar"],
+                batch_dict["bar"],
+                num_graphs=self._infer_num_graphs(batch_dict),
+            )
+            if self.bar_transformer_combine == "replace":
+                graph_embedding = bar_embedding
+            else:
+                graph_embedding = torch.cat([pooled_embedding, bar_embedding], dim=-1)
         score = self.graph_head(graph_embedding).squeeze(-1)
         if not return_outputs:
             return score

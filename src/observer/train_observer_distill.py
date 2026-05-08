@@ -598,6 +598,7 @@ def _save_checkpoint(
     best_val_loss: float,
     cfg: DictConfig,
     adapters: ObserverDistillationAdapters | None = None,
+    best_val_rank: float | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "model_state_dict": model.state_dict(),
@@ -606,6 +607,8 @@ def _save_checkpoint(
         "best_val_loss": float(best_val_loss),
         "config": OmegaConf.to_container(cfg, resolve=True),
     }
+    if best_val_rank is not None:
+        payload["best_val_rank"] = float(best_val_rank)
     if adapters is not None:
         payload["distillation_adapters_state_dict"] = adapters.state_dict()
     torch.save(payload, path)
@@ -621,15 +624,18 @@ def train(cfg: DictConfig) -> None:
     metrics_path = out_dir / "metrics.jsonl"
     config_path = out_dir / "config.json"
     best_path = out_dir / "best.pt"
+    best_rank_path = out_dir / "best_rank.pt"
     last_path = out_dir / "last.pt"
     resume = bool(cfg.observer_training.get("resume", False))
     start_epoch = 1
     best_val_loss = math.inf
+    best_val_rank = -math.inf
 
     if not resume:
         if metrics_path.exists():
             metrics_path.unlink()
         best_path.unlink(missing_ok=True)
+        best_rank_path.unlink(missing_ok=True)
         last_path.unlink(missing_ok=True)
     elif not last_path.exists():
         raise ValueError("observer_training.resume=true but last.pt does not exist")
@@ -683,11 +689,21 @@ def train(cfg: DictConfig) -> None:
         hidden_dim=int(cfg.observer_model.hidden_dim),
         num_layers=int(cfg.observer_model.num_layers),
         dropout=float(cfg.observer_model.dropout),
+        pooling_mode=str(cfg.observer_model.get("pooling_mode", "mean")),
+        pooling_output_dim=cfg.observer_model.get("pooling_output_dim", None),
+        score_head_hidden_dim=cfg.observer_model.get("score_head_hidden_dim", None),
+        use_bar_sequence_transformer=bool(cfg.observer_model.get("use_bar_sequence_transformer", False)),
+        bar_transformer_num_layers=int(cfg.observer_model.get("bar_transformer_num_layers", 2)),
+        bar_transformer_num_heads=int(cfg.observer_model.get("bar_transformer_num_heads", 4)),
+        bar_transformer_ff_dim=cfg.observer_model.get("bar_transformer_ff_dim", None),
+        bar_transformer_dropout=cfg.observer_model.get("bar_transformer_dropout", None),
+        bar_transformer_pooling=str(cfg.observer_model.get("bar_transformer_pooling", "cls")),
+        bar_transformer_combine=str(cfg.observer_model.get("bar_transformer_combine", "concat")),
     )
     target_dims = _merge_distillation_target_dims(train_ds, val_ds)
     adapters = ObserverDistillationAdapters(
         observer_graph_dim=int(getattr(model, "pooling_output_dim", cfg.observer_model.hidden_dim)),
-        observer_node_dim=int(getattr(model, "hidden_dim", cfg.observer_model.hidden_dim)),
+        observer_node_dim=int(getattr(model, "pool_per_type_dim", getattr(model, "hidden_dim", cfg.observer_model.hidden_dim))),
         target_dims=target_dims,
     )
     device = torch.device(str(cfg.observer_training.device))
@@ -705,6 +721,7 @@ def train(cfg: DictConfig) -> None:
             adapters.load_state_dict(checkpoint["distillation_adapters_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         best_val_loss = float(checkpoint.get("best_val_loss", best_val_loss))
+        best_val_rank = float(checkpoint.get("best_val_rank", best_val_rank))
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         if start_epoch > int(cfg.observer_training.epochs):
             raise ValueError("resume checkpoint epoch already exceeds configured epochs")
@@ -751,11 +768,15 @@ def train(cfg: DictConfig) -> None:
 
         if val_m["loss"] < best_val_loss:
             best_val_loss = val_m["loss"]
-            _save_checkpoint(best_path, model, optimizer, epoch, best_val_loss, cfg, adapters=adapters)
-        _save_checkpoint(last_path, model, optimizer, epoch, best_val_loss, cfg, adapters=adapters)
+            _save_checkpoint(best_path, model, optimizer, epoch, best_val_loss, cfg, adapters=adapters, best_val_rank=best_val_rank)
+        val_rank = float(val_m.get("batch_rank_acc", float("nan")))
+        if math.isfinite(val_rank) and val_rank > best_val_rank:
+            best_val_rank = val_rank
+            _save_checkpoint(best_rank_path, model, optimizer, epoch, best_val_loss, cfg, adapters=adapters, best_val_rank=best_val_rank)
+        _save_checkpoint(last_path, model, optimizer, epoch, best_val_loss, cfg, adapters=adapters, best_val_rank=best_val_rank)
 
     if not best_path.exists():
-        _save_checkpoint(best_path, model, optimizer, int(cfg.observer_training.epochs), best_val_loss, cfg, adapters=adapters)
+        _save_checkpoint(best_path, model, optimizer, int(cfg.observer_training.epochs), best_val_loss, cfg, adapters=adapters, best_val_rank=best_val_rank)
 
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="observer_distill")

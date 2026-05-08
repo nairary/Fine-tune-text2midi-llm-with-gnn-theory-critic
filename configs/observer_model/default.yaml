@@ -2,3 +2,13 @@ name: observer_gnn_default
 hidden_dim: 128
 num_layers: 3
 dropout: 0.1
+pooling_mode: mean
+pooling_output_dim: null
+score_head_hidden_dim: null
+use_bar_sequence_transformer: false
+bar_transformer_num_layers: 2
+bar_transformer_num_heads: 4
+bar_transformer_ff_dim: null
+bar_transformer_dropout: null
+bar_transformer_pooling: cls
+bar_transformer_combine: concat

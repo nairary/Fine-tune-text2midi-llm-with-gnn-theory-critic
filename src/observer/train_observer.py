@@ -42,6 +42,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--pooling-mode", choices=["mean", "mean_max", "attention"], default="mean")
+    parser.add_argument("--pooling-output-dim", type=int, default=None)
+    parser.add_argument("--score-head-hidden-dim", type=int, default=None)
+    parser.add_argument("--use-bar-sequence-transformer", action="store_true")
+    parser.add_argument("--bar-transformer-num-layers", type=int, default=2)
+    parser.add_argument("--bar-transformer-num-heads", type=int, default=4)
+    parser.add_argument("--bar-transformer-ff-dim", type=int, default=None)
+    parser.add_argument("--bar-transformer-dropout", type=float, default=None)
+    parser.add_argument("--bar-transformer-pooling", choices=["cls", "mean"], default="cls")
+    parser.add_argument("--bar-transformer-combine", choices=["concat", "replace"], default="concat")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -190,6 +200,16 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
+        pooling_mode=args.pooling_mode,
+        pooling_output_dim=args.pooling_output_dim,
+        score_head_hidden_dim=args.score_head_hidden_dim,
+        use_bar_sequence_transformer=args.use_bar_sequence_transformer,
+        bar_transformer_num_layers=args.bar_transformer_num_layers,
+        bar_transformer_num_heads=args.bar_transformer_num_heads,
+        bar_transformer_ff_dim=args.bar_transformer_ff_dim,
+        bar_transformer_dropout=args.bar_transformer_dropout,
+        bar_transformer_pooling=args.bar_transformer_pooling,
+        bar_transformer_combine=args.bar_transformer_combine,
     ).to(device)
 
     criterion = create_loss(args.loss)
