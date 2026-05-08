@@ -30,7 +30,7 @@ def resolve_observer_pipeline_paths(cfg: DictConfig, base_cwd: Path | None = Non
     cache_root = root / str(cfg.observer_pipeline.get("cache_output_dir", "cache"))
     graph_cache_root = cache_root / "graphs"
     cache_index_root = cache_root / "index"
-    training_root = root / "training"
+    training_root = root / str(cfg.observer_pipeline.get("training_output_dir", "training"))
 
     return {
         "output_root": root,

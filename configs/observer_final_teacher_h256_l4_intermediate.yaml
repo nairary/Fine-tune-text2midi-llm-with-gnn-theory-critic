@@ -1,0 +1,46 @@
+defaults:
+  - observer_distill
+  - override /dataloader: section_cache_balanced
+  - _self_
+
+run_name: observer_intermediate_seed42_h256_l4
+
+observer_pipeline:
+  output_root: outputs/observer_cache/final_teacher_dyn_fusion_h256_l4_v1
+  build_pairs: false
+  build_targets: false
+  build_graph_cache: false
+  train: true
+  training_output_dir: training_intermediate_seed42_h256_l4
+
+observer_model:
+  hidden_dim: 256
+  num_layers: 4
+  dropout: 0.1
+
+observer_training:
+  epochs: 10
+  seed: 42
+  device: cuda
+  cache_teacher_intermediates: true
+  resume: false
+
+dataloader:
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  shuffle: true
+  drop_last: false
+
+losses:
+  lambda_score_distill: 1.0
+  lambda_margin_distill: 0.5
+  lambda_graph_embedding_distill: 0.1
+  lambda_node_type_embedding_distill: 0.1
+  lambda_local_summary_distill: 0.1
+  embedding_distill_loss: mse
+  min_teacher_gap_for_rank: 0.25
+  use_pair_rank: true
+  use_batch_rank: true
+  rank_intra_weight: 1.0
+  rank_inter_weight: 1.0
