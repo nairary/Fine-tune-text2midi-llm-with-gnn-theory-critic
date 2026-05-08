@@ -28,7 +28,7 @@ observer_training:
 dataloader:
   batch_size: 8
   num_workers: 4
-  pin_memory: true
+  pin_memory: false
   shuffle: true
   drop_last: false
 
