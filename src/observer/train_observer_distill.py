@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -354,7 +355,19 @@ def _rankdata(values: np.ndarray) -> np.ndarray:
     return ranks
 
 
-def _run_epoch(model, loader, optimizer, device, cfg_losses, adapters: ObserverDistillationAdapters | None = None):
+def _run_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    cfg_losses,
+    adapters: ObserverDistillationAdapters | None = None,
+    *,
+    phase: str = "train",
+    epoch: int | None = None,
+    total_epochs: int | None = None,
+    log_every_batches: int = 100,
+):
     is_train = optimizer is not None
     model.train(is_train)
     if adapters is not None:
@@ -387,7 +400,13 @@ def _run_epoch(model, loader, optimizer, device, cfg_losses, adapters: ObserverD
     use_batch_rank = bool(cfg_losses.get("use_batch_rank", False)) and rank_weight > 0.0
     use_pair_rank = bool(cfg_losses.get("use_pair_rank", True)) and rank_weight > 0.0
 
-    for batch in loader:
+    num_batches = len(loader)
+    epoch_label = f" epoch={epoch}/{total_epochs}" if epoch is not None and total_epochs is not None else ""
+    LOGGER.info("%s%s start batches=%d", phase, epoch_label, num_batches)
+    epoch_started = time.perf_counter()
+    log_every_batches = max(0, int(log_every_batches))
+
+    for batch_idx, batch in enumerate(loader, start=1):
         g_clean = batch["graph_clean"].to(device)
         g_corr = batch["graph_corrupted"].to(device)
         y_clean = batch["teacher_clean"].to(device)
@@ -487,6 +506,23 @@ def _run_epoch(model, loader, optimizer, device, cfg_losses, adapters: ObserverD
         pred_margins.extend((s_clean - s_corr).detach().cpu().tolist())
         teacher_margins.extend((y_clean - y_corr).detach().cpu().tolist())
 
+        if log_every_batches > 0 and (
+            batch_idx == 1 or batch_idx == num_batches or batch_idx % log_every_batches == 0
+        ):
+            elapsed = time.perf_counter() - epoch_started
+            batches_per_sec = float(batch_idx) / elapsed if elapsed > 0.0 else 0.0
+            LOGGER.info(
+                "%s%s batch=%d/%d examples=%d reg_loss=%.4f rank_valid=%d speed=%.2f batch/s",
+                phase,
+                epoch_label,
+                batch_idx,
+                num_batches,
+                total_examples,
+                (total_reg_loss / total_examples) if total_examples > 0 else float("nan"),
+                total_valid_rank,
+                batches_per_sec,
+            )
+
     p = np.asarray(preds_all)
     t = np.asarray(targets_all)
     err = p - t
@@ -502,7 +538,7 @@ def _run_epoch(model, loader, optimizer, device, cfg_losses, adapters: ObserverD
         + node_type_embedding_weight * node_type_embedding_distill_loss
         + local_summary_weight * local_summary_distill_loss
     )
-    return {
+    metrics = {
         "loss": total_loss,
         "reg_loss": reg_loss,
         "score_distill_loss": reg_loss,
@@ -522,6 +558,17 @@ def _run_epoch(model, loader, optimizer, device, cfg_losses, adapters: ObserverD
         "mean_pred_margin": float(np.mean(pred_margins)) if pred_margins else float("nan"),
         "mean_teacher_margin": float(np.mean(teacher_margins)) if teacher_margins else float("nan"),
     }
+    LOGGER.info(
+        "%s%s done loss=%.4f mae=%.4f pair_rank_acc=%.4f batch_rank_acc=%.4f elapsed=%.1fs",
+        phase,
+        epoch_label,
+        float(metrics["loss"]),
+        float(metrics["mae"]),
+        float(metrics["pair_rank_acc"]),
+        float(metrics["batch_rank_acc"]),
+        time.perf_counter() - epoch_started,
+    )
+    return metrics
 
 
 def _merge_distillation_target_dims(*datasets) -> dict[str, Any]:
@@ -593,6 +640,13 @@ def train(cfg: DictConfig) -> None:
         raise ValueError("Train cached dataset is empty")
     if len(val_ds) == 0:
         raise ValueError("Validation cached dataset is empty")
+    LOGGER.info(
+        "Observer cached datasets train_pairs=%d val_pairs=%d train_graphs=%d val_graphs=%d",
+        len(train_ds),
+        len(val_ds),
+        len(train_ds.graph_rows),
+        len(val_ds.graph_rows),
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -611,6 +665,14 @@ def train(cfg: DictConfig) -> None:
         pin_memory=bool(cfg.dataloader.get("pin_memory", False)),
         drop_last=False,
         collate_fn=_collate_pairs,
+    )
+    LOGGER.info(
+        "Observer dataloaders train_batches=%d val_batches=%d batch_size=%d num_workers=%d pin_memory=%s",
+        len(train_loader),
+        len(val_loader),
+        int(cfg.dataloader.batch_size),
+        int(cfg.dataloader.num_workers),
+        bool(cfg.dataloader.get("pin_memory", False)),
     )
 
     spec_global = json.loads((_base_cwd() / "metadata" / "specs" / "spec_global.json").read_text(encoding="utf-8"))
@@ -648,9 +710,41 @@ def train(cfg: DictConfig) -> None:
             raise ValueError("resume checkpoint epoch already exceeds configured epochs")
     config_path.write_text(json.dumps(OmegaConf.to_container(cfg, resolve=True), ensure_ascii=False, indent=2), encoding="utf-8")
 
-    for epoch in range(start_epoch, int(cfg.observer_training.epochs) + 1):
-        train_m = _run_epoch(model, train_loader, optimizer, device, cfg.losses, adapters=adapters)
-        val_m = _run_epoch(model, val_loader, None, device, cfg.losses, adapters=adapters)
+    total_epochs = int(cfg.observer_training.epochs)
+    log_every_batches = int(cfg.observer_training.get("log_every_batches", 100))
+    LOGGER.info(
+        "Observer training start epochs=%d start_epoch=%d device=%s log_every_batches=%d",
+        total_epochs,
+        start_epoch,
+        device,
+        log_every_batches,
+    )
+
+    for epoch in range(start_epoch, total_epochs + 1):
+        train_m = _run_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            cfg.losses,
+            adapters=adapters,
+            phase="train",
+            epoch=epoch,
+            total_epochs=total_epochs,
+            log_every_batches=log_every_batches,
+        )
+        val_m = _run_epoch(
+            model,
+            val_loader,
+            None,
+            device,
+            cfg.losses,
+            adapters=adapters,
+            phase="val",
+            epoch=epoch,
+            total_epochs=total_epochs,
+            log_every_batches=log_every_batches,
+        )
 
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"epoch": epoch, "train": train_m, "val": val_m}, ensure_ascii=False) + "\n")

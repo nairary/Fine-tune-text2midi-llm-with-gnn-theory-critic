@@ -10,3 +10,4 @@ chord_instrument_name: chords
 use_fallback_44: true
 
 resume: false
+log_every_batches: 100
