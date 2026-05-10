@@ -12,6 +12,19 @@ from src.observer.schema import OBSERVER_NODE_TYPES
 from src.utils.teacher_pooling import MultiTypeMeanPooling
 
 
+def _make_activation(name: str) -> nn.Module:
+    name = str(name or "relu").lower()
+    if name == "relu":
+        return nn.ReLU()
+    if name == "leaky_relu":
+        return nn.LeakyReLU(negative_slope=0.01)
+    if name == "gelu":
+        return nn.GELU()
+    if name == "silu":
+        return nn.SiLU()
+    raise ValueError("score_head_activation must be one of: relu, leaky_relu, gelu, silu.")
+
+
 class ObserverNodeFeaturizer(nn.Module):
     def __init__(
         self,
@@ -180,6 +193,8 @@ class ObserverGNN(nn.Module):
         bar_transformer_dropout: float | None = None,
         bar_transformer_pooling: str = "cls",
         bar_transformer_combine: str = "concat",
+        score_head_activation: str = "relu",
+        score_head_layer_norm: bool = False,
     ):
         super().__init__()
         self.node_types = tuple(OBSERVER_NODE_TYPES)
@@ -228,11 +243,17 @@ class ObserverGNN(nn.Module):
             graph_dim = self.hidden_dim if self.bar_transformer_combine == "replace" else int(pool_out_dim) + self.hidden_dim
         self.pooling_output_dim = int(graph_dim)
         score_hidden = score_head_hidden_dim or max(1, graph_dim // 2)
-        self.graph_head = nn.Sequential(
-            nn.Linear(graph_dim, score_hidden),
-            nn.ReLU(),
-            nn.Linear(score_hidden, 1),
+        score_head_layers: list[nn.Module] = []
+        if bool(score_head_layer_norm):
+            score_head_layers.append(nn.LayerNorm(graph_dim))
+        score_head_layers.extend(
+            [
+                nn.Linear(graph_dim, score_hidden),
+                _make_activation(score_head_activation),
+                nn.Linear(score_hidden, 1),
+            ]
         )
+        self.graph_head = nn.Sequential(*score_head_layers)
 
     def backbone(self, x_dict: Dict[str, torch.Tensor], edge_index_dict: Dict[Tuple[str, str, str], torch.Tensor]):
         for conv, norms in zip(self.convs, self.conv_norms):

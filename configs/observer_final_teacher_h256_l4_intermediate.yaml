@@ -17,6 +17,11 @@ observer_model:
   hidden_dim: 256
   num_layers: 4
   dropout: 0.1
+  pooling_mode: mean_max
+  score_head_activation: leaky_relu
+  score_head_layer_norm: true
+  use_bar_sequence_transformer: true
+  bar_transformer_combine: concat
 
 observer_training:
   epochs: 10
@@ -24,6 +29,10 @@ observer_training:
   device: cuda
   cache_teacher_intermediates: true
   resume: false
+
+optimizer:
+  lr: 0.0003
+  weight_decay: 0.0001
 
 dataloader:
   batch_size: 8

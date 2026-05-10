@@ -5,6 +5,8 @@ dropout: 0.1
 pooling_mode: mean
 pooling_output_dim: null
 score_head_hidden_dim: null
+score_head_activation: relu
+score_head_layer_norm: false
 use_bar_sequence_transformer: false
 bar_transformer_num_layers: 2
 bar_transformer_num_heads: 4

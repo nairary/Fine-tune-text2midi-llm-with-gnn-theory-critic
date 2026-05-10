@@ -616,6 +616,11 @@ def _save_checkpoint(
 
 def train(cfg: DictConfig) -> None:
     _set_seed(int(cfg.observer_training.seed))
+    try:
+        torch.multiprocessing.set_sharing_strategy("file_system")
+    except RuntimeError as exc:
+        LOGGER.warning("Could not set torch multiprocessing sharing strategy: %s", exc)
+
     paths = resolve_observer_pipeline_paths(cfg)
     targets_root = paths["targets_root"]
     index_root = paths["cache_index_root"]
@@ -699,6 +704,8 @@ def train(cfg: DictConfig) -> None:
         bar_transformer_dropout=cfg.observer_model.get("bar_transformer_dropout", None),
         bar_transformer_pooling=str(cfg.observer_model.get("bar_transformer_pooling", "cls")),
         bar_transformer_combine=str(cfg.observer_model.get("bar_transformer_combine", "concat")),
+        score_head_activation=str(cfg.observer_model.get("score_head_activation", "relu")),
+        score_head_layer_norm=bool(cfg.observer_model.get("score_head_layer_norm", False)),
     )
     target_dims = _merge_distillation_target_dims(train_ds, val_ds)
     adapters = ObserverDistillationAdapters(

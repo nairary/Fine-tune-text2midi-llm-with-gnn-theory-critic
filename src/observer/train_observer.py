@@ -45,6 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pooling-mode", choices=["mean", "mean_max", "attention"], default="mean")
     parser.add_argument("--pooling-output-dim", type=int, default=None)
     parser.add_argument("--score-head-hidden-dim", type=int, default=None)
+    parser.add_argument("--score-head-activation", choices=["relu", "leaky_relu", "gelu", "silu"], default="relu")
+    parser.add_argument("--score-head-layer-norm", action="store_true")
     parser.add_argument("--use-bar-sequence-transformer", action="store_true")
     parser.add_argument("--bar-transformer-num-layers", type=int, default=2)
     parser.add_argument("--bar-transformer-num-heads", type=int, default=4)
@@ -210,6 +212,8 @@ def main() -> None:
         bar_transformer_dropout=args.bar_transformer_dropout,
         bar_transformer_pooling=args.bar_transformer_pooling,
         bar_transformer_combine=args.bar_transformer_combine,
+        score_head_activation=args.score_head_activation,
+        score_head_layer_norm=args.score_head_layer_norm,
     ).to(device)
 
     criterion = create_loss(args.loss)

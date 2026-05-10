@@ -173,6 +173,8 @@ def build_model_from_checkpoint(checkpoint_path: Path, device: torch.device) -> 
         bar_transformer_dropout=model_cfg.get("bar_transformer_dropout"),
         bar_transformer_pooling=str(model_cfg.get("bar_transformer_pooling", "cls")),
         bar_transformer_combine=str(model_cfg.get("bar_transformer_combine", "concat")),
+        score_head_activation=str(model_cfg.get("score_head_activation", "relu")),
+        score_head_layer_norm=bool(model_cfg.get("score_head_layer_norm", False)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()

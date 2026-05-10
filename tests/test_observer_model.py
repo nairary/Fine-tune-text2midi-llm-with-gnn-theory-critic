@@ -94,6 +94,47 @@ class ObserverModelTests(unittest.TestCase):
         self.assertIn("song", outputs["pooled_by_type"])
         self.assertTrue(torch.isfinite(outputs["graph_embedding"]).all())
 
+        sequence_model = ObserverGNN(
+            cat_vocab_sizes=build_observer_vocab_sizes(theory_ctx, spec_global),
+            num_feature_dims={
+                "song": len(OBSERVER_NUM_FIELDS["song"]),
+                "bar": len(OBSERVER_NUM_FIELDS["bar"]),
+                "onset": len(OBSERVER_NUM_FIELDS["onset"]),
+                "note": len(OBSERVER_NUM_FIELDS["note"]),
+                "chord": len(OBSERVER_NUM_FIELDS["chord"]),
+            },
+            edge_types=OBSERVER_EDGE_TYPES,
+            hidden_dim=32,
+            num_layers=2,
+            dropout=0.0,
+            cat_embedding_dim=8,
+            pooling_mode="mean_max",
+            use_bar_sequence_transformer=True,
+            score_head_activation="leaky_relu",
+            score_head_layer_norm=True,
+        )
+        sequence_out = sequence_model(batch)
+        self.assertEqual(tuple(sequence_out.shape), (1,))
+        self.assertTrue(torch.isfinite(sequence_out).all())
+
+    def test_configurable_score_head_uses_norm_and_non_dead_activation(self):
+        spec_global = json.loads((REPO_ROOT / "metadata" / "specs" / "spec_global.json").read_text(encoding="utf-8"))
+        theory_ctx = build_theory_context()
+        model = ObserverGNN(
+            cat_vocab_sizes=build_observer_vocab_sizes(theory_ctx, spec_global),
+            num_feature_dims={node_type: len(OBSERVER_NUM_FIELDS[node_type]) for node_type in OBSERVER_NUM_FIELDS},
+            edge_types=OBSERVER_EDGE_TYPES,
+            hidden_dim=32,
+            num_layers=1,
+            dropout=0.0,
+            cat_embedding_dim=8,
+            score_head_activation="leaky_relu",
+            score_head_layer_norm=True,
+        )
+
+        self.assertIsInstance(model.graph_head[0], torch.nn.LayerNorm)
+        self.assertIsInstance(model.graph_head[2], torch.nn.LeakyReLU)
+
 
 if __name__ == "__main__":
     unittest.main()
