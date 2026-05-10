@@ -10,7 +10,7 @@ from typing import Any
 import hydra
 from omegaconf import DictConfig
 
-from src.observer.build_teacher_targets import build_teacher_targets, load_jsonl_rows, write_jsonl
+from src.observer.build_teacher_targets import build_teacher_targets_jsonl, load_jsonl_rows, write_jsonl
 from src.observer.pipeline_paths import resolve_observer_pipeline_paths
 
 LOGGER = logging.getLogger(__name__)
@@ -82,6 +82,9 @@ def build_pair_targets(cfg: DictConfig) -> None:
     manifests_root = paths["manifests_root"]
     index_root = paths["pair_index_root"]
     targets_root = paths["targets_root"]
+    overwrite = bool(cfg.observer_pipeline.get("overwrite", False))
+    resume = not overwrite
+    target_log_every = int(cfg.observer_training.get("target_log_every", 100))
     teacher_checkpoint = Path(cfg.observer_training.teacher_checkpoint)
     teacher_config = Path(cfg.observer_training.teacher_config)
     if not teacher_checkpoint.is_absolute():
@@ -99,9 +102,21 @@ def build_pair_targets(cfg: DictConfig) -> None:
             split_pair_targets.unlink(missing_ok=True)
             continue
 
+        if overwrite:
+            split_targets.unlink(missing_ok=True)
+            split_pair_targets.unlink(missing_ok=True)
+
         rows = load_jsonl_rows(manifest_path)
-        target_rows = build_teacher_targets(
+        LOGGER.info(
+            "Building teacher targets split=%s samples=%d output=%s resume=%s",
+            split,
+            len(rows),
+            split_targets,
+            resume,
+        )
+        built_targets = build_teacher_targets_jsonl(
             rows=rows,
+            output_jsonl=split_targets,
             teacher_checkpoint=teacher_checkpoint,
             teacher_config=teacher_config,
             encoded_song_field="encoded_song_path",
@@ -109,15 +124,23 @@ def build_pair_targets(cfg: DictConfig) -> None:
             split=split,
             device=str(cfg.observer_training.device),
             include_intermediates=bool(cfg.observer_training.get("cache_teacher_intermediates", False)),
+            resume=resume,
+            log_every=target_log_every,
         )
-        write_jsonl(split_targets, target_rows)
+        target_rows = load_jsonl_rows(split_targets)
         built_pairs, skipped_pairs = _join_pair_targets(
             target_rows=target_rows,
             pair_index_path=pair_path,
             output_path=split_pair_targets,
         )
         LOGGER.info(
-            "Targets split=%s samples=%d pairs=%d skipped_pairs=%d", split, len(target_rows), built_pairs, skipped_pairs
+            "Targets split=%s samples=%d built_targets=%d pairs=%d skipped_pairs=%d output=%s",
+            split,
+            len(target_rows),
+            built_targets,
+            built_pairs,
+            skipped_pairs,
+            split_pair_targets,
         )
 
 
