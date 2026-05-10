@@ -24,7 +24,7 @@ observer_model:
   bar_transformer_combine: concat
 
 observer_training:
-  epochs: 10
+  epochs: 20
   seed: 42
   device: cuda
   cache_teacher_intermediates: true
